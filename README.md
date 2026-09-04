@@ -12,26 +12,27 @@ Dự án gốc `ai tool` (máy local, `tools/db.html` + Flask port 8080) **khôn
 3. Mọi thay đổi hành vi (ghi DB, điều khiển cycle) là **Phase 2**, sau khi app
    đọc ổn định và `db.html` gốc vẫn chạy bình thường.
 
-## Cấu trúc
+## Cấu trúc (Phase 1: tách module, giữ nguyên hành vi)
 
 ```
 website/
 ├── README.md                 # file này
-├── docs/
-│   ├── ARCHITECTURE.md       # kiến trúc nguồn + kiến trúc đích
-│   ├── API_CONTRACT.md       # toàn bộ API của ai tool (method/auth/mục đích)
-│   ├── DATA_SCHEMAS.md       # hình dạng JSON dữ liệu
-│   └── DEPLOY_PLAN.md        # lộ trình 4 phase
+├── docs/                     # ARCHITECTURE / API_CONTRACT / DATA_SCHEMAS / DEPLOY_PLAN
+├── tests/
+│   ├── contract/             # smoke GET + API_INVENTORY + BASELINE
+│   └── security/             # test proxy read-only + SECURITY_BASELINE
 └── webapp/
     ├── README.md             # cách chạy skeleton
     ├── backend/              # proxy read-only + serve frontend
-    │   ├── proxy.py
+    │   ├── proxy.py          # entry mỏng (giữ lệnh chạy cũ)
+    │   ├── app.py            # Flask app + routes (create_app)
+    │   ├── upstream.py       # chuyển tiếp GET sang ai tool
     │   ├── config.py
     │   └── requirements.txt
-    └── frontend/             # dashboard tĩnh (HTML/CSS/JS thuần)
+    └── frontend/             # dashboard tĩnh, ES modules (không build)
         ├── index.html
-        ├── styles.css
-        └── app.js
+        ├── css/base.css + components.css
+        └── js/api.js, store.js, views.js, main.js
 ```
 
 ## Chạy thử skeleton (2 phút)
@@ -52,8 +53,9 @@ từ ai tool, không cần đăng nhập trình duyệt (proxy giữ credentials
 
 ## Roadmap
 
-- Phase 0 (hiện tại): docs + skeleton đọc. `db.html` gốc phải luôn ổn định.
-- Phase 1: tách module, giữ nguyên tính năng.
+- Phase 0 (xong): docs + skeleton đọc + contract/security baseline xanh.
+  `db.html` gốc phải luôn ổn định.
+- Phase 1 (đang làm): tách module, giữ nguyên tính năng.
 - Phase 2: ghi an toàn (qua API ai tool, có xác thực riêng).
 - Phase 3: DB SQLite + realtime + auth + tunnel cố định.
 - Chi tiết: `docs/DEPLOY_PLAN.md`.

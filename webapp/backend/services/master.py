@@ -26,8 +26,9 @@ def _safe_error(status=502):
     raise UpstreamError(status, b'{"error":"master upstream response unavailable"}')
 
 
-def _safe_upstream_error(status):
-    _safe_error(status if 400 <= status <= 599 else 502)
+def _safe_upstream_error(_status):
+    # Master writes never pass through an upstream body or status.
+    _safe_error()
 
 
 def _decode_object(body):
@@ -43,7 +44,10 @@ def _decode_object(body):
 def _valid_text(value):
     if type(value) is not str or not 1 <= len(value) <= 200 or not value.strip():
         return False
-    return not any(ord(char) < 32 or char in "\r\n" for char in value)
+    return not any(
+        ord(char) < 32 or 0x7F <= ord(char) <= 0x9F
+        for char in value
+    )
 
 
 def _load_fresh_master():

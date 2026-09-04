@@ -25,20 +25,15 @@ def free_port():
 PROXY_PORT, STUB_PORT = free_port(), free_port()
 TOKEN = "write-secret"
 CANARY = "MASTER_SECRET_CANARY"
-INITIAL_MASTER = {
-    "clients": [
-        {"client": "client_a", "name": "Alpha", "group": "group_a", "selected": True, "slot": "00:00"},
-        {"client": "client_b", "name": "Beta", "group": "group_b", "selected": True, "status": "offline"},
-    ],
-    "schedule": [{"group": "group_a", "time": "00:00", "close": "12:00", "secret": CANARY}],
-}
 
 
 def clean_master():
     return {
         "clients": [
-            {"client": "client_a", "name": "Alpha", "group": "group_a", "selected": True},
-            {"client": "client_b", "name": "Beta", "group": "group_b", "selected": True},
+            {"client": "client_a", "name": "Alpha", "group": "group_a", "selected": True,
+             "slot": "00:00", "status": "online", "remote_name": "remote-a"},
+            {"client": "client_b", "name": "Beta", "group": "group_b", "selected": True,
+             "slot": "12:00", "status": "offline", "remote_name": "remote-b"},
         ],
         "schedule": [{"group": "group_a", "time": "00:00", "close": "12:00"}],
     }
@@ -233,8 +228,10 @@ def main():
                   {"client": "client_a", "name": "Alpha-new", "group": "group_a", "selected": True},
                   {"client": "client_b", "name": "Beta", "group": "group_b", "selected": True},
               ], "schedule": [{"group": "group_a", "time": "00:00", "close": "12:00"}]})
-        check("raw full collectMaster and slot fields are not forwarded", "expected_name" not in sent[0]["body"].decode()
-              and "slot" not in sent[0]["body"].decode() and "secret" not in sent[0]["body"].decode())
+        check("fresh status/remote/slot fields are not forwarded", "expected_name" not in sent[0]["body"].decode()
+              and "slot" not in sent[0]["body"].decode()
+              and "status" not in sent[0]["body"].decode()
+              and "remote_name" not in sent[0]["body"].decode())
 
         for content_type in ("text/plain", "application/json; charset=latin1",
                              "application/json; foo=bar", "application/json;charset=utf-8"):
@@ -254,6 +251,8 @@ def main():
             ("name empty", b'{"changes":[{"client":"client_a","expected_name":"Alpha","name":""}]}'),
             ("name whitespace", b'{"changes":[{"client":"client_a","expected_name":"Alpha","name":"   "}]}'),
             ("name control", b'{"changes":[{"client":"client_a","expected_name":"Alpha","name":"bad\\nname"}]}'),
+            ("name DEL", json.dumps({"changes":[{"client":"client_a","expected_name":"Alpha","name":"bad\x7fname"}]}).encode()),
+            ("name C1", json.dumps({"changes":[{"client":"client_a","expected_name":"Alpha","name":"bad\x80name"}]}).encode()),
             ("name overlength", json.dumps({"changes":[{"client":"client_a","expected_name":"Alpha","name":"x" * 201}]}).encode()),
             ("wrong expected type", b'{"changes":[{"client":"client_a","expected_name":true,"name":"New"}]}'),
         ]
@@ -285,7 +284,7 @@ def main():
         Stub.reset()
         Stub.mode = "error"
         status, raw, _ = call(proxy, "/up/api/master", "POST", rename, json_bearer)
-        check("upstream error sanitized", status == 500
+        check("upstream 4xx/5xx sanitized to generic 502", status == 502
               and body_json(raw) == {"error": "master upstream response unavailable"}
               and CANARY not in raw.decode(errors="replace"))
         Stub.mode = "success"
@@ -331,6 +330,7 @@ def main():
               and "ai_tool.post(\"api/master\"" in source)
         check("master response uses exact integer counter validation",
               "type(clients) is not int" in source and "type(schedule) is not int" in source)
+        check("master text rejects DEL and C1 controls", "0x7F <= ord(char) <= 0x9F" in source)
 
         stub.shutdown(); stub.server_close(); time.sleep(0.2)
         status, raw, _ = call(proxy, "/up/api/master", "POST", rename, json_bearer)

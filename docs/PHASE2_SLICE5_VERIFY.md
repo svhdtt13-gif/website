@@ -55,7 +55,7 @@ Redaction dùng `omit`, không dùng masked placeholder.
 
 ## Verification
 
-- `tests/security/test_settings_read.py` bao phủ:
+- `tests/security/test_settings_read.py`: **21/21 pass**:
   - exact public allowlist response và Basic Auth/path forwarding;
   - missing key không tự tạo key;
   - malformed JSON/non-object 200 -> generic `502`;
@@ -66,12 +66,26 @@ Redaction dùng `omit`, không dùng masked placeholder.
     upstream write;
   - upstream unreachable -> generic `502`, proxy vẫn sống;
   - service không direct file access và không raw return.
-- Regression Slice 1–4 phải pass.
-- Remote Python syntax compile phải pass cho app/config/settings service/tests.
-- Live verification phải chụp schema/key set nhưng không ghi giá trị secret; public
-  body chỉ chứa allowlist. `settings.json`, `client_database.json`,
-  `cycle_state.json`, client IDs/schedules và AutoCycle PID phải giữ nguyên.
+- Regression Slice 1–4:
+  - `tests/security/test_proxy.py`: **10/10 pass**.
+  - `tests/security/test_write_log.py`: **16/16 pass**.
+  - `tests/security/test_backup_read.py`: **17/17 pass**.
+  - `tests/security/test_master_read.py`: **16/16 pass**.
+- Remote Python syntax compile: app/config/settings service/test pass.
+
+## Live verification (2026-09-04)
+
+- Direct ai tool `GET /api/settings`: `200`; branch proxy
+  `GET /up/api/settings`: `200`.
+- Raw upstream schema có 8 keys; public response có đúng 5 keys:
+  `default_browser`, `tunnel_port`, `auto_restart_tunnel`, `auto_telegram`,
+  `auto_open_browser`.
+- Không in hoặc ghi giá trị secret; public response không có sensitive key.
+- Snapshot trước/sau giữ nguyên: `settings.json`, `client_database.json`,
+  `cycle_state.json`, `clients_master.json`, số clients/schedules và client IDs.
+- AutoCycle PID vẫn alive; không gọi method write, không sync, không restart/stop.
 
 ## Approval gate
 
-Chỉ mở PR sau khi test và live evidence đạt, rồi chờ review trước merge.
+Implementation đã chạy test và live evidence trên branch này. Chỉ mở PR sau
+khi review diff và confirmation cuối cùng.

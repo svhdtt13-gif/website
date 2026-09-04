@@ -3,6 +3,7 @@
 Luong Phase 2: route -> service -> repository -> ai tool.
 Hanh vi GET giu nguyen proxy read-only; Slice 2 chi mo write api/log
 sau khi qua Bearer gate rieng cua website.
+Slice 3 chi them GET api/cycle/backup; khong mo POST backup.
 """
 import hmac
 import pathlib
@@ -12,6 +13,7 @@ from flask import Flask, Response, jsonify, request, send_from_directory
 import config
 from repositories.aitool import UpstreamError
 from services import aifix as aifix_service
+from services import backup as backup_service
 from services import cycle as cycle_service
 from services import log as log_service
 from services import master as master_service
@@ -28,6 +30,7 @@ READ_HANDLERS = {
     "api/sync_status": sync_service.get_sync_status,
     "api/status": sync_service.get_general_status,
     "api/ai_fix/status": aifix_service.get_ai_fix_status,
+    "api/cycle/backup": backup_service.get_cycle_backups,
     "clients_master.json": master_service.get_master,
     "client_database.json": master_service.get_database,
 }

@@ -103,6 +103,14 @@ class Stub(BaseHTTPRequestHandler):
             source = copy.deepcopy(VALID_SOURCE)
             if Stub.mode == "extra_top":
                 source["unexpected"] = TOKEN_CANARY
+            elif Stub.mode == "missing_room":
+                source.pop("room")
+            elif Stub.mode == "missing_roster":
+                source.pop("roster")
+            elif Stub.mode == "bad_room":
+                source["room"] = 1
+            elif Stub.mode == "bad_roster":
+                source["roster"] = "not-an-object"
             elif Stub.mode == "extra_client":
                 source["clients"][0]["password"] = TOKEN_CANARY
             elif Stub.mode == "missing_client_field":
@@ -239,7 +247,9 @@ def main():
         check("selectedClientIdx null is accepted", status == 200 and body_json(raw)["selectedClientIdx"] is None)
 
         invalid_modes = [
-            ("extra_top", "extra top-level field"), ("extra_client", "extra client field"),
+            ("extra_top", "extra top-level field"), ("missing_room", "missing upstream room"),
+            ("missing_roster", "missing upstream roster"), ("bad_room", "invalid upstream room"),
+            ("bad_roster", "invalid upstream roster"), ("extra_client", "extra client field"),
             ("missing_client_field", "missing client field"), ("extra_resource", "extra resource field"),
             ("extra_task", "extra task field"), ("extra_log", "extra log field"),
             ("bad_ok", "non-boolean ok"), ("bad_timestamp", "invalid fetchedAt"),

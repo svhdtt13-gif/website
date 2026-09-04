@@ -6,6 +6,7 @@ Khong dung ai tool that, khong ghi gi ra ngoai. Exit 0 khi tat ca PASS.
 """
 import json
 import os
+import socket
 import subprocess
 import sys
 import threading
@@ -16,10 +17,18 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 BACKEND_DIR = os.path.join(REPO_ROOT, "webapp", "backend")
-PROXY_PORT = 18093
-STUB_PORT = 18092
 PASS_COUNT = 0
 FAIL_COUNT = 0
+
+
+def free_port():
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+PROXY_PORT = free_port()
+STUB_PORT = free_port()
 
 
 def check(name, cond, detail=""):
@@ -215,6 +224,16 @@ def main():
     finally:
         try:
             proc.terminate()
+            proc.wait(timeout=5)
+        except Exception:
+            try:
+                proc.kill()
+                proc.wait(timeout=5)
+            except Exception:
+                pass
+        try:
+            stub.shutdown()
+            stub.server_close()
         except Exception:
             pass
 

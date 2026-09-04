@@ -5,6 +5,7 @@ Tu dung upstream stub + proxy subprocess; khong dung ai tool that, khong ghi fil
 """
 import json
 import os
+import socket
 import subprocess
 import sys
 import threading
@@ -15,10 +16,18 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 BACKEND_DIR = os.path.join(REPO_ROOT, "webapp", "backend")
-PROXY_PORT = 18094
-STUB_PORT = 18095
 PASS_COUNT = 0
 FAIL_COUNT = 0
+
+
+def free_port():
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+PROXY_PORT = free_port()
+STUB_PORT = free_port()
 
 
 def check(name, condition, detail=""):
@@ -97,7 +106,6 @@ def http_call(base, path, method="GET", data=None, headers=None, timeout=10):
 
 
 def main():
-    proxy_url = f"http://127.0.0.1:{PROXY_PORT}"
     stub = HTTPServer(("127.0.0.1", STUB_PORT), Stub)
     threading.Thread(target=stub.serve_forever, kwargs={"poll_interval": 0.1},
                      daemon=True).start()
@@ -130,7 +138,7 @@ def main():
         Stub.hits.clear()
         status, body, ctype = http_call(proxy, "/up/api/cycle/backup")
         data = json.loads(body.decode("utf-8"))
-        check("GET backup -> 200 backups shape + JSON", 
+        check("GET backup -> 200 backups shape + JSON",
               status == 200 and isinstance(data.get("backups"), list)
               and "application/json" in (ctype or ""),
               f"status={status} body={body[:200]}")
@@ -177,6 +185,16 @@ def main():
     finally:
         try:
             proc.terminate()
+            proc.wait(timeout=5)
+        except Exception:
+            try:
+                proc.kill()
+                proc.wait(timeout=5)
+            except Exception:
+                pass
+        try:
+            stub.shutdown()
+            stub.server_close()
         except Exception:
             pass
 

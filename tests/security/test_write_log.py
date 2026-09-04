@@ -36,10 +36,11 @@ class Stub(BaseHTTPRequestHandler):
     """Mimic toi thieu ai tool: GET ok; POST /api/log can Basic + X-DB-Editor."""
     hits = []
 
-    def _rec(self):
+    def _rec(self, body=b""):
         Stub.hits.append((self.command, self.path,
                           self.headers.get("Authorization", ""),
-                          self.headers.get("X-DB-Editor", "")))
+                          self.headers.get("X-DB-Editor", ""), body,
+                          self.headers.get("Content-Type", "")))
 
     def _send(self, obj, code=200):
         body = json.dumps(obj).encode()
@@ -57,9 +58,9 @@ class Stub(BaseHTTPRequestHandler):
         self._send({"ok": True})
 
     def do_POST(self):
-        self._rec()
         length = int(self.headers.get("Content-Length", 0) or 0)
         raw = self.rfile.read(length) if length else b""
+        self._rec(raw)
         if self.path != "/api/log":
             self._send({"error": "not found"}, 404)
             return
@@ -84,8 +85,10 @@ class Stub(BaseHTTPRequestHandler):
         pass
 
 
-def http_call(base, path, method="GET", data=None, ctype="application/json", timeout=10):
+def http_call(base, path, method="GET", data=None, ctype="application/json",
+              extra_headers=None, timeout=10):
     headers = {"Content-Type": ctype} if data is not None else {}
+    headers.update(extra_headers or {})
     req = urllib.request.Request(base + path, data=data, headers=headers, method=method)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
@@ -96,6 +99,13 @@ def http_call(base, path, method="GET", data=None, ctype="application/json", tim
         except Exception:
             body = b""
         return e.code, body, ""
+
+
+def json_body(body):
+    try:
+        return json.loads(body.decode("utf-8"))
+    except Exception:
+        return {}
 
 
 def main():
@@ -126,64 +136,58 @@ def main():
         check("proxy boots", ready)
         if not ready:
             return 1
-        # 1. POST hop le -> 200 passthrough, stub thay Basic + X-DB-Editor + dung body
+        # Valid request: exact bytes, Content-Type, auth and marker boundary.
         Stub.hits.clear()
-        payload = json.dumps({"action": "phase2-slice2-test",
-                              "clients": "c1", "schedule": "s1"}).encode()
-        status, body, ctype = http_call(proxy_url, "/up/api/log",
-                                        method="POST", data=payload)
-        try:
-            data = json.loads(body.decode("utf-8"))
-        except Exception:
-            data = {}
+        payload = b' {"action":"phase2-slice2-test","clients":"c1","schedule":"s1","text":"\xc3\xa9"} '
+        content_type = "application/json; charset=utf-8"
+        status, body, ctype = http_call(
+            proxy_url, "/up/api/log", method="POST", data=payload,
+            ctype=content_type, extra_headers={"X-DB-Editor": "client-forged"})
+        data = json_body(body)
         check("POST valid -> 200 logged passthrough",
               status == 200 and data.get("status") == "logged"
               and "application/json" in (ctype or ""),
               f"status={status} body={body[:200]}")
         fwd = [h for h in Stub.hits if h[0] == "POST" and h[1] == "/api/log"]
-        check("upstream got POST with Basic + X-DB-Editor",
+        check("upstream got exact raw body + Content-Type",
+              len(fwd) == 1 and fwd[0][4] == payload and fwd[0][5] == content_type,
+              str(fwd)[:250])
+        check("repository overwrites forged marker",
               len(fwd) == 1 and fwd[0][2].startswith("Basic ") and fwd[0][3] == "1",
               str(fwd)[:200])
-        # 2. JSON sai -> passthrough 500 tu upstream, khong crash
-        status, body, _ = http_call(proxy_url, "/up/api/log",
-                                    method="POST", data=b"{not-json")
-        try:
-            data = json.loads(body.decode("utf-8"))
-        except Exception:
-            data = {}
-        check("POST malformed -> upstream 500 passthrough",
-              status == 500 and "error" in data, f"got {status}")
-        # 3. POST path READ khac van 403, upstream zero write ngoai api/log
+        # Exact upstream errors for empty, malformed and wrong JSON type.
+        for label, raw in (("empty body", b""),
+                           ("malformed JSON", b"{not-json"),
+                           ("wrong JSON type", b"[]")):
+            status, body, _ = http_call(proxy_url, "/up/api/log",
+                                        method="POST", data=raw)
+            data = json_body(body)
+            check(f"POST {label} -> 500 JSON error",
+                  status == 500 and "error" in data, f"got {status} body={body[:150]}")
+        # POST path READ khac van 403, upstream zero write ngoai api/log.
         Stub.hits.clear()
         status, body, _ = http_call(proxy_url, "/up/api/cycle/status",
                                     method="POST", data=b"{}")
-        try:
-            data = json.loads(body.decode("utf-8"))
-        except Exception:
-            data = {}
+        data = json_body(body)
         writes = [h for h in Stub.hits if h[0] != "GET"]
         check("POST other path -> 403 + zero upstream writes",
               status == 403 and "error" in data and not writes,
               f"got {status} writes={writes}"[:200])
-        # 4. PUT/PATCH/DELETE len api/log van 403
+        # Other methods on api/log remain blocked.
         for method in ("PUT", "PATCH", "DELETE"):
             status, _, _ = http_call(proxy_url, "/up/api/log",
                                      method=method, data=b"{}")
             check(f"{method} /up/api/log -> 403", status == 403, f"got {status}")
-        # 5. GET /up/api/log van 403 (upstream khong co GET)
         status, _, _ = http_call(proxy_url, "/up/api/log")
         check("GET /up/api/log -> 403", status == 403, f"got {status}")
-        # 6. Upstream chet -> 502 JSON on dinh, proxy song
+        # Upstream down -> stable 502 JSON, proxy remains alive.
         stub.shutdown()
         time.sleep(0.5)
         status, body, _ = http_call(proxy_url, "/up/api/log",
                                     method="POST", data=payload, timeout=30)
-        try:
-            data = json.loads(body.decode("utf-8"))
-            ok = status == 502 and "error" in data
-        except Exception:
-            ok = False
-        check("upstream down -> 502 json-error", ok, f"got {status}")
+        data = json_body(body)
+        check("upstream down -> 502 json-error", status == 502 and "error" in data,
+              f"got {status}")
         check("proxy survives upstream outage", proc.poll() is None)
         print(f"\nSUMMARY: {PASS_COUNT} passed, {FAIL_COUNT} failed")
         return 0 if FAIL_COUNT == 0 else 1

@@ -1,10 +1,11 @@
-"""Flask app: serve frontend tinh + proxy GET allowlist + POST api/log.
+"""Flask app: serve frontend tinh + proxy GET allowlist + POST write allowlist.
 
 Luong Phase 2: route -> service -> repository -> ai tool.
 Hanh vi GET giu nguyen proxy read-only; Slice 2 chi mo write api/log
 sau khi qua Bearer gate rieng cua website.
 Slice 3 them GET api/cycle/backup; Slice 4 them GET api/master rieng.
 Slice 5 them GET api/settings voi positive allowlist va fail-closed redaction.
+Slice 6 them POST api/cycle/backup voi write gate va spacing.
 """
 import hmac
 import pathlib
@@ -41,6 +42,7 @@ READ_HANDLERS = {
 
 WRITE_HANDLERS = {
     "api/log": log_service.append_log,
+    "api/cycle/backup": backup_service.create_cycle_backup,
 }
 
 

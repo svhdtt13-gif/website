@@ -1,8 +1,9 @@
 """Services for cycle backup metadata and backup creation."""
+import json
 import threading
 import time
 
-from repositories.aitool import ai_tool
+from repositories.aitool import UpstreamError, ai_tool
 
 
 _BACKUP_MIN_SPACING_SECONDS = 1.1
@@ -13,6 +14,36 @@ _last_upstream_backup_at = 0.0
 def get_cycle_backups():
     """GET api/cycle/backup — chi doc danh sach metadata backup."""
     return ai_tool.get("api/cycle/backup")
+
+
+def _invalid_success():
+    """Never expose malformed success bodies or retry a backup creation."""
+    raise UpstreamError(502, b'{"error":"invalid backup response"}')
+
+
+def _validate_success(body, status, content_type):
+    if status != 200 or "application/json" not in (content_type or ""):
+        _invalid_success()
+    try:
+        response = json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        _invalid_success()
+    if not isinstance(response, dict):
+        _invalid_success()
+    if response.get("status") != "OK" or not isinstance(response.get("backup"), str):
+        _invalid_success()
+    manifest = response.get("manifest")
+    if not isinstance(manifest, dict):
+        _invalid_success()
+    if not isinstance(manifest.get("created_at"), str):
+        _invalid_success()
+    if not isinstance(manifest.get("label"), str):
+        _invalid_success()
+    if not isinstance(manifest.get("files"), list):
+        _invalid_success()
+    if not isinstance(manifest.get("script_files"), list):
+        _invalid_success()
+    return body, status, content_type
 
 
 def create_cycle_backup(body, content_type="application/json"):
@@ -28,6 +59,7 @@ def create_cycle_backup(body, content_type="application/json"):
         if delay > 0:
             time.sleep(delay)
         try:
-            return ai_tool.post("api/cycle/backup", body, content_type)
+            result = ai_tool.post("api/cycle/backup", body, content_type)
+            return _validate_success(*result)
         finally:
             _last_upstream_backup_at = time.monotonic()

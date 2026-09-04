@@ -7,9 +7,10 @@ from repositories.aitool import UpstreamError, ai_tool
 
 
 _REMOTE_LIVE_LOCK = threading.Lock()
-_TOP_LEVEL_FIELDS = frozenset({
+_PUBLIC_TOP_LEVEL_FIELDS = frozenset({
     "ok", "fetchedAt", "clientCount", "selectedClientIdx", "clients", "tasks", "logs"
 })
+_UPSTREAM_TOP_LEVEL_FIELDS = _PUBLIC_TOP_LEVEL_FIELDS | {"room", "roster"}
 _CLIENT_FIELDS = frozenset({
     "idx", "id", "name", "state", "cap", "capAge", "uiStatus", "level", "resources", "checked"
 })
@@ -93,7 +94,9 @@ def _project_snapshot(body, status, content_type):
         _safe_error()
     try:
         source = _decode_object(body)
-        if set(source) != _TOP_LEVEL_FIELDS or source["ok"] is not True:
+        if not _PUBLIC_TOP_LEVEL_FIELDS.issubset(source) or set(source) - _UPSTREAM_TOP_LEVEL_FIELDS:
+            raise RemoteLiveValidationError()
+        if source["ok"] is not True:
             raise RemoteLiveValidationError()
         if not _valid_timestamp(source["fetchedAt"]):
             raise RemoteLiveValidationError()

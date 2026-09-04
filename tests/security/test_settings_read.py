@@ -21,7 +21,7 @@ def free_port():
         return s.getsockname()[1]
 
 PROXY_PORT, STUB_PORT = free_port(), free_port()
-PUBLIC_KEYS = {"default_browser", "tunnel_port", "auto_restart_tunnel", "auto_telegram", "auto_open_browser"}
+PUBLIC_KEYS = {"tunnel_port", "auto_restart_tunnel", "auto_telegram", "auto_open_browser"}
 CANARIES = ("BOT_TOKEN_CANARY", "CHAT_ID_CANARY", "PASSWORD_CANARY", "NESTED_SECRET_CANARY")
 
 
@@ -69,8 +69,20 @@ class Stub(BaseHTTPRequestHandler):
         elif Stub.mode == "valid":
             self._send(json.dumps(Stub.valid).encode())
         elif Stub.mode == "missing":
-            self._send(json.dumps({"default_browser": "default", "auto_telegram": True,
+            self._send(json.dumps({"auto_telegram": True,
                                    "unknown": {"nested": CANARIES[3]}}).encode())
+        elif Stub.mode == "allowlisted_canary":
+            payload = dict(Stub.valid)
+            payload["tunnel_port"] = CANARIES[0]
+            self._send(json.dumps(payload).encode())
+        elif Stub.mode == "port_low":
+            payload = dict(Stub.valid)
+            payload["tunnel_port"] = 0
+            self._send(json.dumps(payload).encode())
+        elif Stub.mode == "port_high":
+            payload = dict(Stub.valid)
+            payload["tunnel_port"] = 65536
+            self._send(json.dumps(payload).encode())
         elif Stub.mode == "malformed":
             self._send(b'{"telegram_bot_token":"' + CANARIES[0].encode())
         elif Stub.mode == "array":
@@ -137,9 +149,8 @@ def main():
         Stub.hits.clear()
         status, raw, ctype = call(proxy, "/up/api/settings")
         data = body_json(raw)
-        expected = {"default_browser": "chrome", "tunnel_port": 18080,
-                    "auto_restart_tunnel": True, "auto_telegram": False,
-                    "auto_open_browser": True}
+        expected = {"tunnel_port": 18080, "auto_restart_tunnel": True,
+                    "auto_telegram": False, "auto_open_browser": True}
         check("valid response is exact positive allowlist JSON", status == 200 and data == expected
               and set(data).issubset(PUBLIC_KEYS) and "application/json" in ctype, str(data))
         check("valid response has no secret canary", not any(x.encode() in raw for x in CANARIES), raw.decode(errors="replace"))
@@ -148,8 +159,16 @@ def main():
 
         Stub.mode = "missing"
         status, raw, _ = call(proxy, "/up/api/settings")
-        check("missing keys stay absent", status == 200 and body_json(raw) ==
-              {"default_browser": "default", "auto_telegram": True}, raw.decode(errors="replace"))
+        check("missing keys stay absent", status == 200 and body_json(raw) == {"auto_telegram": True}, raw.decode(errors="replace"))
+
+        for mode, label in (("allowlisted_canary", "allowlisted canary"),
+                            ("port_low", "port below range"), ("port_high", "port above range")):
+            Stub.mode = mode
+            status, raw, _ = call(proxy, "/up/api/settings")
+            data = body_json(raw)
+            check(label + " -> generic 502", status == 502 and isinstance(data, dict)
+                  and data == {"error": "settings upstream response unavailable"}
+                  and not any(x.encode() in raw for x in CANARIES), raw.decode(errors="replace"))
 
         for mode, label in (("malformed", "malformed JSON"), ("array", "non-object JSON")):
             Stub.mode = mode

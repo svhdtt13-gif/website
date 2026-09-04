@@ -190,7 +190,9 @@ def update_master_names(body, content_type="application/json"):
         names = {}
         for client_id, expected_name, name in changes:
             current = by_client.get(client_id)
-            if current is None or current["name"] != expected_name:
+            if current is None:
+                _invalid_request()
+            if current["name"] != expected_name:
                 _conflict()
             names[client_id] = name
         if not any(names[client_id] != by_client[client_id]["name"] for client_id in names):

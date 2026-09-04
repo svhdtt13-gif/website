@@ -13,6 +13,7 @@ _PUBLIC_FIELDS = (
 )
 _PUBLIC_FIELD_NAMES = frozenset(field for field, _expected in _PUBLIC_FIELDS)
 _SETTINGS_WRITE_LOCK = threading.Lock()
+_ALLOWED_JSON_CONTENT_TYPES = {"application/json", "application/json; charset=utf-8"}
 
 
 class SettingsValidationError(Exception):
@@ -85,7 +86,7 @@ def get_settings():
 
 
 def _prepare_update(body, content_type):
-    if (content_type or "").split(";", 1)[0].strip().lower() != "application/json":
+    if (content_type or "").strip().lower() not in _ALLOWED_JSON_CONTENT_TYPES:
         _invalid_request()
     if not body:
         _invalid_request()

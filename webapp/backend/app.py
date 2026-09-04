@@ -4,6 +4,7 @@ Luong Phase 2: route -> service -> repository -> ai tool.
 Hanh vi GET giu nguyen proxy read-only; Slice 2 chi mo write api/log
 sau khi qua Bearer gate rieng cua website.
 Slice 3 them GET api/cycle/backup; Slice 4 them GET api/master rieng.
+Slice 5 them GET api/settings voi positive allowlist va fail-closed redaction.
 """
 import hmac
 import pathlib
@@ -17,6 +18,7 @@ from services import backup as backup_service
 from services import cycle as cycle_service
 from services import log as log_service
 from services import master as master_service
+from services import settings as settings_service
 from services import sync as sync_service
 
 BASE = pathlib.Path(__file__).resolve().parent
@@ -34,6 +36,7 @@ READ_HANDLERS = {
     "api/master": master_service.get_api_master,
     "clients_master.json": master_service.get_master,
     "client_database.json": master_service.get_database,
+    "api/settings": settings_service.get_settings,
 }
 
 WRITE_HANDLERS = {

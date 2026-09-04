@@ -5,7 +5,6 @@ from repositories.aitool import UpstreamError, ai_tool
 
 
 _PUBLIC_FIELDS = (
-    ("default_browser", str),
     ("tunnel_port", int),
     ("auto_restart_tunnel", bool),
     ("auto_telegram", bool),
@@ -46,9 +45,12 @@ def get_settings():
     for field, expected in _PUBLIC_FIELDS:
         if field not in settings:
             continue
-        if not _is_exact_type(settings[field], expected):
+        value = settings[field]
+        if not _is_exact_type(value, expected):
             _safe_error()
-        public[field] = settings[field]
+        if field == "tunnel_port" and not 1 <= value <= 65535:
+            _safe_error()
+        public[field] = value
 
     return (
         json.dumps(public, ensure_ascii=False, separators=(",", ":")).encode("utf-8"),

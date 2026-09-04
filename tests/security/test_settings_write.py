@@ -183,8 +183,9 @@ def main():
                                ("forged marker only", {"X-DB-Editor": "1"})):
             Stub.hits.clear()
             status, body, response_headers = call_headers(proxy, "/up/api/settings", "POST", b'{"auto_telegram":true}', headers)
+            challenge = response_headers.get("WWW-Authenticate") or response_headers.get("Www-Authenticate")
             check(label + " -> 401 + WWW-Authenticate + zero upstream writes",
-                  status == 401 and response_headers.get("WWW-Authenticate") == "Bearer"
+                  status == 401 and challenge == "Bearer"
                   and b'"error"' in body and not [h for h in Stub.hits if h["method"] != "GET"],
                   f"status={status} headers={response_headers}")
 

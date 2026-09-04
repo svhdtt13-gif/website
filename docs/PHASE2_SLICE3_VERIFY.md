@@ -28,10 +28,10 @@ Theo `WebAppControl/flask/app_public.py` của ai tool:
 
 ## Verification
 
-- `tests/security/test_backup_read.py`: **15/15 pass** trên stub local:
+- `tests/security/test_backup_read.py`: **17/17 pass** trên stub local:
   boot, GET shape/content-type, Basic Auth, POST/PUT/PATCH/DELETE 403 + zero
-  upstream write, traversal variants, Slice 2 write gate, upstream error/body,
-  proxy survival.
+  upstream write, traversal variants, Slice 2 write gate, upstream HTTP 500,
+  connection-refused 502 JSON + proxy survival.
 - Regression `tests/security/test_proxy.py`: **10/10 pass**; 7 read path cũ
   vẫn giữ nguyên và mọi write cũ vẫn bị chặn.
 - Regression `tests/security/test_write_log.py`: **16/16 pass**; Bearer gate,
@@ -43,6 +43,9 @@ Theo `WebAppControl/flask/app_public.py` của ai tool:
   Basic Auth; status `200`, MIME `application/json`, body **3684 bytes** khớp
   byte-for-byte. Không có backup tạo đồng thời nên không phát sinh delta cần
   nới assertion.
+- Snapshot thư mục backup trước/sau giống hệt:
+  `cycle_20260904_081215.zip|158684|2026-09-04T01:12:15.6581298Z`;
+  `cycle_20260904_081521.zip|159020|2026-09-04T01:15:21.8851623Z`.
 - Live pre/post: AutoCycle PID **21268** giữ nguyên và alive.
   `cycle_state.json` SHA-256 giữ nguyên:
   `37B3D96B07FD54C6FFF516EF3C601A6F9F4A8357AFAEB5125CC52B9626D613F4`.

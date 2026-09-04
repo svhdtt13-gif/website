@@ -13,8 +13,14 @@ scheduler ownership.
 - Upstream: `POST /api/cycle/backup` với Basic Auth.
 - Website Bearer token phải pass trước handler/repository.
 - Repository tự thêm/ghi đè `X-DB-Editor: 1`; client marker không phải auth.
-- JSON/form body và Content-Type forward raw để giữ golden semantics label.
-- Success passthrough: `200 application/json` với `status`, `backup`, `manifest`.
+- JSON/form body và Content-Type forward raw; empty request body phải tới upstream
+  đúng `b""`, không synthesize `{}`.
+- Success body `200 application/json` phải parse thành object có contract đầy đủ:
+  `status=OK`, string `backup`, manifest object với string `created_at`/`label`
+  và list `files`/`script_files`.
+- Malformed JSON, non-object hoặc thiếu/sai success contract tại HTTP 200 ->
+  generic `502 {"error":"invalid backup response"}`, không echo raw body và
+  không retry.
 - Upstream error/unreachable giữ status/error behavior hiện tại của repository.
 - Missing/wrong Bearer -> `401` JSON, zero upstream write.
 - PUT/PATCH/DELETE cùng path và restore/delete subpaths -> `403` JSON, zero
@@ -45,10 +51,13 @@ snapshot artifact vẫn best-effort theo golden khi runtime file đang thay đ�
 
 ## Automated verification
 
-- `tests/security/test_backup_write.py`: **23/23 pass**:
+- `tests/security/test_backup_write.py`: **28/28 pass**:
   - Bearer missing/wrong/forged marker gate;
   - exact JSON/form raw body and Content-Type forwarding;
+  - empty request body forwarded as exact `b""`;
   - repository Basic Auth and owned `X-DB-Editor: 1`;
+  - malformed/non-object/missing-contract HTTP 200 -> generic 502, raw body not
+    echoed and exactly one upstream attempt;
   - upstream error and unreachable handling;
   - concurrent requests serialized with upstream spacing >= 1.0s;
   - GET remains available; other methods/subpaths blocked;
@@ -56,7 +65,7 @@ snapshot artifact vẫn best-effort theo golden khi runtime file đang thay đ�
 - Regression:
   - `test_proxy.py`: **10/10 pass**.
   - `test_write_log.py`: **16/16 pass**.
-  - `test_backup_read.py`: **17/17 pass** (POST without Bearer now explicitly
+  - `test_backup_read.py`: **17/17 pass** (POST without Bearer explicitly
     expects `401`; PUT/PATCH/DELETE remain `403`).
   - `test_master_read.py`: **16/16 pass**.
   - `test_settings_read.py`: **24/24 pass**.
@@ -70,12 +79,13 @@ snapshot and cleanup; no shared `+1` artifact claim:
 1. Direct golden POST: `200`; exact response filename used; new ZIP marker,
    manifest label, local SHA-256 and size matched API metadata; exact artifact
    deleted; state snapshot unchanged; AutoCycle alive.
-2. Proxy POST: `200`; Bearer gate and forged client marker path exercised; new ZIP
-   marker, manifest label, local SHA-256 and size matched API metadata; exact
-   artifact deleted; state snapshot unchanged; AutoCycle alive.
+2. Proxy POST on current validation code: `200`; Bearer gate and forged client
+   marker path exercised; validated success response, new ZIP marker, manifest
+   label, local SHA-256 and size matched API metadata; exact artifact deleted;
+   state snapshot unchanged; AutoCycle alive.
 3. Concurrent proxy POST: two `200` responses; two distinct marker artifacts,
-   no overwrite; each manifest/hash/size verified independently; both exact
-   artifacts deleted; state snapshot unchanged; AutoCycle alive.
+   no overwrite; each manifest/hash/size verified independently; exact artifacts
+   deleted; state snapshot unchanged; AutoCycle alive.
 
 Snapshot included settings, client database, cycle state, master hash, client
 IDs, and AutoCycle PID. No sync, remote WebSocket, restart/stop, or other write

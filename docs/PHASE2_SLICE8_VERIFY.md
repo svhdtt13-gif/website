@@ -22,7 +22,8 @@ Request body chỉ có dạng:
 - `changes` là non-empty array; mỗi item có đúng `client`, `expected_name`, `name`.
 - Không duplicate client; mọi field là exact JSON string.
 - `name` và `expected_name` dài `1..200` Unicode characters, không whitespace-only,
-  control character hoặc CR/LF; không coercion, trim hay fallback.
+  control character `U+0000..U+001F`, DEL `U+007F` hoặc C1 `U+0080..U+009F`;
+  không coercion, trim hay fallback.
 - `client` phải là client hiện có; unknown client là generic `400`.
 - Full `collectMaster()` không phải write authority và bị reject.
 
@@ -44,7 +45,7 @@ Request body chỉ có dạng:
 - Success upstream phải có `status: "OK"`, `clients` và `schedule` là exact JSON
   integer, không phải bool, và `>= 0`.
 - Public response chỉ `{status, clients, schedule}`.
-- Malformed/non-object/missing/invalid success, upstream error hoặc unreachable
+- Malformed/non-object/missing/invalid success, upstream `4xx/5xx` hoặc unreachable
   đều trả generic sanitized `502`, không raw echo và không retry.
 
 ## Side effects and rollback
@@ -64,12 +65,13 @@ Live rollback chỉ rename một client non-fixed bằng CAS từ tên gốc san
 
 ## Automated verification
 
-- `tests/security/test_master_write.py`: **51/51 pass**:
+- `tests/security/test_master_write.py`: **54/54 pass**:
   - Bearer gate, owned marker và zero upstream khi unauthenticated;
   - exact MIME/schema/name/unknown/duplicate/full-payload rejection;
+  - name control rejection cho C0, DEL và C1;
   - fresh snapshot canonical payload và no raw `slot`/CAS fields forward;
   - stale CAS `409`, zero upstream POST;
-  - malformed/error/unreachable response sanitization;
+  - malformed/error/unreachable response sanitization thành generic `502`;
   - exact integer counter validation;
   - concurrent different-client and same-client CAS behavior;
   - method/subpath blocking và no direct file access.

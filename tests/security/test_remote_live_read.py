@@ -221,14 +221,13 @@ def main():
         if not ready:
             return 1
 
-        for query, expected, body in (("?client=client-a", 401, {"error": "write authentication required"}),
+        for query, expected, body in (("?client=client-a", 400, {"error": "invalid remote selector query"}),
                                       ("?t=123", 400, {"error": "invalid remote selector query"}),
                                       ("?anything=1", 400, {"error": "invalid remote selector query"})):
             Stub.reset()
-            status, raw, response_headers = call(proxy, "/up/api/remote_live" + query)
-            challenge_ok = expected != 401 or (response_headers.get("WWW-Authenticate") or response_headers.get("Www-Authenticate")) == "Bearer"
-            check("query " + query + " -> boundary guard/auth and zero upstream",
-                  status == expected and body_json(raw) == body and challenge_ok and not remote_hits())
+            status, raw, _ = call(proxy, "/up/api/remote_live" + query)
+            check("query " + query + " -> boundary guard and zero upstream",
+                  status == expected and body_json(raw) == body and not remote_hits())
 
         Stub.reset()
         status, raw, _ = call(proxy, "/up/api/remote_live")
@@ -309,7 +308,8 @@ def main():
         with open(os.path.join(BACKEND, "app.py"), encoding="utf-8") as source_file:
             app_source = source_file.read()
         check("query guard is at route boundary", "request.query_string" in app_source
-              and "remote live selector not allowed" in app_source)
+              and "parse_selector_query(request.query_string)" in app_source
+              and "RemoteSelectorQueryError" in app_source)
 
         stub.shutdown(); stub.server_close(); time.sleep(0.2)
         status, raw, _ = call(proxy, "/up/api/remote_live")

@@ -89,7 +89,7 @@ class Stub(BaseHTTPRequestHandler):
         elif Stub.mode == "non_object":
             self._send(b'[{"status":"OK"}]')
         elif Stub.mode == "missing_contract":
-            self._send(b'{"status":"OK","settings":{}}')
+            self._send(b'{"status":"OK"}')
         elif Stub.mode == "corrupt_port":
             source = dict(SOURCE)
             source["tunnel_port"] = CANARIES[0]
@@ -136,7 +136,7 @@ def main():
     threading.Thread(target=stub.serve_forever, kwargs={"poll_interval": 0.1}, daemon=True).start()
     env = dict(os.environ)
     env.update(AI_TOOL_API_BASE=f"http://127.0.0.1:{STUB_PORT}", AI_TOOL_USER="tester",
-               AI_TOOL_PASS="dummy", WEBAPP_WRITE_TOKEN=TOKEN, WEBAPP_PORT=str(PROXY_PORT))
+               AI_TOOL_PASS="dummy", WEBAPP_PORT=str(PROXY_PORT))
     proc = subprocess.Popen([sys.executable, os.path.join(BACKEND, "proxy.py")],
                             cwd=BACKEND, env=env, stdout=subprocess.DEVNULL,
                             stderr=subprocess.DEVNULL)

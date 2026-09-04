@@ -1,8 +1,5 @@
 #!/usr/bin/env python3
-"""Slice 3 contract/security test cho GET /up/api/cycle/backup.
-
-Tu dung upstream stub + proxy subprocess; khong dung ai tool that, khong ghi file.
-"""
+"""Regression/security tests for GET /up/api/cycle/backup after Slice 6."""
 import json
 import os
 import socket
@@ -21,7 +18,7 @@ FAIL_COUNT = 0
 
 
 def free_port():
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+    with socket.socket(socket.AF_INET, SOCK_STREAM) as sock:
         sock.bind(("127.0.0.1", 0))
         return sock.getsockname()[1]
 
@@ -107,8 +104,7 @@ def http_call(base, path, method="GET", data=None, headers=None, timeout=10):
 
 def main():
     stub = HTTPServer(("127.0.0.1", STUB_PORT), Stub)
-    threading.Thread(target=stub.serve_forever, kwargs={"poll_interval": 0.1},
-                     daemon=True).start()
+    threading.Thread(target=stub.serve_forever, kwargs={"poll_interval": 0.1}, daemon=True).start()
     env = dict(os.environ)
     env["AI_TOOL_API_BASE"] = f"http://127.0.0.1:{STUB_PORT}"
     env["AI_TOOL_USER"] = "tester"
@@ -146,11 +142,14 @@ def main():
         check("GET backup forwards Basic auth", len(reads) == 1 and reads[0][2].startswith("Basic "))
 
         Stub.hits.clear()
-        for method in ("POST", "PUT", "PATCH", "DELETE"):
+        for method in ("PUT", "PATCH", "DELETE"):
             status, body, _ = http_call(proxy, "/up/api/cycle/backup", method=method, data=b"{}")
             check(f"{method} backup -> 403 JSON", status == 403 and b'\"error\"' in body,
                   f"got {status}")
-        check("backup methods cause zero upstream writes",
+        status, body, _ = http_call(proxy, "/up/api/cycle/backup", method="POST", data=b"{}")
+        check("POST backup without Bearer -> 401 JSON", status == 401 and b'\"error\"' in body,
+              f"got {status}")
+        check("blocked backup methods cause zero upstream writes",
               not [h for h in Stub.hits if h[0] != "GET"])
 
         Stub.hits.clear()

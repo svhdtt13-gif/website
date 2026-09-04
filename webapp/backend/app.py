@@ -9,6 +9,7 @@ Slice 6 them POST api/cycle/backup voi write gate va spacing.
 Slice 7 them POST api/settings voi shared projector va safe partial update.
 Slice 8 them guarded CAS name-only POST api/master.
 Slice 9 them canonical GET api/remote_live khong selector.
+Slice 10 them guarded remote selector query.
 """
 import hmac
 import pathlib
@@ -83,13 +84,19 @@ def create_app():
     @app.route("/up/<path:subpath>", methods=["GET", "POST", "PUT", "PATCH", "DELETE"])
     def upstream(subpath):
         if request.method == "GET":
-            # Selector query parameters can cause row_select in the golden app;
-            # reject them before allowlist dispatch and before any upstream call.
-            if subpath == "api/remote_live" and (request.query_string or request.args):
-                return jsonify({"error": "remote live selector not allowed"}), 400
+            handler = READ_HANDLERS.get(subpath)
+            if subpath == "api/remote_live" and request.query_string:
+                try:
+                    selector = remote_live_service.parse_selector_query(request.query_string)
+                except remote_live_service.RemoteSelectorQueryError:
+                    return jsonify({"error": "invalid remote selector query"}), 400
+                if not _write_authorized():
+                    return jsonify({"error": "write authentication required"}), 401, {
+                        "WWW-Authenticate": "Bearer"
+                    }
+                handler = lambda: remote_live_service.get_remote_live_selector(selector)
             if subpath not in config.READ_ONLY_ALLOWLIST:
                 return jsonify({"error": "read-only proxy: endpoint not allowed"}), 403
-            handler = READ_HANDLERS.get(subpath)
             if handler is None:
                 # Allowlist co path chua co service: chan thay vi forward truc tiep.
                 return jsonify({"error": "read-only proxy: endpoint not allowed"}), 403

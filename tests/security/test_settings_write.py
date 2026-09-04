@@ -136,7 +136,7 @@ def main():
     threading.Thread(target=stub.serve_forever, kwargs={"poll_interval": 0.1}, daemon=True).start()
     env = dict(os.environ)
     env.update(AI_TOOL_API_BASE=f"http://127.0.0.1:{STUB_PORT}", AI_TOOL_USER="tester",
-               AI_TOOL_PASS="dummy", WEBAPP_PORT=str(PROXY_PORT))
+               AI_TOOL_PASS="dummy", WEBAPP_WRITE_TOKEN=TOKEN, WEBAPP_PORT=str(PROXY_PORT))
     proc = subprocess.Popen([sys.executable, os.path.join(BACKEND, "proxy.py")],
                             cwd=BACKEND, env=env, stdout=subprocess.DEVNULL,
                             stderr=subprocess.DEVNULL)

@@ -117,6 +117,7 @@ def main():
     env["AI_TOOL_API_BASE"] = f"http://127.0.0.1:{STUB_PORT}"
     env["AI_TOOL_USER"] = "tester"
     env["AI_TOOL_PASS"] = "dummy"
+    env["WEBAPP_WRITE_TOKEN"] = "write-secret"
     env["WEBAPP_PORT"] = str(PROXY_PORT)
     proc = subprocess.Popen(
         [sys.executable, os.path.join(BACKEND_DIR, "proxy.py")],
@@ -136,15 +137,28 @@ def main():
         check("proxy boots", ready)
         if not ready:
             return 1
+        # Write auth fails before service/repository and never reaches upstream.
+        for label, headers in (("missing token", {}),
+                               ("wrong token", {"Authorization": "Bearer wrong"})):
+            Stub.hits.clear()
+            status, body, _ = http_call(proxy_url, "/up/api/log", method="POST",
+                                        data=b"{}", extra_headers=headers)
+            data = json_body(body)
+            writes = [h for h in Stub.hits if h[0] != "GET"]
+            check(f"{label} -> 401 JSON + zero upstream writes",
+                  status == 401 and "error" in data and not writes,
+                  f"got {status} hits={Stub.hits}")
         # Valid request: exact bytes, Content-Type, auth and marker boundary.
         Stub.hits.clear()
         payload = b' {"action":"phase2-slice2-test","clients":"c1","schedule":"s1","text":"\xc3\xa9"} '
         content_type = "application/json; charset=utf-8"
         status, body, ctype = http_call(
             proxy_url, "/up/api/log", method="POST", data=payload,
-            ctype=content_type, extra_headers={"X-DB-Editor": "client-forged"})
+            ctype=content_type,
+            extra_headers={"Authorization": "Bearer write-secret",
+                           "X-DB-Editor": "client-forged"})
         data = json_body(body)
-        check("POST valid -> 200 logged passthrough",
+        check("correct token -> 200 logged passthrough",
               status == 200 and data.get("status") == "logged"
               and "application/json" in (ctype or ""),
               f"status={status} body={body[:200]}")
@@ -159,32 +173,36 @@ def main():
         for label, raw in (("empty body", b""),
                            ("malformed JSON", b"{not-json"),
                            ("wrong JSON type", b"[]")):
-            status, body, _ = http_call(proxy_url, "/up/api/log",
-                                        method="POST", data=raw)
+            status, body, _ = http_call(
+                proxy_url, "/up/api/log", method="POST", data=raw,
+                extra_headers={"Authorization": "Bearer write-secret"})
             data = json_body(body)
             check(f"POST {label} -> 500 JSON error",
                   status == 500 and "error" in data, f"got {status} body={body[:150]}")
         # POST path READ khac van 403, upstream zero write ngoai api/log.
         Stub.hits.clear()
-        status, body, _ = http_call(proxy_url, "/up/api/cycle/status",
-                                    method="POST", data=b"{}")
+        status, body, _ = http_call(
+            proxy_url, "/up/api/cycle/status", method="POST", data=b"{}",
+            extra_headers={"Authorization": "Bearer write-secret"})
         data = json_body(body)
         writes = [h for h in Stub.hits if h[0] != "GET"]
         check("POST other path -> 403 + zero upstream writes",
               status == 403 and "error" in data and not writes,
               f"got {status} writes={writes}"[:200])
-        # Other methods on api/log remain blocked.
+        # Other methods on api/log remain blocked without touching upstream.
         for method in ("PUT", "PATCH", "DELETE"):
-            status, _, _ = http_call(proxy_url, "/up/api/log",
-                                     method=method, data=b"{}")
+            status, _, _ = http_call(
+                proxy_url, "/up/api/log", method=method, data=b"{}",
+                extra_headers={"Authorization": "Bearer write-secret"})
             check(f"{method} /up/api/log -> 403", status == 403, f"got {status}")
         status, _, _ = http_call(proxy_url, "/up/api/log")
         check("GET /up/api/log -> 403", status == 403, f"got {status}")
         # Upstream down -> stable 502 JSON, proxy remains alive.
         stub.shutdown()
         time.sleep(0.5)
-        status, body, _ = http_call(proxy_url, "/up/api/log",
-                                    method="POST", data=payload, timeout=30)
+        status, body, _ = http_call(
+            proxy_url, "/up/api/log", method="POST", data=payload,
+            extra_headers={"Authorization": "Bearer write-secret"}, timeout=30)
         data = json_body(body)
         check("upstream down -> 502 json-error", status == 502 and "error" in data,
               f"got {status}")

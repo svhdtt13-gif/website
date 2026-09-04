@@ -4,6 +4,8 @@ AI_TOOL_API_BASE = os.environ.get("AI_TOOL_API_BASE", "http://127.0.0.1:8080").r
 AI_TOOL_USER = os.environ.get("AI_TOOL_USER", "admin")
 AI_TOOL_PASS = os.environ.get("AI_TOOL_PASS", "")
 PORT = int(os.environ.get("WEBAPP_PORT", "8090"))
+# Required for every write request; never hard-code or commit this value.
+WEBAPP_WRITE_TOKEN = os.environ.get("WEBAPP_WRITE_TOKEN", "")
 
 # Chi cac endpoint GET nay duoc proxy (read-only). Moi thu khac -> 403.
 READ_ONLY_ALLOWLIST = {

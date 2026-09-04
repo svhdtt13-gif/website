@@ -1,10 +1,10 @@
-"""Flask app: serve frontend tinh + proxy GET allowlist (read-only) + POST api/log.
+"""Flask app: serve frontend tinh + proxy GET allowlist + POST api/log.
 
 Luong Phase 2: route -> service -> repository -> ai tool.
-Hanh vi va contract giu nguyen y het ban proxy truc tiep.
-Slice 2 chi mo duy nhat POST /up/api/log (qua services/log.py);
-moi POST/PUT/PATCH/DELETE khac van 403.
+Hanh vi GET giu nguyen proxy read-only; Slice 2 chi mo write api/log
+sau khi qua Bearer gate rieng cua website.
 """
+import hmac
 import pathlib
 
 from flask import Flask, Response, jsonify, request, send_from_directory
@@ -35,6 +35,13 @@ READ_HANDLERS = {
 WRITE_HANDLERS = {
     "api/log": log_service.append_log,
 }
+
+
+def _write_authorized():
+    """Require the website's minimal write token before contacting upstream."""
+    expected = config.WEBAPP_WRITE_TOKEN
+    supplied = request.headers.get("Authorization", "")
+    return bool(expected) and hmac.compare_digest(supplied, f"Bearer {expected}")
 
 
 def create_app():
@@ -71,8 +78,13 @@ def create_app():
             except UpstreamError as e:
                 return Response(e.body, status=e.status, content_type="application/json")
             return Response(body, status=status, content_type=ctype)
-        # Write: chi mo POST api/log, qua service -> repository.
+
+        # Write: method/path allowlist is not enough; require website Bearer auth first.
         if request.method == "POST" and subpath in config.WRITE_ALLOWLIST:
+            if not _write_authorized():
+                return jsonify({"error": "write authentication required"}), 401, {
+                    "WWW-Authenticate": "Bearer"
+                }
             handler = WRITE_HANDLERS.get(subpath)
             if handler is None:
                 return jsonify({"error": "read-only proxy: endpoint not allowed"}), 403

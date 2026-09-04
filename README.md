@@ -12,7 +12,7 @@ Dự án gốc `ai tool` (máy local, `tools/db.html` + Flask port 8080) **khôn
 3. Mọi thay đổi hành vi (ghi DB, điều khiển cycle) là **Phase 2**, sau khi app
    đọc ổn định và `db.html` gốc vẫn chạy bình thường.
 
-## Cấu trúc (Phase 1: tách module, giữ nguyên hành vi)
+## Cấu trúc (Phase 2: route → service → repository, mới chỉ READ)
 
 ```
 website/
@@ -26,14 +26,20 @@ website/
     ├── backend/              # proxy read-only + serve frontend
     │   ├── proxy.py          # entry mỏng (giữ lệnh chạy cũ)
     │   ├── app.py            # Flask app + routes (create_app)
-    │   ├── upstream.py       # chuyển tiếp GET sang ai tool
     │   ├── config.py
-    │   └── requirements.txt
+    │   ├── requirements.txt
+    │   ├── repositories/     # tầng data-access (hiện tại: ai tool qua HTTP)
+    │   │   └── aitool.py     # AiToolRepository.get() + UpstreamError
+    │   └── services/         # tầng nghiệp vụ đọc (cycle/sync/master/aifix)
     └── frontend/             # dashboard tĩnh, ES modules (không build)
         ├── index.html
         ├── css/base.css + components.css
         └── js/api.js, store.js, views.js, main.js
 ```
+
+Luồng đọc: `route (app.py) → service/* → repositories/aitool.py → ai tool`.
+Chưa có service ghi nào — write endpoint là lát cắt sau, từng cái một,
+mỗi cái có contract test + rollback riêng.
 
 ## Chạy thử skeleton (2 phút)
 
@@ -55,7 +61,9 @@ từ ai tool, không cần đăng nhập trình duyệt (proxy giữ credentials
 
 - Phase 0 (xong): docs + skeleton đọc + contract/security baseline xanh.
   `db.html` gốc phải luôn ổn định.
-- Phase 1 (đang làm): tách module, giữ nguyên tính năng.
-- Phase 2: ghi an toàn (qua API ai tool, có xác thực riêng).
+- Phase 1 (xong): tách module, giữ nguyên tính năng (`docs/PHASE1_VERIFY.md`,
+  `docs/PHASE1_UISMOKE.md`).
+- Phase 2 (đang làm): abstraction service/repository cho READ trước;
+  write endpoint từng cái một, có test + rollback.
 - Phase 3: DB SQLite + realtime + auth + tunnel cố định.
 - Chi tiết: `docs/DEPLOY_PLAN.md`.

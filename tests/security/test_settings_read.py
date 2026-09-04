@@ -16,7 +16,7 @@ BACKEND = os.path.join(ROOT, "webapp", "backend")
 PASS = FAIL = 0
 
 def free_port():
-    with socket.socket() as s:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind(("127.0.0.1", 0))
         return s.getsockname()[1]
 
@@ -107,8 +107,9 @@ class Stub(BaseHTTPRequestHandler):
         pass
 
 
-def call(base, path, method="GET", data=None, timeout=10):
-    req = urllib.request.Request(base + path, data=data, method=method)
+def call(base, path, method="GET", data=None, headers=None, timeout=10):
+    req = urllib.request.Request(base + path, data=data, method=method,
+                                 headers=headers or {})
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
             return r.status, r.read(), r.headers.get_content_type()
@@ -188,20 +189,24 @@ def main():
         check("proxy survives settings failures", call(proxy, "/up/api/settings")[0] == 200)
 
         Stub.hits.clear()
-        for method in ("POST", "PUT", "PATCH", "DELETE"):
+        for method in ("PUT", "PATCH", "DELETE"):
             status, raw, _ = call(proxy, "/up/api/settings", method, b"{}")
             check(method + " settings -> 403 JSON", status == 403 and b'"error"' in raw, str(status))
+        status, raw, _ = call(proxy, "/up/api/settings", "POST", b"{}")
+        check("POST settings without Bearer -> 401 JSON", status == 401 and b'"error"' in raw, str(status))
         for path in ("/up/api/settings/test_telegram", "/up/api/settings/open_browser"):
             status, raw, _ = call(proxy, path, "POST", b"{}")
             check("related settings write -> 403 JSON", status == 403 and b'"error"' in raw, str(status))
-        check("all settings write attempts cause zero upstream writes",
+        check("settings write attempts cause zero upstream writes",
               not [h for h in Stub.hits if h[0] != "GET"])
 
-        with open(os.path.join(BACKEND, "services", "settings.py"), encoding="utf-8") as f:
-            source = f.read()
+        source_path = os.path.join(BACKEND, "services", "settings.py")
+        with open(source_path, encoding="utf-8") as source_file:
+            source = source_file.read()
         check("settings service has no direct file access", "open(" not in source)
-        check("settings service uses positive allowlist, not raw return",
-              "_PUBLIC_FIELDS" in source and "api/settings" in source and "return ai_tool.get" not in source)
+        check("settings service has positive allowlist and no raw return",
+              "_PUBLIC_FIELDS" in source and "api/settings" in source
+              and "return ai_tool.get" not in source)
 
         stub.shutdown()
         stub.server_close()

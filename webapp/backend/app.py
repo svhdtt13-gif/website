@@ -1,7 +1,9 @@
-"""Flask app: serve frontend tĩnh + proxy GET allowlist (read-only).
+"""Flask app: serve frontend tinh + proxy GET allowlist (read-only) + POST api/log.
 
-Luồng Phase 2: route -> service -> repository -> ai tool.
-Hành vi và contract giữ nguyên y hệt bản proxy trực tiếp.
+Luong Phase 2: route -> service -> repository -> ai tool.
+Hanh vi va contract giu nguyen y het ban proxy truc tiep.
+Slice 2 chi mo duy nhat POST /up/api/log (qua services/log.py);
+moi POST/PUT/PATCH/DELETE khac van 403.
 """
 import pathlib
 
@@ -11,6 +13,7 @@ import config
 from repositories.aitool import UpstreamError
 from services import aifix as aifix_service
 from services import cycle as cycle_service
+from services import log as log_service
 from services import master as master_service
 from services import sync as sync_service
 
@@ -29,6 +32,10 @@ READ_HANDLERS = {
     "client_database.json": master_service.get_database,
 }
 
+WRITE_HANDLERS = {
+    "api/log": log_service.append_log,
+}
+
 
 def create_app():
     app = Flask(__name__, static_folder=None)
@@ -39,8 +46,8 @@ def create_app():
 
     @app.route("/<path:filename>")
     def static_files(filename):
-        # Cho phép file lồng nhau (js/, css/) nhưng giam trong FRONTEND:
-        # resolve + kiểm tra relative, chặn traversal, chỉ 3 đuôi file.
+        # Cho phep file long nhau (js/, css/) nhung giam trong FRONTEND:
+        # resolve + kiem tra relative, chan traversal, chi 3 duoi file.
         try:
             target = (FRONTEND / filename).resolve()
             target.relative_to(FRONTEND.resolve())
@@ -52,18 +59,28 @@ def create_app():
 
     @app.route("/up/<path:subpath>", methods=["GET", "POST", "PUT", "PATCH", "DELETE"])
     def upstream(subpath):
-        if request.method != "GET":
-            return jsonify({"error": "read-only proxy: write methods blocked"}), 403
-        if subpath not in config.READ_ONLY_ALLOWLIST:
-            return jsonify({"error": "read-only proxy: endpoint not allowed"}), 403
-        handler = READ_HANDLERS.get(subpath)
-        if handler is None:
-            # Allowlist có path chưa có service: chặn thay vì forward trực tiếp.
-            return jsonify({"error": "read-only proxy: endpoint not allowed"}), 403
-        try:
-            body, status, ctype = handler()
-        except UpstreamError as e:
-            return Response(e.body, status=e.status, content_type="application/json")
-        return Response(body, status=status, content_type=ctype)
+        if request.method == "GET":
+            if subpath not in config.READ_ONLY_ALLOWLIST:
+                return jsonify({"error": "read-only proxy: endpoint not allowed"}), 403
+            handler = READ_HANDLERS.get(subpath)
+            if handler is None:
+                # Allowlist co path chua co service: chan thay vi forward truc tiep.
+                return jsonify({"error": "read-only proxy: endpoint not allowed"}), 403
+            try:
+                body, status, ctype = handler()
+            except UpstreamError as e:
+                return Response(e.body, status=e.status, content_type="application/json")
+            return Response(body, status=status, content_type=ctype)
+        # Write: chi mo POST api/log, qua service -> repository.
+        if request.method == "POST" and subpath in config.WRITE_ALLOWLIST:
+            handler = WRITE_HANDLERS.get(subpath)
+            if handler is None:
+                return jsonify({"error": "read-only proxy: endpoint not allowed"}), 403
+            try:
+                body, status, ctype = handler(request.get_data(), request.content_type)
+            except UpstreamError as e:
+                return Response(e.body, status=e.status, content_type="application/json")
+            return Response(body, status=status, content_type=ctype)
+        return jsonify({"error": "read-only proxy: write methods blocked"}), 403
 
     return app

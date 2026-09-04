@@ -94,9 +94,13 @@ def _project_snapshot(body, status, content_type):
         _safe_error()
     try:
         source = _decode_object(body)
-        if not _PUBLIC_TOP_LEVEL_FIELDS.issubset(source) or set(source) - _UPSTREAM_TOP_LEVEL_FIELDS:
+        if set(source) != _UPSTREAM_TOP_LEVEL_FIELDS:
             raise RemoteLiveValidationError()
         if source["ok"] is not True:
+            raise RemoteLiveValidationError()
+        if type(source["room"]) is not str or not source["room"]:
+            raise RemoteLiveValidationError()
+        if source["roster"] is not None and not isinstance(source["roster"], dict):
             raise RemoteLiveValidationError()
         if not _valid_timestamp(source["fetchedAt"]):
             raise RemoteLiveValidationError()

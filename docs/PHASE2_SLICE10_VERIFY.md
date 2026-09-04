@@ -47,6 +47,10 @@ failure trả `502` generic `{"error":"remote live snapshot unavailable"}`. Khô
 Executed on branch `phase2-slice10-remote-selector`:
 
 - `python tests/security/test_remote_live_selector.py`: **32/32 pass**.
+- `python tests/security/test_remote_live_selector_preconditions.py`: **6/6 pass**.
+  - `selectedClientIdx=null` returns `SKIPPED/BLOCKED BY PRECONDITION` and emits zero selector action.
+  - no alternate client returns `SKIPPED/BLOCKED BY PRECONDITION` and emits zero selector action.
+  - a reversible snapshot is the only branch marked `READY` to emit a selector action.
 - `python tests/security/test_remote_live_read.py`: **49/49 pass**.
 - `python tests/security/test_proxy.py`: **10/10 pass**.
 - `python tests/security/test_write_log.py`: **16/16 pass**.
@@ -56,32 +60,52 @@ Executed on branch `phase2-slice10-remote-selector`:
 - `python tests/security/test_master_write.py`: **54/54 pass**.
 - `python tests/security/test_settings_read.py`: **24/24 pass**.
 - `python tests/security/test_settings_write.py`: **43/43 pass**.
-- Combined security assertions: **289 passed, 0 failed**.
-- `python -m py_compile webapp/backend/app.py webapp/backend/services/remote_live.py tests/security/test_remote_live_selector.py tests/security/test_remote_live_read.py`: pass.
+- Combined security assertions: **295 passed, 0 failed**.
+- `python -m py_compile webapp/backend/app.py webapp/backend/services/remote_live.py tests/security/test_remote_live_selector.py tests/security/test_remote_live_read.py tests/security/test_remote_live_selector_preconditions.py`: pass.
 
 ## Live verification
 
 Executed against the configured real ai tool on `127.0.0.1:8080`, through the branch
-proxy on `127.0.0.1:8091`, using a temporary Bearer token and no source changes:
+proxy on `127.0.0.1:8091`, using a temporary Bearer token and no source changes.
+The run completed without a concurrent `remote_sync` entry:
 
-- initial selection: `idx 0`, `client_14`;
+- initial selection: `idx 19`, `client_56`;
 - alternate: `idx 20`, `client_46` (scheduled group, not fixed);
 - guarded selector returned `200` and selected `idx 20`;
 - canonical read confirmed selected `idx 20`;
-- guarded rollback returned `200` and restored `idx 0` / `client_14`;
-- final canonical upstream read confirmed selected `idx 0`;
+- guarded rollback returned `200` and restored `idx 19` / `client_56`;
+- final canonical upstream read confirmed selected `idx 19`;
 - AutoCycle process count remained `1` before and after;
 - no selector test call used POST/PUT/PATCH/DELETE or any sync/toggle/action endpoint.
 
-The first live run took long enough to overlap the already-running continuous sync. The
-state-file fingerprint was therefore not byte-identical: `activity_history.jsonl` and
-`change_log.jsonl` gained periodic `remote_sync` entries, and the associated sync-owned
-state files changed during that background activity. The observed entries were
-`event=sync_remote`, not selector activity. A second run holding
-`Local\\AutoGhostStory_RemoteSync` was not possible because the continuous sync process
-owns that mutex; the process was not stopped or modified. Thus selector rollback passed,
-but byte-level “all state files unchanged” is not claimed as isolated evidence in this
-environment. Do not merge until a reviewer accepts this limitation or repeats the live
-check during a controlled maintenance window.
+### Semantic diff matrix
 
-Do not merge until live evidence and review are complete.
+The following matrix was captured immediately before and after the selector + rollback
+transaction. JSON files were compared both by SHA-256 and recursively by semantic JSON
+paths. JSONL/text files were compared by SHA-256, line count, and newly appended entries.
+No secret values were printed.
+
+| Protected state | Raw change | Semantic diff / new entries | Attribution |
+|---|---:|---|---|
+| `tools/client_database.json` | no | no paths | unchanged |
+| `tools/clients_master.json` | no | no paths | unchanged |
+| `tools/config.json` | no | no paths | unchanged |
+| `tools/cache/cycle_state.json` | no | no paths | unchanged |
+| `tools/cache/manual_override.json` | no | no paths | unchanged |
+| `tools/remote_session.json` | no | no paths | unchanged |
+| `tools/remote_rooms.json` | no | no paths | unchanged |
+| `tools/cache/activity_history.jsonl` | no | line count unchanged; new entries `[]` | no `remote_sync` or selector event |
+| `tools/cache/change_log.jsonl` | no | line count unchanged; new entries `[]` | no `remote_sync` or selector event |
+| `tools/cache/cycle.log` | no | line count unchanged; new lines `[]` | unchanged |
+| AutoCycle process | no | count `1 -> 1` | scheduler remained alive |
+
+This controlled semantic run isolates the selector transaction and closes the earlier
+continuous-sync attribution gap. The earlier exploratory run did overlap background
+`remote_sync`; its non-selector changes are not used as acceptance evidence.
+
+Rollback was executed only because the initial selected identity was non-null and an
+alternate scheduled client existed. The precondition test separately proves that
+`selectedClientIdx=null` and “no alternate client” are explicit
+`SKIPPED/BLOCKED BY PRECONDITION` branches with zero selector action.
+
+Do not merge until this evidence and the requested review are complete.

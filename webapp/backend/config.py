@@ -21,8 +21,9 @@ READ_ONLY_ALLOWLIST = {
     "client_database.json",
 }
 
-# Slice 2: write endpoint duy nhat duoc phep (POST /up/api/log -> POST api/log).
+# Slice 2: POST api/log; Slice 6: POST api/cycle/backup.
 # Moi write khac -> 403. Khong mo SQLite/Session/SSE/Worker/Tunnel o slice nay.
 WRITE_ALLOWLIST = {
     "api/log",
+    "api/cycle/backup",
 }

@@ -8,6 +8,7 @@ Slice 5 them GET api/settings voi positive allowlist va fail-closed redaction.
 Slice 6 them POST api/cycle/backup voi write gate va spacing.
 Slice 7 them POST api/settings voi shared projector va safe partial update.
 Slice 8 them guarded CAS name-only POST api/master.
+Slice 9 them canonical GET api/remote_live khong selector.
 """
 import hmac
 import pathlib
@@ -21,6 +22,7 @@ from services import backup as backup_service
 from services import cycle as cycle_service
 from services import log as log_service
 from services import master as master_service
+from services import remote_live as remote_live_service
 from services import settings as settings_service
 from services import sync as sync_service
 
@@ -37,6 +39,7 @@ READ_HANDLERS = {
     "api/ai_fix/status": aifix_service.get_ai_fix_status,
     "api/cycle/backup": backup_service.get_cycle_backups,
     "api/master": master_service.get_api_master,
+    "api/remote_live": remote_live_service.get_remote_live,
     "clients_master.json": master_service.get_master,
     "client_database.json": master_service.get_database,
     "api/settings": settings_service.get_settings,
@@ -80,6 +83,10 @@ def create_app():
     @app.route("/up/<path:subpath>", methods=["GET", "POST", "PUT", "PATCH", "DELETE"])
     def upstream(subpath):
         if request.method == "GET":
+            # Selector query parameters can cause row_select in the golden app;
+            # reject them before allowlist dispatch and before any upstream call.
+            if subpath == "api/remote_live" and (request.query_string or request.args):
+                return jsonify({"error": "remote live selector not allowed"}), 400
             if subpath not in config.READ_ONLY_ALLOWLIST:
                 return jsonify({"error": "read-only proxy: endpoint not allowed"}), 403
             handler = READ_HANDLERS.get(subpath)

@@ -3,7 +3,8 @@
 Auth mọi request: `Authorization: Basic base64(admin:DB_WEB_PASS)`.
 POST/PUT/PATCH/DELETE cần thêm header `X-DB-Editor: 1`.
 
-Ghi chú cột Webapp: `R` = proxy cho phép (read-only), `W` = phase 2 mới mở.
+Ghi chú cột Webapp: `R` = proxy cho phép (read-only). `W` = phase 2 mới mở.
+`—` = golden/internal path chưa được webapp proxy.
 
 | Method | Path | Webapp | Mục đích |
 |---|---|---|---|
@@ -12,7 +13,8 @@ Ghi chú cột Webapp: `R` = proxy cho phép (read-only), `W` = phase 2 mới m�
 | POST | `/api/master` | W | Lưu master/schedule |
 | GET | `/api/status` | R | Trạng thái tổng |
 | GET | `/api/sync_status` | R | Trạng thái auto sync |
-| GET | `/api/remote_live?t=&client=` | W | Snapshot remote (gây `row_select` khi kèm client!) |
+| GET | `/api/remote_live` | R | Canonical remote snapshot read, không selector, không đổi remote selection |
+| GET | `/api/remote_live?t=&client=` | — | Golden selector path; có thể gửi `row_select` khi có `client`, write-risk và không được webapp proxy |
 | POST | `/api/sync_remote` | W | Sync 1 lần từ remote |
 | POST | `/api/sync_all` | W | Sync toàn bộ |
 | POST | `/api/sync_continuous/<start\|stop>` | W | Bật/tắt sync |
@@ -35,6 +37,27 @@ Ghi chú cột Webapp: `R` = proxy cho phép (read-only), `W` = phase 2 mới m�
 | GET | `/api/cycle/status` | R | Chi tiết cycle + `manual_overrides` + qnyh |
 | POST | `/api/log` | W | Ghi log |
 | GET | `/clients_master.json`, `/client_database.json`, `/cache/*` | R | File tĩnh trong allowlist |
+
+## Slice 9 remote live contract
+
+Canonical webapp request là chính xác `GET /api/remote_live` với query string rỗng.
+Mọi `client`, `t` hoặc query parameter khác bị chặn tại route boundary trước
+upstream. Selector URL vẫn tồn tại ở golden để phục vụ `db.html` cũ nhưng có thể
+thực hiện `row_select` và không thuộc webapp Slice 9 allowlist.
+
+Golden upstream success envelope phải có chính xác 9 key:
+
+`ok`, `fetchedAt`, `clientCount`, `selectedClientIdx`, `clients`, `tasks`, `logs`,
+`room`, `roster`.
+
+`room` là exact non-empty string; `roster` là object hoặc null. Webapp project
+public response thành chính xác 7 key:
+
+`ok`, `fetchedAt`, `clientCount`, `selectedClientIdx`, `clients`, `tasks`, `logs`.
+
+`room`, `roster`, session/token và transport/internal metadata không được expose.
+Nested client/resource/task/log fields dùng positive allowlists và exact type/range/
+consistency validation theo `docs/PHASE2_SLICE9_VERIFY.md`.
 
 Response lỗi chuẩn: `{"error": "..."}` kèm HTTP 4xx/5xx.
 Lưu ý: Flask không bật CORS — trình duyệt gọi trực tiếp sẽ bị chặn,

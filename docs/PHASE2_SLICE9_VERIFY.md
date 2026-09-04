@@ -55,7 +55,14 @@ master/DB/config/schedule/override/log/cycle mutation.
   - all upstream failures -> generic `502`;
   - concurrent reads serialized;
   - non-GET/subpath blocking và no direct file/subprocess/WebSocket access.
-- Regression Slice 1–8: tất cả pass trên cùng head.
+- Regression Slice 1–8 trên cùng head:
+  - `test_proxy.py`: **10/10 pass**.
+  - `test_write_log.py`: **16/16 pass**.
+  - `test_backup_read.py`: **17/17 pass**.
+  - `test_backup_write.py`: **28/28 pass**.
+  - `test_master_read.py`: **16/16 pass**.
+  - `test_settings_read.py`: **24/24 pass**.
+  - `test_settings_write.py`: **43/43 pass**.
 - Python syntax compile: pass.
 
 ## API contract update
@@ -66,7 +73,13 @@ webapp Slice 9 allowlist.
 
 ## Live verification
 
-Live test phải đọc canonical snapshot trước, gọi webapp canonical GET không query,
-rồi đọc canonical snapshot sau. Verify `selectedClientIdx` và remote selection
-identity không đổi; master/DB/config/cycle/override/log/secrets không mutation;
-AutoCycle vẫn alive. Không gọi selector, `row_select`, sync, toggle hay action.
+Verified on the current branch head with the real ai tool:
+
+- canonical webapp GET without query returned `200` with exact safe public keys;
+- canonical golden snapshot was read before and after the webapp call;
+- `selectedClientIdx` and selected remote client identity were unchanged;
+- `clients_master.json`, `client_database.json`, `config.json`, CSV, cycle state,
+  alwaysrun override, activity/change/action logs and secret fingerprints were
+  unchanged;
+- no selector, `row_select`, sync, toggle or action was called;
+- AutoCycle remained alive.

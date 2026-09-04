@@ -21,16 +21,27 @@ Implementation (dung 3 lop, khong SQLite/Session/SSE/Worker/Tunnel):
   chuyen nguyen ven den repository/upstream de giu semantics golden reference.
 
 Verify (stub local, KHONG ghi live ai tool):
-- `tests/security/test_write_log.py`: **15/15 xanh** (boot, valid POST 200,
+- `tests/security/test_write_log.py`: **14/14 xanh** (boot, valid POST 200,
   exact raw bytes + Content-Type, Basic/X-DB-Editor, client marker cannot
   override repository marker, empty/malformed/wrong-type JSON passthrough,
   POST path khac 403 + zero upstream write, PUT/PATCH/DELETE 403,
-  GET /up/api/log 403, upstream down -> 502 + alive).
+  GET `/up/api/log` 403, upstream down -> 502 + alive).
 - Hoi quy: `tests/security/test_proxy.py` giu nguyen (7 READ path van 28 calls 403).
 - AST: `app.py`, `aitool.py`, `log.py`, `config.py` pass `py_compile`.
-- Live ai tool: da chay voi marker duy nhat `phase2-slice2-test-*`; ket qua va
-  delta-only cleanup duoc ghi tai day sau khi test. Cleanup chi loc bo dung
-  dong co marker, khong restore-overwrite va khong xoa append dong thoi.
-- Zero-downtime evidence: truoc/sau live test ghi nhan AutoCycle PID,
-  `cycle_state.json` byte hash va cycle log; khong restart/stop worker,
-  khong doi scheduler ownership, cycle state hash khong doi.
+
+Live contract + delta cleanup (2026-09-04):
+- Chay qua proxy Slice 2 toi ai tool local voi marker duy nhat
+  `phase2-slice2-test-0664e9c80ecb425f84661005f9b1b217`.
+- Ket qua: `POST /up/api/log` -> `200 {"status":"logged"}`; marker xuat hien
+  dung 1 lan trong moi file `action.log`, `activity_history.jsonl`,
+  `change_log.jsonl`.
+- Cleanup da khoa tung file va chi loai bo dong chua marker nay; khong
+  restore-overwrite backup, khong xoa append khac. Xac nhan `DELTA-ONLY CLEANUP PASS`.
+
+Zero-downtime evidence (cung lan live test):
+- AutoCycle PID truoc/sau: `21268`, process van alive.
+- `cycle_state.json` SHA-256 truoc/sau:
+  `37B3D96B07FD54C6FFF516EF3C601A6F9F4A8357AFAEB5125CC52B9626D613F4`.
+- Khong restart/stop worker, khong doi scheduler ownership, khong sua cycle state.
+- Live test chi tao/xoa delta log cua `POST /api/log`; khong thay doi cac file
+  cycle state va khong gui remote action.

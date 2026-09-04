@@ -15,6 +15,7 @@ READ_ONLY_ALLOWLIST = {
     "api/status",
     "api/ai_fix/status",
     "api/cycle/backup",
+    "api/master",
     "clients_master.json",
     "client_database.json",
 }

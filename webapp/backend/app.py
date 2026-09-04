@@ -3,7 +3,7 @@
 Luong Phase 2: route -> service -> repository -> ai tool.
 Hanh vi GET giu nguyen proxy read-only; Slice 2 chi mo write api/log
 sau khi qua Bearer gate rieng cua website.
-Slice 3 chi them GET api/cycle/backup; khong mo POST backup.
+Slice 3 them GET api/cycle/backup; Slice 4 them GET api/master rieng.
 """
 import hmac
 import pathlib
@@ -31,6 +31,7 @@ READ_HANDLERS = {
     "api/status": sync_service.get_general_status,
     "api/ai_fix/status": aifix_service.get_ai_fix_status,
     "api/cycle/backup": backup_service.get_cycle_backups,
+    "api/master": master_service.get_api_master,
     "clients_master.json": master_service.get_master,
     "client_database.json": master_service.get_database,
 }

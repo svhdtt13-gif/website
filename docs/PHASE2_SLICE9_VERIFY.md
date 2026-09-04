@@ -16,8 +16,13 @@ lookup hoặc gọi `READ_HANDLERS`. `?client=...`, `?t=...` và query khác tr�
 ## Upstream and public schema
 
 Service gọi đúng upstream `GET /api/remote_live` với Basic Auth dưới
-`_REMOTE_LIVE_LOCK`. Upstream được phép có metadata `room`/`roster`, nhưng public
-response chỉ project top-level:
+`_REMOTE_LIVE_LOCK`. Golden upstream success phải có chính xác 9 key:
+
+`ok`, `fetchedAt`, `clientCount`, `selectedClientIdx`, `clients`, `tasks`, `logs`,
+`room`, `roster`.
+
+`room` phải là exact non-empty string; `roster` phải là object hoặc null. Public
+response chỉ project top-level 7 key:
 
 `ok`, `fetchedAt`, `clientCount`, `selectedClientIdx`, `clients`, `tasks`, `logs`.
 
@@ -47,29 +52,23 @@ master/DB/config/schedule/override/log/cycle mutation.
 
 ## Automated verification
 
-- `tests/security/test_remote_live_read.py`: **45/45 pass**:
+- `tests/security/test_remote_live_read.py`: **49/49 pass**:
   - route-level query guard với zero upstream call;
-  - Basic Auth forwarding và safe top-level projection;
+  - Basic Auth forwarding và exact 9-key upstream envelope;
+  - exact 7-key public projection, room/roster stripping;
   - positive allowlist cho clients/resources/tasks/logs;
   - exact types, ranges, indexes và client-count consistency;
-  - all upstream failures -> generic `502`;
+  - malformed/error/unreachable/invalid room-roster responses -> generic `502`;
   - concurrent reads serialized;
   - non-GET/subpath blocking và no direct file/subprocess/WebSocket access.
-- Regression Slice 1–8 trên cùng head:
-  - `test_proxy.py`: **10/10 pass**.
-  - `test_write_log.py`: **16/16 pass**.
-  - `test_backup_read.py`: **17/17 pass**.
-  - `test_backup_write.py`: **28/28 pass**.
-  - `test_master_read.py`: **16/16 pass**.
-  - `test_settings_read.py`: **24/24 pass**.
-  - `test_settings_write.py`: **43/43 pass**.
+- Regression Slice 1–8 trên cùng head: tất cả pass.
 - Python syntax compile: pass.
 
 ## API contract update
 
 `docs/API_CONTRACT.md` tách canonical `GET /api/remote_live` read-only khỏi golden
-selector `GET /api/remote_live?t=&client=` write-risk. Selector vẫn không thuộc
-webapp Slice 9 allowlist.
+selector `GET /api/remote_live?t=&client=` write-risk. Upstream envelope 9 key và
+public webapp projection 7 key được ghi rõ; selector không thuộc webapp allowlist.
 
 ## Live verification
 

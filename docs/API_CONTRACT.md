@@ -38,15 +38,26 @@ Ghi chú cột Webapp: `R` = proxy cho phép (read-only). `W` = phase 2 mới m�
 | POST | `/api/log` | W | Ghi log |
 | GET | `/clients_master.json`, `/client_database.json`, `/cache/*` | R | File tĩnh trong allowlist |
 
-Slice 9 webapp contract cho canonical `GET /api/remote_live`:
+## Slice 9 remote live contract
 
-- Request phải có query string rỗng; mọi `client`, `t` hoặc query parameter khác bị
-  chặn tại route boundary trước upstream.
-- Webapp project top-level safe fields: `ok`, `fetchedAt`, `clientCount`,
-  `selectedClientIdx`, `clients`, `tasks`, `logs`; `room`, `roster` và transport
-  metadata không được expose.
-- Selector URL vẫn tồn tại ở golden để phục vụ `db.html` cũ nhưng không nằm trong
-  Slice 9 webapp allowlist; không được gọi qua webapp.
+Canonical webapp request là chính xác `GET /api/remote_live` với query string rỗng.
+Mọi `client`, `t` hoặc query parameter khác bị chặn tại route boundary trước
+upstream. Selector URL vẫn tồn tại ở golden để phục vụ `db.html` cũ nhưng có thể
+thực hiện `row_select` và không thuộc webapp Slice 9 allowlist.
+
+Golden upstream success envelope phải có chính xác 9 key:
+
+`ok`, `fetchedAt`, `clientCount`, `selectedClientIdx`, `clients`, `tasks`, `logs`,
+`room`, `roster`.
+
+`room` là exact non-empty string; `roster` là object hoặc null. Webapp project
+public response thành chính xác 7 key:
+
+`ok`, `fetchedAt`, `clientCount`, `selectedClientIdx`, `clients`, `tasks`, `logs`.
+
+`room`, `roster`, session/token và transport/internal metadata không được expose.
+Nested client/resource/task/log fields dùng positive allowlists và exact type/range/
+consistency validation theo `docs/PHASE2_SLICE9_VERIFY.md`.
 
 Response lỗi chuẩn: `{"error": "..."}` kèm HTTP 4xx/5xx.
 Lưu ý: Flask không bật CORS — trình duyệt gọi trực tiếp sẽ bị chặn,

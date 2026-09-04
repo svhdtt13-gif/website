@@ -1,0 +1,10 @@
+.banner{display:block;margin:12px 0;padding:10px 12px;border-radius:8px;background:rgba(239,68,68,.12);border:1px solid rgba(239,68,68,.4);}
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:12px;margin:16px 0;}
+.card{background:var(--card);border:1px solid rgba(255,255,255,.1);border-radius:10px;padding:14px;}
+.card h2{margin:0 0 8px;font-size:1rem;color:var(--sub);}
+.card p{margin:0;font-size:1.05rem;}
+.ok{color:var(--good);} .bad{color:var(--bad);} .warn{color:var(--warn);}
+.table-wrap{max-height:420px;overflow-y:auto;border:1px solid rgba(255,255,255,.1);border-radius:10px;}
+table{width:100%;border-collapse:collapse;font-size:.9rem;}
+th,td{padding:8px 10px;border-bottom:1px solid rgba(255,255,255,.07);text-align:left;}
+thead th{position:sticky;top:0;background:var(--card);color:var(--sub);}

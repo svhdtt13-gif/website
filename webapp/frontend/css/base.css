@@ -1,0 +1,7 @@
+:root{--bg:#0b1220;--card:#111a2e;--text:#e5e9f0;--sub:#8b93a7;--good:#22c55e;--bad:#ef4444;--warn:#f59e0b;}
+*{box-sizing:border-box;}
+body{font-family:'Inter','Segoe UI',system-ui,sans-serif;background:var(--bg);color:var(--text);margin:0;padding:24px;}
+header h1{margin:0 0 4px;font-size:1.4rem;}
+header small{color:var(--sub);font-weight:400;}
+footer{margin-top:16px;color:var(--sub);font-size:.8rem;}
+@media (max-width:640px){body{padding:12px;}}

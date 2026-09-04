@@ -142,6 +142,7 @@ def main():
                             stderr=subprocess.DEVNULL)
     proxy = f"http://127.0.0.1:{PROXY_PORT}"
     bearer = {"Authorization": "Bearer " + TOKEN}
+    json_bearer = dict(bearer, **{"Content-Type": "application/json"})
     try:
         ready = False
         for _ in range(40):
@@ -171,7 +172,6 @@ def main():
               and posts[0]["content_type"] == "application/json"
               and posts[0]["auth"].startswith("Basic ") and posts[0]["marker"] == "1")
 
-        # Both approved JSON MIME forms are accepted; text/plain is rejected locally.
         Stub.hits.clear()
         status, _, _ = call(proxy, "/up/api/settings", "POST", b'{"auto_telegram":true}',
                             dict(bearer, **{"Content-Type": "application/json"}))
@@ -182,7 +182,6 @@ def main():
         check("text/plain JSON rejected with 400 and zero upstream write",
               status == 400 and b'"error"' in body and not [h for h in Stub.hits if h["method"] != "GET"])
 
-        # Empty/invalid requests never reach the write repository.
         for label, body in (("empty body", b""), ("empty object", b"{}"),
                             ("array", b"[]"), ("malformed", b"{not-json")):
             Stub.hits.clear()
@@ -192,7 +191,6 @@ def main():
                   status == 400 and b'"error"' in raw and not [h for h in Stub.hits if h["method"] != "GET"],
                   str(status))
 
-        # Unknown/secret fields and bad safe values are rejected without echo.
         invalid_requests = [
             ("secret field", b'{"telegram_bot_token":"BOT_TOKEN_CANARY"}'),
             ("unknown nested secret", b'{"unknown":{"nested":"NESTED_SECRET_CANARY"}}'),
@@ -209,7 +207,6 @@ def main():
                   status == 400 and not any(x.encode() in raw for x in CANARIES)
                   and not [h for h in Stub.hits if h["method"] != "GET"], raw.decode(errors="replace"))
 
-        # Success response is also projected by the shared validator.
         for mode, label in (("corrupt_port", "corrupt allowlisted port response"),
                             ("corrupt_bool", "corrupt allowlisted bool response"),
                             ("malformed", "malformed response"),
@@ -217,19 +214,19 @@ def main():
                             ("missing_contract", "missing response contract")):
             Stub.mode = mode
             Stub.hits.clear()
-            status, raw, _ = call(proxy, "/up/api/settings", "POST", b'{"auto_telegram":true}', bearer)
+            status, raw, _ = call(proxy, "/up/api/settings", "POST", b'{"auto_telegram":true}', json_bearer)
             posts = [h for h in Stub.hits if h["method"] == "POST"]
             check(label + " -> generic 502 no raw echo/no retry",
                   status == 502 and raw == GENERIC and len(posts) == 1
                   and not any(x.encode() in raw for x in CANARIES), raw.decode(errors="replace"))
 
         Stub.mode = "missing_safe"
-        status, raw, _ = call(proxy, "/up/api/settings", "POST", b'{"auto_telegram":false}', bearer)
+        status, raw, _ = call(proxy, "/up/api/settings", "POST", b'{"auto_telegram":false}', json_bearer)
         check("missing response safe keys stay absent", status == 200
               and json_body(raw) == {"status": "OK", "settings": {"auto_telegram": False}})
 
         Stub.mode = "error"
-        status, raw, _ = call(proxy, "/up/api/settings", "POST", b'{"auto_telegram":true}', bearer)
+        status, raw, _ = call(proxy, "/up/api/settings", "POST", b'{"auto_telegram":true}', json_bearer)
         check("upstream 500 settings body sanitized", status == 500
               and json_body(raw) == {"error": "settings upstream response unavailable"}
               and not any(x.encode() in raw for x in CANARIES))
@@ -254,7 +251,7 @@ def main():
         check("settings service has no direct file access", "open(" not in source)
 
         stub.shutdown(); stub.server_close(); time.sleep(0.2)
-        status, raw, _ = call(proxy, "/up/api/settings", "POST", b'{"auto_telegram":true}', bearer)
+        status, raw, _ = call(proxy, "/up/api/settings", "POST", b'{"auto_telegram":true}', json_bearer)
         check("upstream unreachable -> 502 generic JSON", status == 502
               and json_body(raw) == {"error": "settings upstream response unavailable"})
         check("proxy survives settings outage", proc.poll() is None)

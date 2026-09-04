@@ -11,6 +11,10 @@ Baseline (tu `app_public.py` ai tool + review issue #1):
 
 Implementation (dung 3 lop, khong SQLite/Session/SSE/Worker/Tunnel):
 - `config.WRITE_ALLOWLIST = {"api/log"}` (duy nhat).
+- `config.WEBAPP_WRITE_TOKEN` lay tu environment, khong co default secret.
+- `app.py` yeu cau `Authorization: Bearer <WEBAPP_WRITE_TOKEN>` truoc khi
+  goi service; token thieu/sai -> 401 JSON + `WWW-Authenticate: Bearer`,
+  khong co request toi upstream.
 - `repositories/aitool.py::post()` — noi duy nhat HTTP write (Basic + X-DB-Editor).
   Co guard `subpath not in WRITE_ALLOWLIST -> 403` va luon tu dat
   `X-DB-Editor: 1`, khong tin header cung ten tu client.
@@ -21,13 +25,14 @@ Implementation (dung 3 lop, khong SQLite/Session/SSE/Worker/Tunnel):
   chuyen nguyen ven den repository/upstream de giu semantics golden reference.
 
 Verify (stub local, KHONG ghi live ai tool):
-- `tests/security/test_write_log.py`: **14/14 xanh** (boot, valid POST 200,
-  exact raw bytes + Content-Type, Basic/X-DB-Editor, client marker cannot
-  override repository marker, empty/malformed/wrong-type JSON passthrough,
-  POST path khac 403 + zero upstream write, PUT/PATCH/DELETE 403,
-  GET `/up/api/log` 403, upstream down -> 502 + alive).
+- `tests/security/test_write_log.py`: **16/16 xanh** (boot, missing/wrong/correct
+  Bearer token, zero upstream writes on auth failure, exact raw bytes + Content-Type,
+  Basic/X-DB-Editor, client marker cannot override repository marker,
+  empty/malformed/wrong-type JSON passthrough, POST path khac 403 + zero upstream
+  write, PUT/PATCH/DELETE 403, GET `/up/api/log` 403, upstream down -> 502 + alive).
 - Hoi quy: `tests/security/test_proxy.py` giu nguyen (7 READ path van 28 calls 403).
 - AST: `app.py`, `aitool.py`, `log.py`, `config.py` pass `py_compile`.
+- Remote branch Python syntax: 4/4 pass.
 
 Live contract + delta cleanup (2026-09-04):
 - Chay qua proxy Slice 2 toi ai tool local voi marker duy nhat

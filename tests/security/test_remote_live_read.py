@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Slice 9 security/contract tests for canonical GET /up/api/remote_live."""
+"""Slice 9 contract/security tests for canonical GET /up/api/remote_live."""
 import copy
 import json
 import os
@@ -221,12 +221,14 @@ def main():
         if not ready:
             return 1
 
-        for query in ("?client=client-a", "?t=123", "?anything=1"):
+        for query, expected, body in (("?client=client-a", 401, {"error": "write authentication required"}),
+                                      ("?t=123", 400, {"error": "invalid remote selector query"}),
+                                      ("?anything=1", 400, {"error": "invalid remote selector query"})):
             Stub.reset()
-            status, raw, _ = call(proxy, "/up/api/remote_live" + query)
-            check("query " + query + " -> route-level 400 and zero upstream",
-                  status == 400 and body_json(raw) == {"error": "remote live selector not allowed"}
-                  and not remote_hits())
+            status, raw, response_headers = call(proxy, "/up/api/remote_live" + query)
+            challenge_ok = expected != 401 or (response_headers.get("WWW-Authenticate") or response_headers.get("Www-Authenticate")) == "Bearer"
+            check("query " + query + " -> boundary guard/auth and zero upstream",
+                  status == expected and body_json(raw) == body and challenge_ok and not remote_hits())
 
         Stub.reset()
         status, raw, _ = call(proxy, "/up/api/remote_live")

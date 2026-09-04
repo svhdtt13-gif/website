@@ -61,15 +61,27 @@ Executed on branch `phase2-slice10-remote-selector`:
 
 ## Live verification
 
-Not run yet. Before opening the PR, run the guarded selector against the configured real
-ai tool with a reversible alternate client and record:
+Executed against the configured real ai tool on `127.0.0.1:8080`, through the branch
+proxy on `127.0.0.1:8091`, using a temporary Bearer token and no source changes:
 
-- canonical snapshot before and after;
-- selected target before, requested target, and selected target after;
-- exact selector call and absence of sync/toggle/action calls;
-- unchanged master/database/config/CSV/cycle/alwaysrun/activity/change/action state;
-- AutoCycle remains alive;
-- rollback restores the original selected client only when the initial selected target
-  was non-null and an alternate client exists; otherwise record an explicit skip.
+- initial selection: `idx 0`, `client_14`;
+- alternate: `idx 20`, `client_46` (scheduled group, not fixed);
+- guarded selector returned `200` and selected `idx 20`;
+- canonical read confirmed selected `idx 20`;
+- guarded rollback returned `200` and restored `idx 0` / `client_14`;
+- final canonical upstream read confirmed selected `idx 0`;
+- AutoCycle process count remained `1` before and after;
+- no selector test call used POST/PUT/PATCH/DELETE or any sync/toggle/action endpoint.
 
-Do not merge until this live evidence and review are complete.
+The first live run took long enough to overlap the already-running continuous sync. The
+state-file fingerprint was therefore not byte-identical: `activity_history.jsonl` and
+`change_log.jsonl` gained periodic `remote_sync` entries, and the associated sync-owned
+state files changed during that background activity. The observed entries were
+`event=sync_remote`, not selector activity. A second run holding
+`Local\\AutoGhostStory_RemoteSync` was not possible because the continuous sync process
+owns that mutex; the process was not stopped or modified. Thus selector rollback passed,
+but byte-level “all state files unchanged” is not claimed as isolated evidence in this
+environment. Do not merge until a reviewer accepts this limitation or repeats the live
+check during a controlled maintenance window.
+
+Do not merge until live evidence and review are complete.

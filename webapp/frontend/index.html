@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Website App — AutoGhostStory (read-only)</title>
+<link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+<header>
+  <h1>AutoGhostStory — Website App <small>(read-only)</small></h1>
+  <div id="banner" class="banner" style="display:none;"></div>
+</header>
+<main>
+  <section class="cards">
+    <div class="card"><h2>Cycle</h2><p id="cardCycle">—</p></div>
+    <div class="card"><h2>Auto Sync</h2><p id="cardSync">—</p></div>
+    <div class="card"><h2>360Auto / qnyh</h2><p id="cardProc">—</p></div>
+    <div class="card"><h2>AI fix</h2><p id="cardAi">—</p></div>
+  </section>
+  <section class="card">
+    <h2>Clients (<span id="clientCount">—</span>)</h2>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Client</th><th>Tên</th><th>Nhóm</th><th>Trạng thái</th></tr></thead>
+      <tbody id="clientBody"><tr><td colspan="4">Đang tải…</td></tr></tbody>
+    </table></div>
+  </section>
+</main>
+<footer>Nguồn dữ liệu: ai tool API (chỉ đọc). Ghi/sửa vẫn làm trên <code>tools/db.html</code> gốc.</footer>
+<script src="app.js"></script>
+</body>
+</html>

@@ -16,13 +16,14 @@ BACKEND = os.path.join(ROOT, "webapp", "backend")
 PASS = FAIL = 0
 
 def free_port():
-    with socket.socket() as s:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind(("127.0.0.1", 0))
         return s.getsockname()[1]
 
 PROXY_PORT, STUB_PORT = free_port(), free_port()
 TOKEN = "write-secret"
-SUCCESS = b'{"status":"OK","backup":"cycle_test.zip","manifest":{"label":"test"}}'
+SUCCESS = b'{"status":"OK","backup":"cycle_test.zip","manifest":{"created_at":"2026-09-04T12:00:00","label":"test","files":[],"script_files":[]}}'
+GENERIC_ERROR = b'{"error":"invalid backup response"}'
 
 
 def check(name, condition, detail=""):
@@ -48,9 +49,9 @@ class Stub(BaseHTTPRequestHandler):
             "body": body, "at": time.monotonic(),
         })
 
-    def _send(self, body, status=200):
+    def _send(self, body, status=200, content_type="application/json"):
         self.send_response(status)
-        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         try:
@@ -75,6 +76,12 @@ class Stub(BaseHTTPRequestHandler):
             self._send(b'{"error":"not found"}', 404)
         elif Stub.mode == "error":
             self._send(b'{"error":"backup upstream failure"}', 500)
+        elif Stub.mode == "malformed":
+            self._send(b'{"status":"OK","backup":"cycle_test.zip"BOT_TOKEN_CANARY')
+        elif Stub.mode == "non_object":
+            self._send(b'[{"status":"OK","backup":"cycle_test.zip"}]')
+        elif Stub.mode == "missing_contract":
+            self._send(b'{"status":"OK","backup":"cycle_test.zip","manifest":{}}')
         else:
             self._send(SUCCESS)
 
@@ -122,7 +129,6 @@ def main():
         if not ready:
             return 1
 
-        # Website Bearer auth fails before service/repository and never reaches upstream.
         for label, headers in (("missing Bearer", {}), ("wrong Bearer", {"Authorization": "Bearer wrong"}),
                                ("forged marker only", {"X-DB-Editor": "1"})):
             Stub.hits.clear()
@@ -131,7 +137,6 @@ def main():
                   status == 401 and b'"error"' in body
                   and not [h for h in Stub.hits if h["method"] != "GET"], str(status))
 
-        # Repository forwards exact raw body/Content-Type and owns the upstream marker.
         Stub.hits.clear()
         payload = b'{"label":"phase2-slice6-json"}'
         ctype = "application/json; charset=utf-8"
@@ -153,6 +158,28 @@ def main():
         check("form backup -> success and exact raw body", status == 200 and body == SUCCESS
               and len(posts) == 1 and posts[0]["body"] == form_payload
               and posts[0]["content_type"] == "application/x-www-form-urlencoded")
+
+        # Empty request body must remain b"" at the upstream boundary.
+        Stub.hits.clear()
+        status, body, _ = call(proxy, "/up/api/cycle/backup", "POST", b"",
+                               dict(bearer, **{"Content-Type": "application/json"}))
+        posts = [h for h in Stub.hits if h["method"] == "POST"]
+        check("empty body -> success without synthesizing JSON", status == 200 and body == SUCCESS
+              and len(posts) == 1 and posts[0]["body"] == b"")
+
+        # A 200 success response must be valid JSON object with the full contract.
+        for mode, label in (("malformed", "malformed success"),
+                            ("non_object", "non-object success"),
+                            ("missing_contract", "missing success contract")):
+            Stub.mode = mode
+            Stub.hits.clear()
+            status, body, _ = call(proxy, "/up/api/cycle/backup", "POST", b"{}", bearer)
+            posts = [h for h in Stub.hits if h["method"] == "POST"]
+            check(label + " -> generic 502 without raw echo",
+                  status == 502 and body == GENERIC_ERROR and len(posts) == 1
+                  and b"BOT_TOKEN_CANARY" not in body, body.decode(errors="replace"))
+        Stub.mode = "success"
+        check("proxy survives malformed success responses", call(proxy, "/up/api/status")[0] == 200)
 
         # Error status/body remains golden for backup writes; proxy survives it.
         Stub.mode = "error"
@@ -181,7 +208,6 @@ def main():
         check("concurrent backup bodies remain distinct",
               len(posts) == 2 and posts[0]["body"] != posts[1]["body"])
 
-        # Existing GET remains read-only; every other method/path remains blocked.
         status, body, _ = call(proxy, "/up/api/cycle/backup")
         check("GET backup remains available", status == 200 and body == b'{"backups":[]}')
         Stub.hits.clear()
@@ -197,10 +223,9 @@ def main():
         with open(os.path.join(BACKEND, "services", "backup.py"), encoding="utf-8") as f:
             source = f.read()
         check("backup service has no direct file access", "open(" not in source)
-        check("backup service uses repository post and spacing", "ai_tool.post(\"api/cycle/backup\"" in source
-              and "_BACKUP_MIN_SPACING_SECONDS = 1.1" in source)
-
-        # Network failure remains a stable JSON error and never kills the proxy.
+        check("backup service validates success without retry",
+              "_validate_success" in source and "_invalid_success" in source
+              and "ai_tool.post(\"api/cycle/backup\"" in source)
         stub.shutdown(); stub.server_close(); time.sleep(0.2)
         status, body, _ = call(proxy, "/up/api/cycle/backup", "POST", b"{}", bearer, timeout=10)
         try:

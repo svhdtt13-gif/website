@@ -182,6 +182,13 @@ def remote_hits():
     return [hit for hit in Stub.hits if hit["path"] == "/api/remote_live"]
 
 
+def body_json(raw):
+    try:
+        return json.loads(raw.decode("utf-8"))
+    except Exception:
+        return None
+
+
 def main():
     global PROXY_PORT, STUB_PORT
     PROXY_PORT, STUB_PORT = free_port(), free_port()
@@ -290,7 +297,7 @@ def main():
         with open(os.path.join(BACKEND, "app.py"), encoding="utf-8") as source_file:
             app_source = source_file.read()
         check("query guard is at route boundary", "request.query_string" in app_source
-              and "remote_live selector not allowed" in app_source)
+              and "remote live selector not allowed" in app_source)
 
         stub.shutdown(); stub.server_close(); time.sleep(0.2)
         status, raw, _ = call(proxy, "/up/api/remote_live")
@@ -303,18 +310,11 @@ def main():
         try:
             proc.terminate(); proc.wait(timeout=5)
         except Exception:
-            try: proc.kill()
+            try: proc.kill(); proc.wait(timeout=5)
             except Exception: pass
         try:
             stub.shutdown(); stub.server_close()
         except Exception: pass
-
-
-def body_json(raw):
-    try:
-        return json.loads(raw.decode("utf-8"))
-    except Exception:
-        return None
 
 
 if __name__ == "__main__":

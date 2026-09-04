@@ -148,7 +148,9 @@ def main():
         Stub.hits.clear()
         for method in ("POST", "PUT", "PATCH", "DELETE"):
             status, body, _ = http_call(proxy, "/up/api/master", method=method, data=b"{}")
-            check(f"{method} api/master -> 403 JSON", status == 403 and b'"error"' in body,
+            expected = 401 if method == "POST" else 403
+            check(f"{method} api/master -> {expected} JSON",
+                  status == expected and b'"error"' in body,
                   f"got {status}")
         check("master write methods cause zero upstream writes",
               not [h for h in Stub.hits if h[0] != "GET"])
@@ -178,7 +180,8 @@ def main():
         check("proxy survives upstream unreachable", proc.poll() is None)
 
         source_path = os.path.join(BACKEND_DIR, "services", "master.py")
-        source = open(source_path, encoding="utf-8").read()
+        with open(source_path, encoding="utf-8") as source_file:
+            source = source_file.read()
         check("master service has separate upstream mappings",
               'get_master()' in source and 'clients_master.json' in source
               and 'get_api_master()' in source and 'api/master' in source)

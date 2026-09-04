@@ -9,7 +9,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 BACKEND = os.path.join(ROOT, "webapp", "backend")
@@ -49,6 +49,9 @@ def check(name, condition, detail=""):
 class Stub(BaseHTTPRequestHandler):
     hits = []
     mode = "success"
+    active = 0
+    max_active = 0
+    active_lock = threading.Lock()
 
     def _rec(self, body=b""):
         Stub.hits.append({"method": self.command, "path": self.path,
@@ -80,28 +83,36 @@ class Stub(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", 0) or 0)
         body = self.rfile.read(length) if length else b""
         self._rec(body)
-        if self.path != "/api/settings":
-            self._send(b'{"error":"not found"}', 404)
-        elif Stub.mode == "error":
-            self._send(b'{"error":"upstream failure","token":"' + CANARIES[0].encode() + b'"}', 500)
-        elif Stub.mode == "malformed":
-            self._send(b'{"status":"OK","settings":' + CANARIES[0].encode())
-        elif Stub.mode == "non_object":
-            self._send(b'[{"status":"OK"}]')
-        elif Stub.mode == "missing_contract":
-            self._send(b'{"status":"OK"}')
-        elif Stub.mode == "corrupt_port":
-            source = dict(SOURCE)
-            source["tunnel_port"] = CANARIES[0]
-            self._send(json.dumps({"status": "OK", "settings": source}).encode())
-        elif Stub.mode == "corrupt_bool":
-            source = dict(SOURCE)
-            source["auto_telegram"] = {"secret": CANARIES[3]}
-            self._send(json.dumps({"status": "OK", "settings": source}).encode())
-        elif Stub.mode == "missing_safe":
-            self._send(json.dumps({"status": "OK", "settings": {"auto_telegram": False}}).encode())
-        else:
-            self._send(SUCCESS)
+        with Stub.active_lock:
+            Stub.active += 1
+            Stub.max_active = max(Stub.max_active, Stub.active)
+        try:
+            time.sleep(0.05)
+            if self.path != "/api/settings":
+                self._send(b'{"error":"not found"}', 404)
+            elif Stub.mode == "error":
+                self._send(b'{"error":"upstream failure","token":"' + CANARIES[0].encode() + b'"}', 500)
+            elif Stub.mode == "malformed":
+                self._send(b'{"status":"OK","settings":' + CANARIES[0].encode())
+            elif Stub.mode == "non_object":
+                self._send(b'[{"status":"OK"}]')
+            elif Stub.mode == "missing_contract":
+                self._send(b'{"status":"OK"}')
+            elif Stub.mode == "corrupt_port":
+                source = dict(SOURCE)
+                source["tunnel_port"] = CANARIES[0]
+                self._send(json.dumps({"status": "OK", "settings": source}).encode())
+            elif Stub.mode == "corrupt_bool":
+                source = dict(SOURCE)
+                source["auto_telegram"] = {"secret": CANARIES[3]}
+                self._send(json.dumps({"status": "OK", "settings": source}).encode())
+            elif Stub.mode == "missing_safe":
+                self._send(json.dumps({"status": "OK", "settings": {"auto_telegram": False}}).encode())
+            else:
+                self._send(SUCCESS)
+        finally:
+            with Stub.active_lock:
+                Stub.active -= 1
 
     do_PUT = do_POST
     do_PATCH = do_POST
@@ -124,6 +135,19 @@ def call(base, path, method="GET", data=None, headers=None, timeout=20):
         return e.code, body, ""
 
 
+def call_headers(base, path, method="GET", data=None, headers=None, timeout=20):
+    req = urllib.request.Request(base + path, data=data, method=method, headers=headers or {})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.status, r.read(), dict(r.headers)
+    except urllib.error.HTTPError as e:
+        try:
+            body = e.read()
+        except Exception:
+            body = b""
+        return e.code, body, dict(e.headers)
+
+
 def json_body(raw):
     try:
         return json.loads(raw.decode())
@@ -132,7 +156,7 @@ def json_body(raw):
 
 
 def main():
-    stub = HTTPServer(("127.0.0.1", STUB_PORT), Stub)
+    stub = ThreadingHTTPServer(("127.0.0.1", STUB_PORT), Stub)
     threading.Thread(target=stub.serve_forever, kwargs={"poll_interval": 0.1}, daemon=True).start()
     env = dict(os.environ)
     env.update(AI_TOOL_API_BASE=f"http://127.0.0.1:{STUB_PORT}", AI_TOOL_USER="tester",
@@ -155,6 +179,15 @@ def main():
         if not ready:
             return 1
 
+        for label, headers in (("missing Bearer", {}), ("wrong Bearer", {"Authorization": "Bearer wrong"}),
+                               ("forged marker only", {"X-DB-Editor": "1"})):
+            Stub.hits.clear()
+            status, body, response_headers = call_headers(proxy, "/up/api/settings", "POST", b'{"auto_telegram":true}', headers)
+            check(label + " -> 401 + WWW-Authenticate + zero upstream writes",
+                  status == 401 and response_headers.get("WWW-Authenticate") == "Bearer"
+                  and b'"error"' in body and not [h for h in Stub.hits if h["method"] != "GET"],
+                  f"status={status} headers={response_headers}")
+
         Stub.mode = "success"
         Stub.hits.clear()
         payload = b'{"tunnel_port":18081,"auto_telegram":false}'
@@ -176,17 +209,20 @@ def main():
         status, _, _ = call(proxy, "/up/api/settings", "POST", b'{"auto_telegram":true}',
                             dict(bearer, **{"Content-Type": "application/json"}))
         check("application/json accepted", status == 200)
-        Stub.hits.clear()
-        status, body, _ = call(proxy, "/up/api/settings", "POST", b'{"auto_telegram":true}',
-                               dict(bearer, **{"Content-Type": "text/plain"}))
-        check("text/plain JSON rejected with 400 and zero upstream write",
-              status == 400 and b'"error"' in body and not [h for h in Stub.hits if h["method"] != "GET"])
+        for content_type in ("text/plain", "application/json; charset=latin1",
+                             "application/json; foo=bar", "application/json;charset=utf-8"):
+            Stub.hits.clear()
+            status, body, _ = call(proxy, "/up/api/settings", "POST", b'{"auto_telegram":true}',
+                                   dict(bearer, **{"Content-Type": content_type}))
+            check(content_type + " rejected with 400 and zero upstream write",
+                  status == 400 and b'"error"' in body
+                  and not [h for h in Stub.hits if h["method"] != "GET"], str(status))
 
         for label, body in (("empty body", b""), ("empty object", b"{}"),
                             ("array", b"[]"), ("malformed", b"{not-json")):
             Stub.hits.clear()
             status, raw, _ = call(proxy, "/up/api/settings", "POST", body,
-                                  dict(bearer, **{"Content-Type": "application/json"}))
+                                  json_bearer)
             check(label + " -> 400 generic + zero upstream write",
                   status == 400 and b'"error"' in raw and not [h for h in Stub.hits if h["method"] != "GET"],
                   str(status))
@@ -201,8 +237,7 @@ def main():
         ]
         for label, body in invalid_requests:
             Stub.hits.clear()
-            status, raw, _ = call(proxy, "/up/api/settings", "POST", body,
-                                  dict(bearer, **{"Content-Type": "application/json"}))
+            status, raw, _ = call(proxy, "/up/api/settings", "POST", body, json_bearer)
             check(label + " -> 400 no echo + zero upstream write",
                   status == 400 and not any(x.encode() in raw for x in CANARIES)
                   and not [h for h in Stub.hits if h["method"] != "GET"], raw.decode(errors="replace"))
@@ -233,6 +268,17 @@ def main():
         Stub.mode = "success"
         check("proxy survives settings write failures", call(proxy, "/up/api/status")[0] == 200)
 
+        Stub.max_active = 0
+        results = []
+        def send():
+            results.append(call(proxy, "/up/api/settings", "POST", b'{"auto_telegram":true}', json_bearer))
+        first = threading.Thread(target=send)
+        second = threading.Thread(target=send)
+        first.start(); second.start(); first.join(10); second.join(10)
+        check("concurrent settings writes both succeed", len(results) == 2 and all(r[0] == 200 for r in results))
+        check("settings upstream writes never overlap", Stub.max_active == 1, f"max_active={Stub.max_active}")
+        check("proxy survives concurrent settings writes", call(proxy, "/up/api/status")[0] == 200)
+
         Stub.hits.clear()
         for method in ("PUT", "PATCH", "DELETE"):
             status, raw, _ = call(proxy, "/up/api/settings", method, b"{}", bearer)
@@ -249,6 +295,8 @@ def main():
               source.count("_project_public_settings") >= 3
               and "def get_settings" in source and "def update_settings" in source)
         check("settings service has no direct file access", "open(" not in source)
+        check("settings write uses process-local lock and exact MIME set",
+              "_SETTINGS_WRITE_LOCK" in source and "_ALLOWED_JSON_CONTENT_TYPES" in source)
 
         stub.shutdown(); stub.server_close(); time.sleep(0.2)
         status, raw, _ = call(proxy, "/up/api/settings", "POST", b'{"auto_telegram":true}', json_bearer)

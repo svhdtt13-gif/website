@@ -25,6 +25,7 @@ Mo `http://127.0.0.1:8090`.
 - `POST /up/api/log` yeu cau `Authorization: Bearer <WEBAPP_WRITE_TOKEN>`.
 - Thieu/sai token -> 401 JSON va khong co request nao toi ai tool.
 - `WEBAPP_WRITE_TOKEN` chi lay tu environment; khong hard-code, khong commit.
+- Neu server khong duoc cau hinh token, moi write deu bi tu choi an toan.
 - Bearer gate nay la bao ve toi thieu cho Phase 2, chua phai Session/role system.
 - Repository tu tao Basic Auth + `X-DB-Editor: 1` khi goi ai tool; client khong
   the override header nay.

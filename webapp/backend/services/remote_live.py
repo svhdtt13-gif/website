@@ -1,12 +1,14 @@
-"""Service for the canonical, non-selecting remote live snapshot read."""
+"""Services for canonical and guarded remote live snapshot reads."""
 import datetime
 import json
 import threading
+from urllib.parse import quote
 
 from repositories.aitool import UpstreamError, ai_tool
 
 
 _REMOTE_LIVE_LOCK = threading.Lock()
+_REMOTE_SELECTOR_LOCK = threading.Lock()
 _PUBLIC_TOP_LEVEL_FIELDS = frozenset({
     "ok", "fetchedAt", "clientCount", "selectedClientIdx", "clients", "tasks", "logs"
 })
@@ -21,6 +23,10 @@ _LOG_FIELDS = frozenset({"text", "color"})
 
 class RemoteLiveValidationError(Exception):
     """The remote snapshot violates the public read contract."""
+
+
+class RemoteSelectorQueryError(Exception):
+    """The raw selector query violates the route-level query contract."""
 
 
 def _safe_error():
@@ -110,11 +116,13 @@ def _project_snapshot(body, status, content_type):
         if type(clients) is not list or type(tasks) is not list or type(logs) is not list:
             raise RemoteLiveValidationError()
         client_indexes = set()
+        client_ids = set()
         for entry in clients:
             _validate_client(entry)
             if entry["idx"] in client_indexes:
                 raise RemoteLiveValidationError()
             client_indexes.add(entry["idx"])
+            client_ids.add(entry["id"])
         task_indexes = set()
         for entry in tasks:
             _validate_task(entry)
@@ -123,6 +131,8 @@ def _project_snapshot(body, status, content_type):
             task_indexes.add(entry["idx"])
         for entry in logs:
             _validate_log(entry)
+        if len(client_ids) != len(clients):
+            raise RemoteLiveValidationError()
         client_count = source["clientCount"]
         if not _exact_nonnegative_int(client_count) or client_count != len(clients):
             raise RemoteLiveValidationError()
@@ -142,12 +152,114 @@ def _project_snapshot(body, status, content_type):
         _safe_error()
 
 
+def _encode_public(snapshot):
+    return json.dumps(snapshot, ensure_ascii=False, separators=(",", ":")).encode("utf-8"), 200, "application/json"
+
+
+def _load_snapshot():
+    try:
+        return _project_snapshot(*ai_tool.get("api/remote_live"))
+    except UpstreamError:
+        _safe_error()
+
+
 def get_remote_live():
     """Read and project remote live without passing a client selector."""
     with _REMOTE_LIVE_LOCK:
+        return _encode_public(_load_snapshot())
+
+
+def _decode_query_component(raw):
+    result = bytearray()
+    index = 0
+    while index < len(raw):
+        value = raw[index]
+        if value == 0x2B:
+            raise RemoteSelectorQueryError()
+        if value == 0x25:
+            if index + 2 >= len(raw):
+                raise RemoteSelectorQueryError()
+            try:
+                result.append(int(raw[index + 1:index + 3], 16))
+            except ValueError:
+                raise RemoteSelectorQueryError()
+            index += 3
+            continue
+        result.append(value)
+        index += 1
+    try:
+        return bytes(result).decode("utf-8")
+    except UnicodeDecodeError:
+        raise RemoteSelectorQueryError()
+
+
+def _valid_selector_text(value, max_length):
+    if type(value) is not str or not 1 <= len(value) <= max_length or not value.strip():
+        return False
+    return not any(ord(char) < 32 or 0x7F <= ord(char) <= 0x9F for char in value)
+
+
+def parse_selector_query(raw_query):
+    """Parse raw query bytes and return (t, client, canonical_query)."""
+    if not isinstance(raw_query, bytes) or not raw_query:
+        raise RemoteSelectorQueryError()
+    values = {}
+    for component in raw_query.split(b"&"):
+        if component.count(b"=") != 1:
+            raise RemoteSelectorQueryError()
+        raw_key, raw_value = component.split(b"=", 1)
+        key = _decode_query_component(raw_key)
+        value = _decode_query_component(raw_value)
+        if not key or not value or key in values:
+            raise RemoteSelectorQueryError()
+        values[key] = value
+    if set(values) != {"t", "client"}:
+        raise RemoteSelectorQueryError()
+    timestamp = values["t"]
+    client = values["client"]
+    if (not 1 <= len(timestamp) <= 32 or not all("0" <= char <= "9" for char in timestamp)
+            or not _valid_selector_text(client, 200)):
+        raise RemoteSelectorQueryError()
+    canonical = "t=" + quote(timestamp, safe="") + "&client=" + quote(client, safe="")
+    return timestamp, client, canonical
+
+
+def _normalize_client_id(value):
+    return value[2:] if value.startswith("0:") else value
+
+
+def _selected_client_id(snapshot):
+    selected = snapshot["selectedClientIdx"]
+    if selected is None:
+        return None
+    for client in snapshot["clients"]:
+        if client["idx"] == selected:
+            return client["id"]
+    return None
+
+
+def _find_target(snapshot, requested_client):
+    normalized = _normalize_client_id(requested_client)
+    matches = [client for client in snapshot["clients"]
+               if _normalize_client_id(client["id"]) == normalized]
+    if len(matches) != 1:
+        raise UpstreamError(409, b'{"error":"remote selector target unavailable"}')
+    return matches[0]["id"]
+
+
+def get_remote_live_selector(selector):
+    """Select a fresh remote client under one read/selector transaction lock."""
+    timestamp, requested_client, _canonical = selector
+    with _REMOTE_SELECTOR_LOCK:
+        fresh = _load_snapshot()
+        target_client = _find_target(fresh, requested_client)
+        if _normalize_client_id(_selected_client_id(fresh) or "") == _normalize_client_id(target_client):
+            return _encode_public(fresh)
+        canonical_query = "t=" + quote(timestamp, safe="") + "&client=" + quote(target_client, safe="")
         try:
-            result = ai_tool.get("api/remote_live")
+            selected = _project_snapshot(*ai_tool.get("api/remote_live?" + canonical_query))
         except UpstreamError:
             _safe_error()
-        public = _project_snapshot(*result)
-        return json.dumps(public, ensure_ascii=False, separators=(",", ":")).encode("utf-8"), 200, "application/json"
+        if _normalize_client_id(_selected_client_id(selected) or "") != _normalize_client_id(target_client):
+            _safe_error()
+        return _encode_public(selected)

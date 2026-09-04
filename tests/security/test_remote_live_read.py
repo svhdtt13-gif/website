@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Slice 9 security/contract tests for canonical GET /up/api/remote_live."""
+"""Slice 9 contract/security tests for canonical GET /up/api/remote_live."""
 import copy
 import json
 import os
@@ -221,12 +221,13 @@ def main():
         if not ready:
             return 1
 
-        for query in ("?client=client-a", "?t=123", "?anything=1"):
+        for query, expected, body in (("?client=client-a", 400, {"error": "invalid remote selector query"}),
+                                      ("?t=123", 400, {"error": "invalid remote selector query"}),
+                                      ("?anything=1", 400, {"error": "invalid remote selector query"})):
             Stub.reset()
             status, raw, _ = call(proxy, "/up/api/remote_live" + query)
-            check("query " + query + " -> route-level 400 and zero upstream",
-                  status == 400 and body_json(raw) == {"error": "remote live selector not allowed"}
-                  and not remote_hits())
+            check("query " + query + " -> boundary guard and zero upstream",
+                  status == expected and body_json(raw) == body and not remote_hits())
 
         Stub.reset()
         status, raw, _ = call(proxy, "/up/api/remote_live")
@@ -307,7 +308,8 @@ def main():
         with open(os.path.join(BACKEND, "app.py"), encoding="utf-8") as source_file:
             app_source = source_file.read()
         check("query guard is at route boundary", "request.query_string" in app_source
-              and "remote live selector not allowed" in app_source)
+              and "parse_selector_query(request.query_string)" in app_source
+              and "RemoteSelectorQueryError" in app_source)
 
         stub.shutdown(); stub.server_close(); time.sleep(0.2)
         status, raw, _ = call(proxy, "/up/api/remote_live")

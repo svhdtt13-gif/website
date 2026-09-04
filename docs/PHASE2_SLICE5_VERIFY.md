@@ -15,6 +15,10 @@ Tunnel và không chạm AutoCycle.
   `{"error":"settings upstream response unavailable"}`.
 - Public key set luôn là subset của positive allowlist; unknown/nested fields bị
   drop và canary secret leakage được test trực tiếp.
+- Golden implementation cho phép `default_browser` là arbitrary string/path;
+  field này bị loại khỏi public contract Slice 5.
+- `tunnel_port` phải là integer trong miền `1..65535`; invalid value -> generic
+  `502`, không echo giá trị.
 
 ## Field contract
 
@@ -23,18 +27,18 @@ Tunnel và không chạm AutoCycle.
 Chỉ các key sau được trả về khi key thực sự tồn tại upstream:
 
 ```text
-default_browser: string
-tunnel_port: integer
+tunnel_port: integer, 1..65535
 auto_restart_tunnel: boolean
 auto_telegram: boolean
 auto_open_browser: boolean
 ```
 
-Giá trị phải đúng JSON type tương ứng. Nếu allowlisted value sai type, response
-fail-closed `502` thay vì trả dữ liệu có thể chứa nested secret.
+Giá trị phải đúng JSON type tương ứng. Nếu allowlisted value sai type hoặc nằm
+ngoài miền hợp lệ, response fail-closed `502`.
 
 ### Always omitted
 
+- `default_browser` (golden cho phép arbitrary string/path, không expose)
 - `telegram_bot_token`
 - `telegram_chat_id`
 - `effective_telegram_bot_token`
@@ -55,9 +59,12 @@ Redaction dùng `omit`, không dùng masked placeholder.
 
 ## Verification
 
-- `tests/security/test_settings_read.py`: **21/21 pass**:
+- `tests/security/test_settings_read.py`: **24/24 pass**:
   - exact public allowlist response và Basic Auth/path forwarding;
   - missing key không tự tạo key;
+  - `default_browser` canary không lọt vì field bị omit;
+  - canary trong allowlisted `tunnel_port` -> generic `502`, không echo;
+  - port `0` và `65536` -> generic `502`;
   - malformed JSON/non-object 200 -> generic `502`;
   - upstream 401/503 -> status giữ nguyên nhưng body generic;
   - canary token/password/chat ID ở top-level, unknown/nested fields và error
@@ -77,9 +84,8 @@ Redaction dùng `omit`, không dùng masked placeholder.
 
 - Direct ai tool `GET /api/settings`: `200`; branch proxy
   `GET /up/api/settings`: `200`.
-- Raw upstream schema có 8 keys; public response có đúng 5 keys:
-  `default_browser`, `tunnel_port`, `auto_restart_tunnel`, `auto_telegram`,
-  `auto_open_browser`.
+- Raw upstream schema có 8 keys; public response có đúng 4 keys:
+  `tunnel_port`, `auto_restart_tunnel`, `auto_telegram`, `auto_open_browser`.
 - Không in hoặc ghi giá trị secret; public response không có sensitive key.
 - Snapshot trước/sau giữ nguyên: `settings.json`, `client_database.json`,
   `cycle_state.json`, `clients_master.json`, số clients/schedules và client IDs.
@@ -87,5 +93,5 @@ Redaction dùng `omit`, không dùng masked placeholder.
 
 ## Approval gate
 
-Implementation đã chạy test và live evidence trên branch này. Chỉ mở PR sau
-khi review diff và confirmation cuối cùng.
+Implementation đã chạy test và live evidence trên branch này. PR đang mở để
+review; không merge hoặc mở endpoint khác trong PR này.

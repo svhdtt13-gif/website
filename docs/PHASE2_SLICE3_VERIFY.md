@@ -28,10 +28,16 @@ Theo `WebAppControl/flask/app_public.py` của ai tool:
 
 ## Verification
 
-- `tests/security/test_backup_read.py`: **15 checks pass** trên stub local:
+- `tests/security/test_backup_read.py`: **15/15 pass** trên stub local:
   boot, GET shape/content-type, Basic Auth, POST/PUT/PATCH/DELETE 403 + zero
   upstream write, traversal variants, Slice 2 write gate, upstream error/body,
   proxy survival.
+- Regression `tests/security/test_proxy.py`: **10/10 pass**; 7 read path cũ
+  vẫn giữ nguyên và mọi write cũ vẫn bị chặn.
+- Regression `tests/security/test_write_log.py`: **16/16 pass**; Bearer gate,
+  raw body/content-type, upstream header boundary và log contract giữ nguyên.
+- Các stub test dùng port động và chờ/thu hồi subprocess để không hit nhầm
+  process cũ trong môi trường local.
 - Remote Python syntax compile: app/config/service/test pass.
 - Live (2026-09-04): gọi qua proxy Slice 3 và đối chiếu direct ai tool với cùng
   Basic Auth; status `200`, MIME `application/json`, body **3684 bytes** khớp

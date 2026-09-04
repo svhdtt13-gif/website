@@ -67,8 +67,11 @@ class Stub(BaseHTTPRequestHandler):
         if self.headers.get("X-DB-Editor") != "1":
             self._send({"error": "missing marker"}, 403)
             return
+        if not raw:
+            self._send({"error": "bad json"}, 500)
+            return
         try:
-            data = json.loads(raw.decode("utf-8") or "{}")
+            data = json.loads(raw.decode("utf-8"))
         except Exception:
             self._send({"error": "bad json"}, 500)
             return

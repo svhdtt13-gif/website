@@ -1,13 +1,15 @@
 """Proxy read-only: serve frontend tĩnh + chuyển tiếp GET allowlist sang ai tool.
 
 Chạy: set AI_TOOL_API_BASE / AI_TOOL_USER / AI_TOOL_PASS rồi `python proxy.py`.
-Bind 127.0.0.1 — local only. Không bao giờ proxy POST/PUT/PATCH/DELETE.
+Bind 127.0.0.1 — local only. Không bao giờ proxy POST/PUT/PATCH/DELETE:
+route khai báo đủ method để Flask không trả 405 HTML mà trả 403 JSON
+đúng contract `{"error": ...}`.
 """
 import base64
 import pathlib
 import urllib.request
 import urllib.error
-from flask import Flask, Response, jsonify, send_from_directory
+from flask import Flask, Response, jsonify, request, send_from_directory
 
 import config
 
@@ -35,8 +37,10 @@ def static_files(filename):
     return send_from_directory(str(FRONTEND), filename)
 
 
-@app.route("/up/<path:subpath>")
+@app.route("/up/<path:subpath>", methods=["GET", "POST", "PUT", "PATCH", "DELETE"])
 def upstream(subpath):
+    if request.method != "GET":
+        return jsonify({"error": "read-only proxy: write methods blocked"}), 403
     if subpath not in config.READ_ONLY_ALLOWLIST:
         return jsonify({"error": "read-only proxy: endpoint not allowed"}), 403
     url = f"{config.AI_TOOL_API_BASE}/{subpath}"

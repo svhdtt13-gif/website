@@ -9,7 +9,6 @@ import json
 import os
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 import urllib.request
@@ -189,7 +188,7 @@ def main():
         stub.shutdown()
         time.sleep(0.5)
         try:
-            status, body, _ = http_call(proxy_url, "/up/api/status")
+            status, body, _ = http_call(proxy_url, "/up/api/status", timeout=30)
             try:
                 err = json.loads((body or b"{}").decode("utf-8"))
                 ok = status == 502 and "error" in err

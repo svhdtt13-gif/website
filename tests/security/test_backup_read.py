@@ -148,7 +148,7 @@ def main():
         Stub.hits.clear()
         for method in ("POST", "PUT", "PATCH", "DELETE"):
             status, body, _ = http_call(proxy, "/up/api/cycle/backup", method=method, data=b"{}")
-            check(f"{method} backup -> 403 JSON", status == 403 and b'"error"' in body,
+            check(f"{method} backup -> 403 JSON", status == 403 and b'\"error\"' in body,
                   f"got {status}")
         check("backup methods cause zero upstream writes",
               not [h for h in Stub.hits if h[0] != "GET"])
@@ -165,7 +165,7 @@ def main():
         # The write gate from Slice 2 remains closed without its own Bearer token.
         Stub.hits.clear()
         status, body, _ = http_call(proxy, "/up/api/log", method="POST", data=b"{}")
-        check("Slice 2 log write gate remains enforced", status == 401 and b'"error"' in body
+        check("Slice 2 log write gate remains enforced", status == 401 and b'\"error\"' in body
               and not [h for h in Stub.hits if h[0] != "GET"])
 
         # Simulate upstream HTTP failure, then verify proxy remains usable.
@@ -179,6 +179,19 @@ def main():
         Stub.do_GET = original
         status, _, _ = http_call(proxy, "/up/api/cycle/backup")
         check("proxy survives upstream error", status == 200)
+
+        # Close the upstream socket to exercise repository connection-refused handling.
+        stub.shutdown()
+        stub.server_close()
+        time.sleep(0.2)
+        status, body, _ = http_call(proxy, "/up/api/cycle/backup", timeout=10)
+        try:
+            error_body = json.loads(body.decode("utf-8"))
+        except Exception:
+            error_body = {}
+        check("upstream unreachable -> 502 JSON error",
+              status == 502 and "error" in error_body, f"got {status} body={body[:200]}")
+        check("proxy survives upstream unreachable", proc.poll() is None)
 
         print(f"\nSUMMARY: {PASS_COUNT} passed, {FAIL_COUNT} failed")
         return 0 if FAIL_COUNT == 0 else 1

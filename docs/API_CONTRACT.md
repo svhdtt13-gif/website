@@ -78,7 +78,7 @@ trả `409` và không gửi selector upstream. Nếu target đã selected thì 
 snapshot và không tạo selector side effect. Nếu khác, upstream query được canonical
 re-encode thành `t=<t>&client=<target_id>`; response sau selection phải xác nhận đúng
 target trước khi trả public snapshot. Mọi upstream/network/timeout/schema failure trả
-`502` generic {"error":"remote live snapshot unavailable"}.
+`502` generic `{"error":"remote live snapshot unavailable"}`.
 
 Selector không gọi sync, toggle, cycle, alwaysrun, Telegram, browser, tunnel, AI-fix,
 không ghi file và không mở WebSocket. POST/PUT/PATCH/DELETE và mọi subpath vẫn bị block.

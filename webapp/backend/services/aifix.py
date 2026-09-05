@@ -1,6 +1,7 @@
 """Guarded AI-fix queue actions; filesystem ownership stays in ai tool."""
 import json
 import re
+import unicodedata
 
 from repositories.aitool import UpstreamError, ai_tool
 
@@ -20,7 +21,7 @@ def _safe_error():
 
 
 def _has_control_chars(value):
-    return any(ord(char) < 32 or 0x7F <= ord(char) <= 0x9F for char in value)
+    return any(unicodedata.category(char).startswith("C") for char in value)
 
 
 def _prepare_request(body):

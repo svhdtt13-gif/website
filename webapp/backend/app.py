@@ -11,6 +11,7 @@ Slice 8 them guarded CAS name-only POST api/master.
 Slice 9 them canonical GET api/remote_live khong selector.
 Slice 10 them guarded remote selector query.
 Slice 11 them dedicated guarded DELETE api/cycle/backup/<name>.
+Bundle 1 them guarded settings Telegram test va browser open actions.
 """
 import hmac
 import pathlib
@@ -26,6 +27,7 @@ from services import log as log_service
 from services import master as master_service
 from services import remote_live as remote_live_service
 from services import settings as settings_service
+from services import settings_actions as settings_actions_service
 from services import sync as sync_service
 
 BASE = pathlib.Path(__file__).resolve().parent
@@ -68,6 +70,19 @@ def _raw_request_path():
     return (raw or request.path).split("?", 1)[0]
 
 
+def _settings_action_gate():
+    """Reject query/methods before action handlers or upstream access."""
+    if request.query_string:
+        return jsonify({"error": "query parameters not allowed"}), 400
+    if request.method != "POST":
+        return jsonify({"error": "read-only proxy: write methods blocked"}), 403
+    if not _write_authorized():
+        return jsonify({"error": "write authentication required"}), 401, {
+            "WWW-Authenticate": "Bearer"
+        }
+    return None
+
+
 def create_app():
     app = Flask(__name__, static_folder=None)
 
@@ -87,6 +102,34 @@ def create_app():
         if target.suffix not in ALLOWED_STATIC_EXT or not target.is_file():
             return jsonify({"error": "not found"}), 404
         return send_from_directory(str(target.parent), target.name)
+
+    @app.route(
+        "/up/api/settings/test_telegram",
+        methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
+    )
+    def test_telegram():
+        rejection = _settings_action_gate()
+        if rejection:
+            return rejection
+        try:
+            body, status, ctype = settings_actions_service.test_telegram()
+        except UpstreamError as e:
+            return Response(e.body, status=e.status, content_type="application/json")
+        return Response(body, status=status, content_type=ctype)
+
+    @app.route(
+        "/up/api/settings/open_browser",
+        methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
+    )
+    def open_browser():
+        rejection = _settings_action_gate()
+        if rejection:
+            return rejection
+        try:
+            body, status, ctype = settings_actions_service.open_browser(request.get_data())
+        except UpstreamError as e:
+            return Response(e.body, status=e.status, content_type="application/json")
+        return Response(body, status=status, content_type=ctype)
 
     @app.route("/up/api/cycle/backup/<name>", methods=["DELETE"])
     def delete_backup(name):

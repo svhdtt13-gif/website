@@ -285,8 +285,8 @@ def main():
             status, raw, _ = call(proxy, "/up/api/settings", method, b"{}", bearer)
             check(method + " settings -> 403 JSON", status == 403 and b'"error"' in raw)
         for path in ("/up/api/settings/test_telegram", "/up/api/settings/open_browser"):
-            status, raw, _ = call(proxy, path, "POST", b"{}", bearer)
-            check("settings helper write -> 403 JSON", status == 403 and b'"error"' in raw)
+            status, raw, _ = call(proxy, path, "POST", b"{}", {"Authorization": "Bearer wrong"})
+            check("settings action wrong Bearer -> 401 JSON", status == 401 and b'"error"' in raw)
         check("blocked settings writes cause zero upstream writes",
               not [h for h in Stub.hits if h["method"] != "GET"])
 
@@ -305,7 +305,7 @@ def main():
               and json_body(raw) == {"error": "settings upstream response unavailable"})
         check("proxy survives settings outage", proc.poll() is None)
         print(f"\nSUMMARY: {PASS} passed, {FAIL} failed")
-        return 0 if FAIL else 1
+        return 0 if FAIL == 0 else 1
     finally:
         try:
             proc.terminate(); proc.wait(timeout=5)

@@ -1,8 +1,20 @@
-# Webapp skeleton + Slice 2 write endpoint
+# Webapp proxy + Phase 2 write actions
 
 Dashboard doc du lieu tu ai tool qua proxy cung origin.
-Write chi mo duy nhat `POST /up/api/log` trong Slice 2 va phai qua Bearer
-write token rieng cua website; cac write khac van bi chan 403.
+Write actions require the website Bearer token and remain server-side through the
+repository/service boundary. The current implemented writes are:
+
+- `POST /up/api/log`
+- `POST /up/api/cycle/backup`
+- `POST /up/api/settings`
+- guarded name-only `POST /up/api/master`
+- guarded `DELETE /up/api/cycle/backup/<name>`
+- guarded `POST /up/api/settings/test_telegram`
+- guarded `POST /up/api/settings/open_browser`
+
+Other write actions remain blocked by the allowlist. Bundle 1 does not modify or
+copy `ai tool` files and does not control cycle, sync, tunnel, Telegram settings,
+or scheduler ownership directly.
 
 ## Chay
 
@@ -22,13 +34,14 @@ Mo `http://127.0.0.1:8090`.
 
 ## Write boundary
 
-- `POST /up/api/log` yeu cau `Authorization: Bearer <WEBAPP_WRITE_TOKEN>`.
-- Thieu/sai token -> 401 JSON va khong co request nao toi ai tool.
-- `WEBAPP_WRITE_TOKEN` chi lay tu environment; khong hard-code, khong commit.
-- Neu server khong duoc cau hinh token, moi write deu bi tu choi an toan.
-- Bearer gate nay la bao ve toi thieu cho Phase 2, chua phai Session/role system.
-- Repository tu tao Basic Auth + `X-DB-Editor: 1` khi goi ai tool; client khong
-  the override header nay.
+- Every implemented write requires `Authorization: Bearer <WEBAPP_WRITE_TOKEN>`.
+- Missing or wrong token returns 401 and makes no request to ai tool.
+- `WEBAPP_WRITE_TOKEN` is read only from the environment; it is never hard-coded or committed.
+- If the server has no configured token, every write is rejected safely.
+- The Bearer gate is the minimum Phase 2 protection, not a session/role system.
+- The repository creates Basic Auth + `X-DB-Editor: 1` for ai tool requests; clients cannot override that marker.
+- Bundle 1 action routes reject query strings and block non-POST methods before upstream access.
+- Browser URLs are limited to absolute HTTP/HTTPS URLs with a hostname, no userinfo/control/CRLF/NUL, and at most 2048 UTF-8 bytes.
 
 ## An toan
 

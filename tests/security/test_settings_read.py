@@ -195,8 +195,8 @@ def main():
         status, raw, _ = call(proxy, "/up/api/settings", "POST", b"{}")
         check("POST settings without Bearer -> 401 JSON", status == 401 and b'"error"' in raw, str(status))
         for path in ("/up/api/settings/test_telegram", "/up/api/settings/open_browser"):
-            status, raw, _ = call(proxy, path, "POST", b"{}")
-            check("related settings write -> 403 JSON", status == 403 and b'"error"' in raw, str(status))
+            status, raw, _ = call(proxy, path, "POST", b"{}", {"Authorization": "Bearer wrong"})
+            check("related settings action wrong Bearer -> 401 JSON", status == 401 and b'"error"' in raw, str(status))
         check("settings write attempts cause zero upstream writes",
               not [h for h in Stub.hits if h[0] != "GET"])
 
@@ -217,21 +217,18 @@ def main():
               and not any(x.encode() in raw for x in CANARIES), raw.decode(errors="replace"))
         check("proxy survives settings outage", proc.poll() is None)
         print(f"\nSUMMARY: {PASS} passed, {FAIL} failed")
-        return 0 if FAIL else 1
+        return 0 if FAIL == 0 else 1
     finally:
         try:
             proc.terminate()
             proc.wait(timeout=5)
         except Exception:
-            try:
-                proc.kill()
-            except Exception:
-                pass
+            try: proc.kill()
+            except Exception: pass
         try:
             stub.shutdown()
             stub.server_close()
-        except Exception:
-            pass
+        except Exception: pass
 
 
 if __name__ == "__main__":

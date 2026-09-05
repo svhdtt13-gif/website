@@ -4,7 +4,9 @@ Slice 1: get() passthrough cho 7 path GET (giuyen tu upstream.py cu).
 Slice 2: post() chi dung cho POST api/log — noi duy nhat thuc hien HTTP write
 toi ai tool o giai doan nay. Route/service khong duoc ghi file truc tiep.
 Slice 11: delete_backup() is the only dynamic DELETE repository operation.
+Bundle 1: typed settings action methods own their POST boundaries.
 """
+import json
 import re
 import urllib.error
 import urllib.request
@@ -70,6 +72,37 @@ class AiToolRepository:
             raise UpstreamError(e.code, body_out)
         except Exception as e:
             raise UpstreamError(502, ('{"error":"upstream unreachable: %s"}' % e)[:300].encode())
+
+    def _post_action(self, subpath, body=b"", content_type=None, timeout=20):
+        """POST a fixed action path with repository-owned auth and marker."""
+        headers = self._auth_headers()
+        headers["X-DB-Editor"] = "1"
+        if content_type:
+            headers["Content-Type"] = content_type
+        url = f"{config.AI_TOOL_API_BASE}/{subpath}"
+        req = urllib.request.Request(url, data=body, headers=headers, method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                return r.read(), r.status, r.headers.get_content_type()
+        except urllib.error.HTTPError as e:
+            try:
+                body_out = e.read()
+            except Exception:
+                body_out = b'{"error":"upstream error"}'
+            raise UpstreamError(e.code, body_out)
+        except Exception as e:
+            raise UpstreamError(502, ('{"error":"upstream unreachable: %s"}' % e)[:300].encode())
+
+    def test_telegram(self, timeout=20):
+        """POST exactly the fixed Telegram test action with an empty body."""
+        return self._post_action("api/settings/test_telegram", timeout=timeout)
+
+    def open_browser(self, url, timeout=20):
+        """POST one validated browser URL to the fixed action endpoint."""
+        body = json.dumps({"url": url}, separators=(",", ":")).encode("utf-8")
+        return self._post_action(
+            "api/settings/open_browser", body, "application/json", timeout
+        )
 
     def delete_backup(self, name, timeout=20):
         """DELETE exactly one canonical backup name; no generic DELETE primitive."""

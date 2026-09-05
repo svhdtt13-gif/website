@@ -217,7 +217,7 @@ def main():
               and not any(x.encode() in raw for x in CANARIES), raw.decode(errors="replace"))
         check("proxy survives settings outage", proc.poll() is None)
         print(f"\nSUMMARY: {PASS} passed, {FAIL} failed")
-        return 0 if FAIL else 1
+        return 0 if FAIL == 0 else 1
     finally:
         try:
             proc.terminate()

@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 """Slice 11 tests for dedicated DELETE /up/api/cycle/backup/<name>."""
-import copy
 import json
 import os
 import socket
@@ -9,7 +8,6 @@ import sys
 import threading
 import time
 import urllib.error
-import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -139,7 +137,8 @@ class Stub(BaseHTTPRequestHandler):
 
 
 def call(base, path, method="GET", data=None, headers=None, timeout=20):
-    request = urllib.request.Request(base + path, data=data, method=method, headers=headers or {})
+    request = urllib.request.Request(base + path.replace(" ", "%20"), data=data,
+                                     method=method, headers=headers or {})
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
             return response.status, response.read(), dict(response.headers)

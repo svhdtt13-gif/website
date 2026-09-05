@@ -185,7 +185,7 @@ def create_app():
             try:
                 body, status, ctype = handler()
             except UpstreamError as e:
-                return Response(e.body, status=e.status, content_type=ctype)
+                return Response(e.body, status=e.status, content_type="application/json")
             return Response(body, status=status, content_type=ctype)
 
         # Write: method/path allowlist is not enough; require website Bearer auth first.

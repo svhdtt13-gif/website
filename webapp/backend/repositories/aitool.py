@@ -158,8 +158,8 @@ class AiToolRepository:
         if kind == "userimport":
             payload["text"] = text
         body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-        started = time.monotonic()
         with _AiFixCreateLock():
+            started = time.monotonic()
             try:
                 return self._post_action("api/ai_fix", body, "application/json", timeout)
             finally:

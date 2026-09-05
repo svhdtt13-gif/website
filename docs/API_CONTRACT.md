@@ -109,6 +109,42 @@ status map deterministically thành `502 application/json` với chính xác
 Không mở cycle/scheduler/fixed-client/remote selection action, không restore, không ghi
 file/database trực tiếp và không đổi scheduler ownership.
 
+## Bundle 1 settings actions contract
+
+Bundle 1 mở đúng hai dedicated POST routes:
+
+- `POST /api/settings/test_telegram`
+- `POST /api/settings/open_browser`
+
+Website route là `/up/...`; Bearer authentication được kiểm tra trước mọi upstream
+call. Query string trên cả hai action bị reject tại route boundary bằng `400`
+`{"error":"query parameters not allowed"}` và zero upstream. GET/PUT/PATCH/DELETE
+và mọi subpath khác bị block `403`.
+
+`test_telegram` không nhận credential/message từ client và không forward body/query.
+Upstream repository gửi một POST body rỗng với Basic Auth + `X-DB-Editor: 1`. Success
+là `200 {"status":"OK","sent":true}`. Golden known configuration/send failure
+là `400 {"error":"Telegram token/chat id chưa cấu hình hoặc gửi thất bại"}`.
+Mọi runtime/network/timeout/malformed upstream response map thành
+`502 {"error":"telegram test unavailable"}` và không retry, echo hoặc expose secrets.
+
+`open_browser` nhận JSON object optional. Empty body hoặc missing/falsey `url` dùng
+`http://127.0.0.1:8080/db`; malformed/non-object JSON trả deterministic `400`
+`{"error":"invalid browser request"}` và zero upstream. URL truthy phải là absolute
+`http`/`https`, có hostname, không userinfo/control/CRLF/NUL và tối đa 2048 UTF-8 bytes.
+Repository chỉ gửi typed `{"url":"<validated_url>"}` tới fixed upstream action.
+Success/failure giữ `200` shape lần lượt
+`{"status":"OK","opened":true,"url":"<url>"}` hoặc
+`{"status":"error","opened":false,"url":"<url>"}`. Runtime/network/timeout/
+malformed upstream response map thành `502 {"error":"browser open unavailable"}`
+không echo hoặc retry.
+
+Hai action không ghi settings/state/activity/change log và không gọi sync, cycle,
+alwaysrun, tunnel hoặc action còn lại. Không direct file access; typed repository
+methods là `test_telegram()` và `open_browser(url)`.
+
+## Response errors
+
 Response lỗi chuẩn: `{"error": "..."}` kèm HTTP 4xx/5xx.
 Lưu ý: Flask không bật CORS — trình duyệt gọi trực tiếp sẽ bị chặn,
 webapp dùng proxy cùng origin để tránh vấn đề này.

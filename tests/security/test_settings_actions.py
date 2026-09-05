@@ -259,6 +259,7 @@ def main():
             ("missing host", b'{"url":"https:///path"}'),
             ("userinfo", b'{"url":"https://user:pass@example.com"}'),
             ("control", b'{"url":"https://example.com/\\r\\nX"}'),
+            ("encoded control", b'{"url":"https://example.com/%0d%0aX"}'),
             ("too long", json.dumps({"url": "https://" + "a" * 2048 + ".com"}).encode()),
         ]
         Stub.browser_mode = "success"
@@ -282,7 +283,7 @@ def main():
         Stub.browser_mode = "success"
         check("proxy survives Bundle 1 failures", call(proxy, "/up/api/status")[0] == 200)
         print(f"\nSUMMARY: {PASS} passed, {FAIL} failed")
-        return 0 if FAIL else 1
+        return 0 if FAIL == 0 else 1
     finally:
         try:
             proc.terminate()

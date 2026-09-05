@@ -26,6 +26,9 @@ def _decode_json(body):
 def _valid_browser_url(url):
     if type(url) is not str or not url or len(url.encode("utf-8")) > 2048:
         return False
+    lowered = url.lower()
+    if any(marker in lowered for marker in ("%00", "%0a", "%0d")):
+        return False
     if any(ord(char) < 32 or 0x7F <= ord(char) <= 0x9F for char in url):
         return False
     try:

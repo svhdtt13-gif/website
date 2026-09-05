@@ -5,9 +5,13 @@ Slice 2: post() chi dung cho POST api/log — noi duy nhat thuc hien HTTP write
 toi ai tool o giai doan nay. Route/service khong duoc ghi file truc tiep.
 Slice 11: delete_backup() is the only dynamic DELETE repository operation.
 Bundle 1: typed settings action methods own their POST boundaries.
+Bundle 2: typed AI-fix creation owns queue request serialization and spacing.
 """
 import json
+import os
 import re
+import threading
+import time
 import urllib.error
 import urllib.request
 from urllib.parse import quote
@@ -22,6 +26,48 @@ class UpstreamError(Exception):
         super().__init__(body[:300] if isinstance(body, str) else "upstream error")
         self.status = status
         self.body = body
+
+
+class _AiFixCreateLock:
+    """Cross-process gate for the golden second-based queue filename."""
+
+    _name = "Local\\AutoGhostStory_AiFixCreate"
+    _process_lock = threading.Lock()
+
+    def __enter__(self):
+        self._handle = None
+        if os.name == "nt":
+            import ctypes
+
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.CreateMutexW.restype = ctypes.c_void_p
+            kernel32.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+            kernel32.WaitForSingleObject.restype = ctypes.c_uint32
+            kernel32.ReleaseMutex.argtypes = [ctypes.c_void_p]
+            kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+            self._kernel32 = kernel32
+            self._handle = kernel32.CreateMutexW(None, False, self._name)
+            if not self._handle:
+                raise OSError(ctypes.get_last_error(), "CreateMutexW failed")
+            result = kernel32.WaitForSingleObject(self._handle, 15000)
+            if result not in (0, 0x80):
+                kernel32.CloseHandle(self._handle)
+                self._handle = None
+                raise TimeoutError("AI fix create lock timeout")
+            return self
+        if not self._process_lock.acquire(timeout=15):
+            raise TimeoutError("AI fix create lock timeout")
+        self._locked = True
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        if self._handle is not None:
+            self._kernel32.ReleaseMutex(self._handle)
+            self._kernel32.CloseHandle(self._handle)
+            self._handle = None
+        elif getattr(self, "_locked", False):
+            self._process_lock.release()
+            self._locked = False
 
 
 class AiToolRepository:
@@ -103,6 +149,22 @@ class AiToolRepository:
         return self._post_action(
             "api/settings/open_browser", body, "application/json", timeout
         )
+
+    def create_ai_fix(self, kind, text=None, timeout=20):
+        """Create one typed queue request, spacing calls after completion."""
+        if kind not in {"cycle", "web", "userimport"}:
+            raise ValueError("invalid AI fix kind")
+        payload = {"kind": kind}
+        if kind == "userimport":
+            payload["text"] = text
+        body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        with _AiFixCreateLock():
+            try:
+                return self._post_action("api/ai_fix", body, "application/json", timeout)
+            finally:
+                # The golden queue filename has only second precision. Keep the
+                # named mutex through this interval after upstream completion.
+                time.sleep(1.1)
 
     def delete_backup(self, name, timeout=20):
         """DELETE exactly one canonical backup name; no generic DELETE primitive."""

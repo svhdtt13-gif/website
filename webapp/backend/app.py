@@ -12,6 +12,7 @@ Slice 9 them canonical GET api/remote_live khong selector.
 Slice 10 them guarded remote selector query.
 Slice 11 them dedicated guarded DELETE api/cycle/backup/<name>.
 Bundle 1 them guarded settings Telegram test va browser open actions.
+Bundle 2 chi mo guarded AI-fix creation; sync/answers/watcher remain deferred.
 """
 import hmac
 import pathlib
@@ -131,6 +132,20 @@ def create_app():
             return Response(e.body, status=e.status, content_type="application/json")
         return Response(body, status=status, content_type=ctype)
 
+    @app.route(
+        "/up/api/ai_fix",
+        methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
+    )
+    def create_ai_fix():
+        rejection = _settings_action_gate()
+        if rejection:
+            return rejection
+        try:
+            body, status, ctype = aifix_service.create_ai_fix(request.get_data())
+        except UpstreamError as e:
+            return Response(e.body, status=e.status, content_type="application/json")
+        return Response(body, status=status, content_type=ctype)
+
     @app.route("/up/api/cycle/backup/<name>", methods=["DELETE"])
     def delete_backup(name):
         """Dedicated dynamic backup DELETE boundary; no generic prefix dispatch."""
@@ -170,7 +185,7 @@ def create_app():
             try:
                 body, status, ctype = handler()
             except UpstreamError as e:
-                return Response(e.body, status=e.status, content_type="application/json")
+                return Response(e.body, status=e.status, content_type=ctype)
             return Response(body, status=status, content_type=ctype)
 
         # Write: method/path allowlist is not enough; require website Bearer auth first.

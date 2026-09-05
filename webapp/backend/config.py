@@ -23,11 +23,13 @@ READ_ONLY_ALLOWLIST = {
 }
 
 # Slice 2: POST api/log; Slice 6: POST api/cycle/backup; Slice 7: POST api/settings;
-# Slice 8: guarded CAS rename POST api/master.
-# Moi write khac -> 403. Khong mo SQLite/Session/SSE/Worker/Tunnel o slice nay.
+# Slice 8: guarded CAS rename POST api/master; Bundle 2: typed POST api/ai_fix.
+# Sync, AI answers deletion and watcher control remain deferred until ownership
+# exclusion is proven; no generic write dispatch is enabled for them.
 WRITE_ALLOWLIST = {
     "api/log",
     "api/cycle/backup",
     "api/settings",
     "api/master",
+    "api/ai_fix",
 }

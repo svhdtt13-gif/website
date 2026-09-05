@@ -37,14 +37,24 @@ without contacting ai tool.
 
 ## Verification
 
-Run from the repository root:
+Executed from the disposable branch `phase2-bundle2-ai-create`:
 
 ```bat
-python tests\security\test_ai_fix.py
-python -m py_compile webapp\backend\app.py webapp\backend\config.py webapp\backend\repositories\aitool.py webapp\backend\services\aifix.py
+python tests\\security\\test_ai_fix.py
 ```
 
-No live AI-fix execution is part of this test. The test uses a local HTTP stub
-and verifies bearer ordering, strict input rejection, typed upstream auth,
-response validation, generic failures, concurrent filename spacing, and the
-four deferred write boundaries.
+Result: **29 passed, 0 failed**.
+
+The pre-Bundle 2 security evidence on the same approved scope was documented as
+**384 passed, 0 failed**. Therefore the Phase 2 close-out records the
+**documented aggregate 384 + 29 = 413 passed, 0 failed**. This is not described
+as one combined test command or one single test-process run.
+
+The test uses a local HTTP stub and verifies bearer ordering, strict input
+rejection, typed upstream auth, response validation, generic failures,
+concurrent filename spacing, and the four deferred write boundaries. No live
+AI-fix execution is part of this test.
+
+The historical golden contract smoke remains **16 passed, 0 failed**; it was
+not rerun during the Phase 2 close-out audit. No GitHub check runs were
+configured for the Bundle 2 PR.

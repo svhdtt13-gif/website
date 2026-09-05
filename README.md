@@ -13,34 +13,50 @@ Dự án gốc `ai tool` (máy local, `tools/db.html` + Flask port 8080)
    (xem `webapp/README.md`). File mẫu trong repo chỉ chứa placeholder.
 3. Mọi thay đổi hành vi (ghi DB, điều khiển cycle) là **Phase 2**, từng endpoint
    một, có contract test và rollback riêng.
+4. Action chưa đạt safety gate được ghi là **deferred/NO-GO**; không mở route chỉ
+   để hoàn thành đủ danh sách endpoint.
 
 ## Cấu trúc (Phase 2: route → service → repository)
 
 ```
 website/
 ├── README.md                 # file này
-├── docs/                     # ARCHITECTURE / API_CONTRACT / DATA_SCHEMAS / DEPLOY_PLAN
+├── docs/                     # architecture / contract / close-out / plan
 ├── tests/
-│   ├── contract/             # smoke GET + API_INVENTORY + BASELINE
+│   ├── contract/             # historical golden GET smoke + API inventory
 │   └── security/             # proxy, write gate và slice security tests
 └── webapp/
-    ├── README.md             # cách chạy skeleton + write token
+    ├── README.md             # cách chạy + current write/deferred boundary
     ├── backend/              # proxy + serve frontend
     │   ├── proxy.py          # entry mỏng (giữ lệnh chạy cũ)
     │   ├── app.py            # Flask app + routes (create_app)
     │   ├── config.py
     │   ├── repositories/     # tầng data-access (ai tool qua HTTP)
-    │   │   └── aitool.py     # AiToolRepository.get()/post() + UpstreamError
-    │   └── services/          # cycle/sync/master/aifix/backup/log
+    │   └── services/         # domain service layers
     └── frontend/             # dashboard tĩnh, ES modules (không build)
-        ├── index.html
-        ├── css/base.css + components.css
-        └── js/api.js, store.js, views.js, main.js
 ```
 
 Luồng đọc/ghi đã duyệt: `route (app.py) → service/* → repositories/aitool.py → ai tool`.
-Hiện chỉ có write `POST /api/log`, được bảo vệ bởi `WEBAPP_WRITE_TOKEN`; các
-write khác chưa migrate.
+Chi tiết current route inventory và deferred registry nằm ở
+`docs/PHASE2_CLOSEOUT.md`.
+
+## Current Phase 2 State
+
+Eight write/action boundaries are implemented and guarded:
+
+- `POST /up/api/log`
+- `POST /up/api/cycle/backup`
+- `POST /up/api/settings`
+- guarded display-name-only CAS `POST /up/api/master`
+- guarded `DELETE /up/api/cycle/backup/<name>`
+- guarded `POST /up/api/settings/test_telegram`
+- guarded `POST /up/api/settings/open_browser`
+- guarded `POST /up/api/ai_fix`
+
+The four Bundle 2 sync/answers/watcher actions and all Bundle 3/4 high-risk
+actions remain intentionally blocked. No route or generic dispatch exists for
+them. `tests/contract/API_INVENTORY.md` remains the historical Phase 0 golden
+inventory; it is not the current webapp capability registry.
 
 ## Chạy thử skeleton
 
@@ -61,11 +77,10 @@ Mở `http://127.0.0.1:8090` — dashboard đọc trạng thái cycle/sync + b�
 
 ## Roadmap
 
-- Phase 0 (xong): docs + skeleton đọc + contract/security baseline xanh.
-  `db.html` gốc phải luôn ổn định.
-- Phase 1 (xong): tách module, giữ nguyên tính năng (`docs/PHASE1_VERIFY.md`,
-  `docs/PHASE1_UISMOKE.md`).
-- Phase 2 (đang làm): repository/service abstraction; Slice 2 đã mở có kiểm soát
-  `POST /api/log`; Slice 3 thêm read `GET /api/cycle/backup`.
-- Phase 3: DB SQLite + realtime + auth + tunnel cố định.
+- Phase 0: docs + read-only skeleton và contract/security baseline xanh.
+- Phase 1: tách module, giữ nguyên tính năng.
+- Phase 2: **close-out**. Safe writes được triển khai; unsafe writes/runtime
+  controls được audit và deferred có chủ đích. Xem `docs/PHASE2_CLOSEOUT.md`.
+- Phase 3: SQLite (WAL), một chiều sync, session, SSE và named tunnel; **chưa
+  được bắt đầu trước khi close-out docs PR được approve và merge**.
 - Chi tiết: `docs/DEPLOY_PLAN.md`.

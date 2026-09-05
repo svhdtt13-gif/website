@@ -3,42 +3,68 @@
 Auth mọi request: `Authorization: Basic base64(admin:DB_WEB_PASS)`.
 POST/PUT/PATCH/DELETE cần thêm header `X-DB-Editor: 1`.
 
-Ghi chú cột Webapp: `R` = proxy cho phép (read-only). `W` = phase 2 mới mở.
+Ghi chú cột Webapp: `R` = proxy cho phép (read-only). `W` = Phase 2 đã mở an toàn.
 `D` = scope đã xác định nhưng route vẫn deferred/blocked vì thiếu safety gate.
 `R*` = guarded read route có thể yêu cầu website Bearer và có remote selection side
 effect giới hạn trong selector contract. `—` = golden/internal path chưa được webapp proxy.
+Current implementation/deferred overlay được ghi đầy đủ tại `docs/PHASE2_CLOSEOUT.md`.
 
 | Method | Path | Webapp | Mục đích |
 |---|---|---|---|
 | GET | `/db`, `/db.html` | — | Trang gốc (không dùng ở webapp mới) |
 | GET | `/api/master` | R | Đọc master data + schedule |
-| POST | `/api/master` | W | Lưu master/schedule |
+| POST | `/api/master` | W | Guarded display-name-only CAS; không phải full master/schedule write |
 | GET | `/api/status` | R | Trạng thái tổng |
 | GET | `/api/sync_status` | R | Trạng thái auto sync |
 | GET | `/api/remote_live` | R | Canonical remote snapshot read, không selector, không đổi remote selection |
 | GET | `/api/remote_live?t=&client=` | R* | Guarded remote client selector; chỉ route này có thể gửi `row_select` |
-| POST | `/api/sync_remote` | D | Deferred: thiếu cross-process `RemoteWs` exclusion |
-| POST | `/api/sync_all` | D | Deferred: thiếu cross-process `RemoteWs` exclusion |
-| POST | `/api/sync_continuous/<start\|stop>` | W | Bật/tắt sync |
+| POST | `/api/sync_remote` | D | Deferred: thiếu cross-process `RemoteWs` và continuous-sync exclusion |
+| POST | `/api/sync_all` | D | Deferred: thiếu cross-process `RemoteWs` và continuous-sync exclusion |
+| POST | `/api/sync_continuous/<start\|stop>` | D | Deferred: thiếu worker ownership, durable stop intent, watchdog/lifecycle exclusion |
 | GET | `/api/cycle_status` | R | Cycle chạy hay không |
-| POST | `/api/cycle/<start\|stop>` | W | Điều khiển cycle |
-| POST | `/api/alwaysrun/<open\|stop>` | W | Điều khiển nhóm fixed |
-| POST | `/api/clear_history` | W | Xóa log |
-| GET/POST | `/api/cycle/backup` | W | List/tạo backup |
-| POST | `/api/cycle/backup/<name>/restore` | W | Khôi phục backup |
+| POST | `/api/cycle/<start\|stop>` | D | Deferred: thiếu PID/mutex ownership, lifecycle race và process rollback |
+| POST | `/api/alwaysrun/<open\|stop>` | D | Deferred: thiếu override CAS, remote/process rollback và disposable evidence |
+| POST | `/api/clear_history` | D | Deferred: destructive preimage/rollback, writer exclusion và verification chưa đủ |
+| GET/POST | `/api/cycle/backup` | W | GET list backup; POST tạo backup artifact qua typed repository |
+| POST | `/api/cycle/backup/<name>/restore` | D | Deferred: archive containment và process/remote rollback chưa đủ |
 | DELETE | `/api/cycle/backup/<name>` | W | Xóa đúng một backup đã xác nhận |
-| POST | `/api/cycle/fix` | W | Refresh + tạo URL mới + notifier |
-| GET/POST | `/api/settings` | W | Cấu hình |
-| POST | `/api/settings/test_telegram` | W | Test Telegram |
-| POST | `/api/settings/open_browser` | W | Mở browser phía server |
+| POST | `/api/cycle/fix` | D | Deferred: composite runtime/tunnel/browser/Telegram side effects |
+| GET/POST | `/api/settings` | W | GET public settings; POST safe partial update, không credential fields |
+| POST | `/api/settings/test_telegram` | W | Test Telegram qua guarded action |
+| POST | `/api/settings/open_browser` | W | Mở browser phía server qua guarded action |
 | POST | `/api/ai_fix` | W | Tạo lệnh AI fix `{kind,text?}` |
 | GET | `/api/ai_fix/status` | R | Hàng chờ + watcher + models |
-| DELETE | `/api/ai_fix/answers` | D | Deferred: thiếu watcher ownership/exclusion |
-| POST | `/api/ai_fix/watcher` | D | Deferred: thiếu watcher ownership/exclusion |
-| GET/POST | `/api/cycle/url` | W | Tạo lại public URL |
+| DELETE | `/api/ai_fix/answers` | D | Deferred: thiếu watcher ownership/exclusion và archive/preimage |
+| POST | `/api/ai_fix/watcher` | D | Deferred: thiếu watcher heartbeat/PID identity và queue exclusion |
+| GET/POST | `/api/cycle/url` | D | Deferred: tunnel ownership, stale URL/log, process rollback và disposable harness |
 | GET | `/api/cycle/status` | R | Chi tiết cycle + `manual_overrides` + qnyh |
-| POST | `/api/log` | W | Ghi log |
+| POST | `/api/log` | W | Ghi log qua typed repository |
 | GET | `/clients_master.json`, `/client_database.json`, `/cache/*` | R | File tĩnh trong allowlist |
+
+## Enabled Write Semantics
+
+### Master
+
+`POST /api/master` is restricted to guarded display-name-only CAS changes for
+existing clients. It does not open full master/schedule editing, client
+add/remove, group/selected changes, or runtime actions. The website canonicalizes
+the fresh master snapshot and forwards only the approved name changes.
+
+### Backup
+
+`GET /api/cycle/backup` is read-only backup metadata listing. `POST
+/api/cycle/backup` creates one artifact through the repository, with typed response
+validation and spacing for the golden second-precision filename. `DELETE
+/api/cycle/backup/<name>` is a separate guarded, canonical-name deletion route.
+Restore remains deferred.
+
+### Settings
+
+`GET /api/settings` exposes only the public settings projection. `POST
+/api/settings` accepts only safe partial fields (`tunnel_port`,
+`auto_restart_tunnel`, `auto_telegram`, `auto_open_browser`) and does not accept
+credentials or executable-path fields. Telegram test and browser open are separate
+guarded actions.
 
 ## Remote live read contract
 
@@ -153,8 +179,8 @@ non-empty, control-character-free, and at most 2,000 characters. Fixed commands 
 owned by the service and the queue file is created through a typed repository method.
 
 The golden queue filename has only second precision. The repository therefore holds
-`Local\\AutoGhostStory_AiFixCreate` during each create and spaces upstream create calls
-by at least 1.1 seconds. The returned success envelope must have exactly
+`Local\\AutoGhostStory_AiFixCreate` during each create and spaces successive upstream
+create calls by at least 1.1 seconds. The returned success envelope must have exactly
 `status`, `kind`, `project`, `file`, and `command`; `file` must be a safe basename of
 `ai_fix_<requested-kind>_YYYYMMDD_HHMMSS.json`, and the command must match the frozen
 command. Runtime, network, timeout, HTTP, and malformed responses map to
@@ -167,6 +193,20 @@ Answers deletion requires atomic watcher ownership and an archive/preimage; watc
 control requires heartbeat/PID identity and atomic queue exclusion; sync requires
 cross-process exclusion with `Local\\AutoGhostStory_RemoteWs` and the continuous-sync
 worker. Website-local status preflight or lock alone is insufficient.
+
+## Bundle 3 and Bundle 4 deferred actions
+
+The following high-risk actions are intentionally marked `D` and are not in the
+website write dispatch:
+
+- Bundle 3: `clear_history`, backup restore, `cycle/fix`, and `cycle/url`.
+- Bundle 4: `sync_continuous`, `cycle`, and `alwaysrun`.
+
+Their approved audit baselines are recorded in Issue #1 comments `5551453439`,
+`5551572259`, and `5551628399`, with final Bundle 3/4 audit approval in
+`5551581824` and `5551675611`. They remain blocked until their ownership,
+preimage/rollback, sanitized-error, and disposable-verification gates are
+separately approved.
 
 ## Response errors
 

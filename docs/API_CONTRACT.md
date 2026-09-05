@@ -25,11 +25,13 @@ Current implementation/deferred overlay được ghi đầy đủ tại `docs/PH
 | POST | `/api/cycle/<start\|stop>` | D | Deferred: thiếu PID/mutex ownership, lifecycle race và process rollback |
 | POST | `/api/alwaysrun/<open\|stop>` | D | Deferred: thiếu override CAS, remote/process rollback và disposable evidence |
 | POST | `/api/clear_history` | D | Deferred: destructive preimage/rollback, writer exclusion và verification chưa đủ |
-| GET/POST | `/api/cycle/backup` | W | GET list backup; POST tạo backup artifact qua typed repository |
+| GET | `/api/cycle/backup` | R | List backup metadata |
+| POST | `/api/cycle/backup` | W | Tạo backup artifact qua typed repository |
 | POST | `/api/cycle/backup/<name>/restore` | D | Deferred: archive containment và process/remote rollback chưa đủ |
 | DELETE | `/api/cycle/backup/<name>` | W | Xóa đúng một backup đã xác nhận |
 | POST | `/api/cycle/fix` | D | Deferred: composite runtime/tunnel/browser/Telegram side effects |
-| GET/POST | `/api/settings` | W | GET public settings; POST safe partial update, không credential fields |
+| GET | `/api/settings` | R | Đọc public settings projection |
+| POST | `/api/settings` | W | Safe partial update, không credential fields |
 | POST | `/api/settings/test_telegram` | W | Test Telegram qua guarded action |
 | POST | `/api/settings/open_browser` | W | Mở browser phía server qua guarded action |
 | POST | `/api/ai_fix` | W | Tạo lệnh AI fix `{kind,text?}` |
@@ -39,7 +41,7 @@ Current implementation/deferred overlay được ghi đầy đủ tại `docs/PH
 | GET/POST | `/api/cycle/url` | D | Deferred: tunnel ownership, stale URL/log, process rollback và disposable harness |
 | GET | `/api/cycle/status` | R | Chi tiết cycle + `manual_overrides` + qnyh |
 | POST | `/api/log` | W | Ghi log qua typed repository |
-| GET | `/clients_master.json`, `/client_database.json`, `/cache/*` | R | File tĩnh trong allowlist |
+| GET | `/clients_master.json`, `/client_database.json` | R | JSON files trong Webapp read allowlist |
 
 ## Enabled Write Semantics
 

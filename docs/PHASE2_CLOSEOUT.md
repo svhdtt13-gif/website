@@ -113,10 +113,14 @@ and disposable harness evidence are not complete.
   inventory. This close-out document is the current website implementation and
   deferred overlay.
 
-## Phase 3 Gate
+## Phase 3 Roadmap Gate
 
-Phase 3 SQLite/WAL, one-way sync redesign, session authentication, SSE, and
-named tunnel work were not started in Phase 2. Phase 3 remains gated until this
-documentation-only close-out PR is reviewed, approved, and merged. Even after
-that gate opens, SQLite must be introduced behind the existing repository
-abstraction without rewriting the approved Phase 2 route contracts.
+Phase 3 is the next planned stage and is limited to SQLite/WAL and its reviewed
+migration/source-of-truth boundary. Later roadmap stages are intentionally
+separate: Phase 4 worker/scheduler runtime control, Phase 5 session
+authentication, Phase 6 SSE, Phase 7 named tunnel, and Phase 8 Windows services.
+None of those stages were started in Phase 2.
+
+SQLite work requires its own schema, migration, rollback, and source-of-truth
+review. It must be introduced behind the existing repository abstraction without
+rewriting the approved Phase 2 route contracts or taking scheduler ownership.

@@ -14,7 +14,7 @@
 - Dashboard smoke đã xác nhận bằng browser.
 - Chi tiết: `docs/PHASE1_VERIFY.md`, `docs/PHASE1_UISMOKE.md`.
 
-## Phase 2 — Ghi an toàn và audit boundaries ✅ close-out pending merge
+## Phase 2 — Ghi an toàn và audit boundaries ✅
 
 Phase 2 hoàn tất theo safety-gated scope:
 
@@ -42,22 +42,50 @@ Close-out documents and the current deferred registry are in
 - The aggregate is explicitly not represented as one combined test command.
 - No GitHub check runs were configured for the Bundle 2 PR.
 
-## Phase 3 — Độc lập ⏸️ NO-GO until close-out merge
+## Phase 3 — SQLite
 
 Planned scope:
 
 - SQLite with WAL behind the existing repository abstraction.
-- One-way sync from ai tool while preserving approved Phase 2 route contracts.
-- Session login replacing Basic Auth at the website boundary.
-- Realtime SSE replacing dashboard polling.
-- Cloudflared named tunnel with fixed URL and service ownership.
+- Preserve the approved Phase 2 route contracts while introducing local durable
+  data ownership.
+- Define one-way synchronization boundaries without silently enabling deferred
+  runtime-control actions.
 
 Entry gate:
 
-- Phase 2 close-out documentation PR reviewed, approved, and merged.
-- Deferred registry remains authoritative and no blocked action is silently
-  promoted into Phase 3 implementation.
-- SQLite schema and migration/rollback plan reviewed separately.
+- SQLite schema, migration, rollback, and source-of-truth transition are reviewed
+  separately before implementation.
+- No worker/scheduler, session, SSE, named tunnel, or Windows service migration
+  is bundled into the SQLite change.
+
+## Phase 4 — Worker/scheduler runtime control
+
+- Define process ownership, PID/mutex identity, stale-state handling, and durable
+  lifecycle intent.
+- Audit and implement only after the deferred Bundle 2/3/4 boundaries receive
+  separate safety approval.
+
+## Phase 5 — Session authentication
+
+- Replace the website boundary's Basic-auth dependency with reviewed session
+  authentication and explicit CSRF/write policy.
+- Preserve the repository boundary and approved API contracts.
+
+## Phase 6 — Realtime SSE
+
+- Replace polling only after connection lifecycle, authorization, backpressure,
+  and rollback behavior are reviewed.
+
+## Phase 7 — Named tunnel
+
+- Introduce a fixed named tunnel only after tunnel process ownership, secret
+  handling, origin binding, and recovery behavior are reviewed.
+
+## Phase 8 — Windows services
+
+- Move approved long-running components to Windows services only after service
+  ownership, startup/shutdown ordering, recovery, and rollback are reviewed.
 
 ## Quy tắc an toàn suốt quá trình
 

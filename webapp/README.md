@@ -56,6 +56,17 @@ Mo `http://127.0.0.1:8090`.
 - `POST /up/api/master` is a display-name-only CAS operation; it does not expose full master/schedule writes.
 - Backup listing/creation and settings GET/POST semantics are separated in `docs/API_CONTRACT.md`.
 
+## Roadmap
+
+- Phase 2: close-out complete at the approved safe/deferred boundary.
+- Phase 3: SQLite/WAL and reviewed source-of-truth migration.
+- Phase 4: worker/scheduler runtime control.
+- Phase 5: session authentication.
+- Phase 6: realtime SSE.
+- Phase 7: named tunnel.
+- Phase 8: Windows services.
+- Each stage requires its own contract, rollback, and review before implementation.
+
 ## An toan
 
 - Proxy bind `127.0.0.1` — chi may local mo duoc.

@@ -81,6 +81,11 @@ Mở `http://127.0.0.1:8090` — dashboard đọc trạng thái cycle/sync + b�
 - Phase 1: tách module, giữ nguyên tính năng.
 - Phase 2: **close-out**. Safe writes được triển khai; unsafe writes/runtime
   controls được audit và deferred có chủ đích. Xem `docs/PHASE2_CLOSEOUT.md`.
-- Phase 3: SQLite (WAL), một chiều sync, session, SSE và named tunnel; **chưa
-  được bắt đầu trước khi close-out docs PR được approve và merge**.
-- Chi tiết: `docs/DEPLOY_PLAN.md`.
+- Phase 3: SQLite với WAL, sau đó mới chuyển sang các phase độc lập bên dưới.
+- Phase 4: worker/scheduler ownership và runtime control.
+- Phase 5: session authentication.
+- Phase 6: realtime SSE.
+- Phase 7: named tunnel.
+- Phase 8: Windows services.
+- Mỗi phase sau Phase 2 cần schema/contract, rollback và review riêng trước khi
+  implementation. Chi tiết: `docs/DEPLOY_PLAN.md`.

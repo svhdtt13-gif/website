@@ -11,10 +11,13 @@ repository/service boundary. The current implemented writes are:
 - guarded `DELETE /up/api/cycle/backup/<name>`
 - guarded `POST /up/api/settings/test_telegram`
 - guarded `POST /up/api/settings/open_browser`
+- guarded `POST /up/api/ai_fix`
 
-Other write actions remain blocked by the allowlist. Bundle 1 does not modify or
-copy `ai tool` files and does not control cycle, sync, tunnel, Telegram settings,
-or scheduler ownership directly.
+`/up/api/ai_fix/answers`, `/up/api/ai_fix/watcher`, `/up/api/sync_remote`, and
+`/up/api/sync_all` remain blocked until the required cross-process ownership and
+atomic exclusion evidence exists. Bundle 2 does not modify or copy `ai tool`
+files and does not control cycle, scheduler, tunnel, or remote WebSocket
+ownership.
 
 ## Chay
 
@@ -41,6 +44,7 @@ Mo `http://127.0.0.1:8090`.
 - The Bearer gate is the minimum Phase 2 protection, not a session/role system.
 - The repository creates Basic Auth + `X-DB-Editor: 1` for ai tool requests; clients cannot override that marker.
 - Bundle 1 action routes reject query strings and block non-POST methods before upstream access.
+- AI create accepts only the frozen `cycle`, `web`, and `userimport` schema, validates the returned queue basename, and spaces concurrent creates by 1.1 seconds under a named Windows mutex because the golden filename has only second precision.
 - Browser URLs are limited to absolute HTTP/HTTPS URLs with a hostname, no userinfo/control/CRLF/NUL, and at most 2048 UTF-8 bytes.
 
 ## An toan

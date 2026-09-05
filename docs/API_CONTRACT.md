@@ -25,7 +25,7 @@ effect giới hạn trong selector contract. `—` = golden/internal path chưa 
 | POST | `/api/clear_history` | W | Xóa log |
 | GET/POST | `/api/cycle/backup` | W | List/tạo backup |
 | POST | `/api/cycle/backup/<name>/restore` | W | Khôi phục backup |
-| DELETE | `/api/cycle/backup/<name>` | W | Xóa backup |
+| DELETE | `/api/cycle/backup/<name>` | W | Xóa đúng một backup đã xác nhận |
 | POST | `/api/cycle/fix` | W | Refresh + tạo URL mới + notifier |
 | GET/POST | `/api/settings` | W | Cấu hình |
 | POST | `/api/settings/test_telegram` | W | Test Telegram |
@@ -81,6 +81,33 @@ target trước khi trả public snapshot. Mọi upstream/network/timeout/schema
 
 Selector không gọi sync, toggle, cycle, alwaysrun, Telegram, browser, tunnel, AI-fix,
 không ghi file và không mở WebSocket. POST/PUT/PATCH/DELETE và mọi subpath vẫn bị block.
+
+## Guarded backup deletion contract
+
+Request là chính xác `DELETE /api/cycle/backup/<name>` và cần website
+`Authorization: Bearer <WEBAPP_WRITE_TOKEN>`. Đây là dedicated route riêng; không mở
+generic prefix DELETE hoặc generic dynamic write dispatch. Upstream dùng Basic Auth,
+`X-DB-Editor: 1`, canonical encoded name và body rỗng.
+
+Golden DELETE không đọc query/body. Webapp giữ compatibility nhưng không dùng hoặc
+forward query/body; upstream URL chỉ có canonical backup name. Raw path được decode đúng
+một lần strict UTF-8, phải là đúng một segment, không slash/backslash/NUL/control,
+malformed percent, residual percent, `.`/`..`, hoặc ký tự ngoài `^[A-Za-z0-9_.-]+$`.
+
+Service fresh-reads `/api/cycle/backup`, xác nhận name tồn tại đúng một lần dưới
+`_BACKUP_LOCK`, rồi mới gửi đúng một DELETE. Unknown/stale/ambiguous name trả
+`409 {"error":"backup target unavailable"}` với zero upstream DELETE. GET listing,
+POST create, restore và mọi path/method khác không đổi.
+
+Success public contract là `200 application/json` với chính xác
+`{"status":"OK","deleted":"<canonical_name>"}`. Invalid raw path/name là `400`
+generic với zero upstream DELETE. Mọi upstream HTTP `500`, repository/runtime exception,
+timeout, network error, malformed/non-JSON/invalid success response hoặc unexpected
+status map deterministically thành `502 application/json` với chính xác
+`{"error":"backup deletion unavailable"}`; không raw echo và không retry.
+
+Không mở cycle/scheduler/fixed-client/remote selection action, không restore, không ghi
+file/database trực tiếp và không đổi scheduler ownership.
 
 Response lỗi chuẩn: `{"error": "..."}` kèm HTTP 4xx/5xx.
 Lưu ý: Flask không bật CORS — trình duyệt gọi trực tiếp sẽ bị chặn,

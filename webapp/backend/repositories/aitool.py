@@ -3,9 +3,12 @@
 Slice 1: get() passthrough cho 7 path GET (giuyen tu upstream.py cu).
 Slice 2: post() chi dung cho POST api/log — noi duy nhat thuc hien HTTP write
 toi ai tool o giai doan nay. Route/service khong duoc ghi file truc tiep.
+Slice 11: delete_backup() is the only dynamic DELETE repository operation.
 """
-import urllib.request
+import re
 import urllib.error
+import urllib.request
+from urllib.parse import quote
 
 import config
 
@@ -46,11 +49,7 @@ class AiToolRepository:
             raise UpstreamError(502, ('{"error":"upstream unreachable: %s"}' % e)[:300].encode())
 
     def post(self, subpath, body, content_type="application/json", timeout=20):
-        """POST raw body toi ai tool. Chi goi cho path trong WRITE_ALLOWLIST.
-
-        Tra ve (body_bytes, status, content_type). Raise UpstreamError.
-        Bao gom Basic Auth + X-DB-Editor: 1 (ai tool yeu cau cho moi POST).
-        """
+        """POST raw body toi ai tool. Chi dung cho path trong WRITE_ALLOWLIST."""
         if subpath not in config.WRITE_ALLOWLIST:
             raise UpstreamError(403, b'{"error":"write endpoint not allowed"}')
         headers = self._auth_headers()
@@ -69,6 +68,26 @@ class AiToolRepository:
             except Exception:
                 body_out = b'{"error":"upstream error"}'
             raise UpstreamError(e.code, body_out)
+        except Exception as e:
+            raise UpstreamError(502, ('{"error":"upstream unreachable: %s"}' % e)[:300].encode())
+
+    def delete_backup(self, name, timeout=20):
+        """DELETE exactly one canonical backup name; no generic DELETE primitive."""
+        if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9_.-]+", name):
+            raise UpstreamError(400, b'{"error":"invalid backup name"}')
+        headers = self._auth_headers()
+        headers["X-DB-Editor"] = "1"
+        url = f"{config.AI_TOOL_API_BASE}/api/cycle/backup/{quote(name, safe='ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.-')}"
+        req = urllib.request.Request(url, headers=headers, method="DELETE")
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                return r.read(), r.status, r.headers.get_content_type()
+        except urllib.error.HTTPError as e:
+            try:
+                body = e.read()
+            except Exception:
+                body = b'{"error":"upstream error"}'
+            raise UpstreamError(e.code, body)
         except Exception as e:
             raise UpstreamError(502, ('{"error":"upstream unreachable: %s"}' % e)[:300].encode())
 

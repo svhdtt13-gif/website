@@ -4,6 +4,7 @@ Auth mọi request: `Authorization: Basic base64(admin:DB_WEB_PASS)`.
 POST/PUT/PATCH/DELETE cần thêm header `X-DB-Editor: 1`.
 
 Ghi chú cột Webapp: `R` = proxy cho phép (read-only). `W` = phase 2 mới mở.
+`D` = scope đã xác định nhưng route vẫn deferred/blocked vì thiếu safety gate.
 `R*` = guarded read route có thể yêu cầu website Bearer và có remote selection side
 effect giới hạn trong selector contract. `—` = golden/internal path chưa được webapp proxy.
 
@@ -16,8 +17,8 @@ effect giới hạn trong selector contract. `—` = golden/internal path chưa 
 | GET | `/api/sync_status` | R | Trạng thái auto sync |
 | GET | `/api/remote_live` | R | Canonical remote snapshot read, không selector, không đổi remote selection |
 | GET | `/api/remote_live?t=&client=` | R* | Guarded remote client selector; chỉ route này có thể gửi `row_select` |
-| POST | `/api/sync_remote` | W | Sync 1 lần từ remote |
-| POST | `/api/sync_all` | W | Sync toàn bộ |
+| POST | `/api/sync_remote` | D | Deferred: thiếu cross-process `RemoteWs` exclusion |
+| POST | `/api/sync_all` | D | Deferred: thiếu cross-process `RemoteWs` exclusion |
 | POST | `/api/sync_continuous/<start\|stop>` | W | Bật/tắt sync |
 | GET | `/api/cycle_status` | R | Cycle chạy hay không |
 | POST | `/api/cycle/<start\|stop>` | W | Điều khiển cycle |
@@ -32,8 +33,8 @@ effect giới hạn trong selector contract. `—` = golden/internal path chưa 
 | POST | `/api/settings/open_browser` | W | Mở browser phía server |
 | POST | `/api/ai_fix` | W | Tạo lệnh AI fix `{kind,text?}` |
 | GET | `/api/ai_fix/status` | R | Hàng chờ + watcher + models |
-| DELETE | `/api/ai_fix/answers` | W | Xóa câu trả lời cũ |
-| POST | `/api/ai_fix/watcher` | W | Bật/tắt watcher |
+| DELETE | `/api/ai_fix/answers` | D | Deferred: thiếu watcher ownership/exclusion |
+| POST | `/api/ai_fix/watcher` | D | Deferred: thiếu watcher ownership/exclusion |
 | GET/POST | `/api/cycle/url` | W | Tạo lại public URL |
 | GET | `/api/cycle/status` | R | Chi tiết cycle + `manual_overrides` + qnyh |
 | POST | `/api/log` | W | Ghi log |
@@ -142,6 +143,30 @@ không echo hoặc retry.
 Hai action không ghi settings/state/activity/change log và không gọi sync, cycle,
 alwaysrun, tunnel hoặc action còn lại. Không direct file access; typed repository
 methods là `test_telegram()` và `open_browser(url)`.
+
+## Bundle 2 AI create and deferred writes
+
+Bundle 2 chỉ enable `POST /up/api/ai_fix`; website Bearer auth is checked before
+contacting ai tool, and query strings/methods/schema failures make zero upstream calls.
+The request accepts exactly `cycle`, `web`, or `userimport`; userimport text is trimmed,
+non-empty, control-character-free, and at most 2,000 characters. Fixed commands are
+owned by the service and the queue file is created through a typed repository method.
+
+The golden queue filename has only second precision. The repository therefore holds
+`Local\\AutoGhostStory_AiFixCreate` during each create and spaces upstream create calls
+by at least 1.1 seconds. The returned success envelope must have exactly
+`status`, `kind`, `project`, `file`, and `command`; `file` must be a safe basename of
+`ai_fix_<requested-kind>_YYYYMMDD_HHMMSS.json`, and the command must match the frozen
+command. Runtime, network, timeout, HTTP, and malformed responses map to
+`502 {"error":"ai fix unavailable"}` with no raw detail.
+
+`POST /up/api/ai_fix/answers`, `POST /up/api/ai_fix/watcher`,
+`POST /up/api/sync_remote`, and `POST /up/api/sync_all` remain deferred and are not
+write-dispatched. They return the existing JSON `403` without contacting ai tool.
+Answers deletion requires atomic watcher ownership and an archive/preimage; watcher
+control requires heartbeat/PID identity and atomic queue exclusion; sync requires
+cross-process exclusion with `Local\\AutoGhostStory_RemoteWs` and the continuous-sync
+worker. Website-local status preflight or lock alone is insufficient.
 
 ## Response errors
 

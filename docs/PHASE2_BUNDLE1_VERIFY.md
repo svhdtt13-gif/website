@@ -24,6 +24,8 @@ Command:
 python tests\security\test_settings_actions.py
 ```
 
+Result: `36 passed, 0 failed`, process exit code `0`.
+
 The test uses a local upstream stub and the real proxy subprocess. It verifies:
 
 - Bearer authentication and zero upstream access on auth failure.
@@ -36,16 +38,18 @@ The test uses a local upstream stub and the real proxy subprocess. It verifies:
   malformed/non-object JSON rejection, generic 502 sanitization and no retry.
 - Proxy liveness after action failures.
 
-Verification result: pending local execution after implementation commit.
+Slice 1–11 regression run: all 14 security scripts reported zero failed assertions,
+for `382 passed, 0 failed` total. The historical pre-Bundle-1 assertion baseline was
+`346/346`; Bundle 1 adds 36 passing assertions.
 
 ## Live verification
 
 Telegram live success is intentionally not run because of the approved golden script
 path mismatch and because no production Telegram message may be sent as a test.
 
-Browser live success is intentionally not run against a production URL. A disposable
-local harness is required to verify launch acceptance without changing AutoCycle,
-sync worker, tunnel, settings, state or activity/change logs.
+Browser live success is intentionally not run against a production URL. The automated
+stub verifies the proxy boundary using a harmless HTTPS URL; no browser process,
+tunnel, AutoCycle, sync worker, settings, state, or activity/change log is touched.
 
 ## Required regression gate
 

@@ -151,7 +151,7 @@ class AiToolRepository:
         )
 
     def create_ai_fix(self, kind, text=None, timeout=20):
-        """Create one typed queue request, spacing calls for second-based names."""
+        """Create one typed queue request, spacing calls after completion."""
         if kind not in {"cycle", "web", "userimport"}:
             raise ValueError("invalid AI fix kind")
         payload = {"kind": kind}
@@ -159,13 +159,12 @@ class AiToolRepository:
             payload["text"] = text
         body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         with _AiFixCreateLock():
-            started = time.monotonic()
             try:
                 return self._post_action("api/ai_fix", body, "application/json", timeout)
             finally:
-                remaining = 1.1 - (time.monotonic() - started)
-                if remaining > 0:
-                    time.sleep(remaining)
+                # The golden queue filename has only second precision. Keep the
+                # named mutex through this interval after upstream completion.
+                time.sleep(1.1)
 
     def delete_backup(self, name, timeout=20):
         """DELETE exactly one canonical backup name; no generic DELETE primitive."""

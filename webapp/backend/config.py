@@ -23,13 +23,12 @@ READ_ONLY_ALLOWLIST = {
 }
 
 # Slice 2: POST api/log; Slice 6: POST api/cycle/backup; Slice 7: POST api/settings;
-# Slice 8: guarded CAS rename POST api/master; Bundle 2: typed POST api/ai_fix.
-# Sync, AI answers deletion and watcher control remain deferred until ownership
-# exclusion is proven; no generic write dispatch is enabled for them.
+# Slice 8: guarded CAS rename POST api/master.
+# Sync, AI answers deletion, watcher control and AI creation are owned by
+# dedicated route boundaries or remain deferred; no generic write dispatch exists.
 WRITE_ALLOWLIST = {
     "api/log",
     "api/cycle/backup",
     "api/settings",
     "api/master",
-    "api/ai_fix",
 }

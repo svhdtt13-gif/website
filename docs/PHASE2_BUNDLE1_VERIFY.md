@@ -24,7 +24,7 @@ Command:
 python tests\security\test_settings_actions.py
 ```
 
-Result: `36 passed, 0 failed`, process exit code `0`.
+Result: `38 passed, 0 failed`, process exit code `0`.
 
 The test uses a local upstream stub and the real proxy subprocess. It verifies:
 
@@ -35,12 +35,13 @@ The test uses a local upstream stub and the real proxy subprocess. It verifies:
 - Telegram empty-body forwarding, exact success/known-failure responses,
   generic 502 sanitization, no retry and no secret echo.
 - Browser default URL, explicit URL, launch-rejected response, strict URL policy,
-  malformed/non-object JSON rejection, generic 502 sanitization and no retry.
+  malformed/non-object JSON rejection, exact semantic `status`/`opened` pairing,
+  generic 502 sanitization and no retry.
 - Proxy liveness after action failures.
 
 Slice 1–11 regression run: all 14 security scripts reported zero failed assertions,
-for `382 passed, 0 failed` total. The historical pre-Bundle-1 assertion baseline was
-`346/346`; Bundle 1 adds 36 passing assertions.
+for `384 passed, 0 failed` total. The historical pre-Bundle-1 assertion baseline was
+`346/346`; Bundle 1 adds 38 passing assertions.
 
 ## Live verification
 

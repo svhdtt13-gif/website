@@ -7,7 +7,7 @@ AI queue-creation endpoint in this bundle:
 
 - `POST /up/api/ai_fix` is enabled through the route -> service -> repository
   boundary.
-- `POST /up/api/ai_fix/answers` remains deferred because deletion ownership and
+- `DELETE /up/api/ai_fix/answers` remains deferred because deletion ownership and
   atomic exclusion with the watcher are not proven.
 - `POST /up/api/ai_fix/watcher` remains deferred because watcher ownership,
   heartbeat verification, PID identity, and atomic queue exclusion are not

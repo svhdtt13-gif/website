@@ -78,7 +78,7 @@ trả `409` và không gửi selector upstream. Nếu target đã selected thì 
 snapshot và không tạo selector side effect. Nếu khác, upstream query được canonical
 re-encode thành `t=<t>&client=<target_id>`; response sau selection phải xác nhận đúng
 target trước khi trả public snapshot. Mọi upstream/network/timeout/schema failure trả
-`502` generic `{"error":"remote live snapshot unavailable"}`.
+`502` generic {"error":"remote live snapshot unavailable"}.
 
 Selector không gọi sync, toggle, cycle, alwaysrun, Telegram, browser, tunnel, AI-fix,
 không ghi file và không mở WebSocket. POST/PUT/PATCH/DELETE và mọi subpath vẫn bị block.
@@ -160,7 +160,7 @@ by at least 1.1 seconds. The returned success envelope must have exactly
 command. Runtime, network, timeout, HTTP, and malformed responses map to
 `502 {"error":"ai fix unavailable"}` with no raw detail.
 
-`POST /up/api/ai_fix/answers`, `POST /up/api/ai_fix/watcher`,
+`DELETE /up/api/ai_fix/answers`, `POST /up/api/ai_fix/watcher`,
 `POST /up/api/sync_remote`, and `POST /up/api/sync_all` remain deferred and are not
 write-dispatched. They return the existing JSON `403` without contacting ai tool.
 Answers deletion requires atomic watcher ownership and an archive/preimage; watcher

@@ -92,6 +92,10 @@ class Stub(BaseHTTPRequestHandler):
                 self._send(b'{"status":"OK"}')
             elif Stub.browser_mode == "rejected":
                 self._send(b'{"status":"error","opened":false,"url":"https://example.com"}')
+            elif Stub.browser_mode == "mismatch_ok_false":
+                self._send(b'{"status":"OK","opened":false,"url":"https://example.com"}')
+            elif Stub.browser_mode == "mismatch_error_true":
+                self._send(b'{"status":"error","opened":true,"url":"https://example.com"}')
             else:
                 try:
                     url = json.loads(body.decode())["url"]
@@ -251,6 +255,17 @@ def main():
         check("Browser launch rejection preserves 200 error shape", status == 200
               and body_json(raw) == {"status": "error", "opened": False, "url": "https://example.com"})
 
+        for mode, label in (("mismatch_ok_false", "OK with opened=false"),
+                            ("mismatch_error_true", "error with opened=true")):
+            Stub.browser_mode = mode
+            Stub.hits.clear()
+            status, raw, _ = call(proxy, "/up/api/settings/open_browser", "POST",
+                                  b'{"url":"https://example.com"}', json_headers)
+            posts = [hit for hit in Stub.hits if hit["method"] == "POST"]
+            check("Browser " + label + " -> exact 502/no retry", status == 502
+                  and body_json(raw) == {"error": "browser open unavailable"}
+                  and len(posts) == 1)
+
         invalid = [
             ("malformed", b"{not-json"),
             ("array", b"[]"),
@@ -258,7 +273,7 @@ def main():
             ("ftp scheme", b'{"url":"ftp://example.com"}'),
             ("missing host", b'{"url":"https:///path"}'),
             ("userinfo", b'{"url":"https://user:pass@example.com"}'),
-            ("control", b'{"url":"https://example.com/\\r\\nX"}'),
+            ("control", b'{"url":"https://example.com/\r\nX"}'),
             ("encoded control", b'{"url":"https://example.com/%0d%0aX"}'),
             ("too long", json.dumps({"url": "https://" + "a" * 2048 + ".com"}).encode()),
         ]

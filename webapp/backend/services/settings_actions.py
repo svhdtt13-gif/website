@@ -102,7 +102,8 @@ def _validate_browser(body, status, content_type, url):
         _safe_error(_BROWSER_UNAVAILABLE)
     if response["status"] not in {"OK", "error"} or type(response["opened"]) is not bool:
         _safe_error(_BROWSER_UNAVAILABLE)
-    if response["url"] != url or type(response["url"]) is not str:
+    if ((response["status"] == "OK") != response["opened"]
+            or response["url"] != url or type(response["url"]) is not str):
         _safe_error(_BROWSER_UNAVAILABLE)
     return (
         json.dumps(response, ensure_ascii=False, separators=(",", ":")).encode("utf-8"),

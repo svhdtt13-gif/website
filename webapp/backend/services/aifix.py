@@ -11,7 +11,7 @@ _COMMANDS = {
     "web": "Trong dự án ai tool, hãy kiểm tra và fix trang web db.html: đọc tools/db.html và WebAppControl/flask/app_public.py; kiểm tra lỗi console trình duyệt và các API /api/settings, /api/cycle/fix; sửa rồi xác minh lại trên trình duyệt.",
 }
 _USERIMPORT_PREFIX = "[Userimport - dự án ai tool] "
-_FILE_RE = re.compile(r"^ai_fix_(?:cycle|web|userimport)_\d{8}_\d{6}\.json$")
+_FILE_RE = re.compile(r"^ai_fix_(cycle|web|userimport)_\d{8}_\d{6}\.json$")
 _UNAVAILABLE = b'{"error":"ai fix unavailable"}'
 _INVALID = b'{"error":"invalid ai fix request"}'
 
@@ -70,6 +70,8 @@ def _validate_response(body, status, content_type, kind, command):
     if response["status"] != "OK" or response["kind"] != kind or response["project"] != "ai tool":
         _safe_error()
     if type(response["file"]) is not str or not _FILE_RE.fullmatch(response["file"]):
+        _safe_error()
+    if not response["file"].startswith(f"ai_fix_{kind}_"):
         _safe_error()
     if response["command"] != command:
         _safe_error()

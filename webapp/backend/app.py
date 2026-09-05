@@ -1,4 +1,4 @@
-"""Flask app: serve frontend tinh + proxy GET allowlist + POST write allowlist.
+"""Flask app: serve frontend tinh + proxy GET allowlist + write allowlists.
 
 Luong Phase 2: route -> service -> repository -> ai tool.
 Hanh vi GET giu nguyen proxy read-only; Slice 2 chi mo write api/log
@@ -10,6 +10,7 @@ Slice 7 them POST api/settings voi shared projector va safe partial update.
 Slice 8 them guarded CAS name-only POST api/master.
 Slice 9 them canonical GET api/remote_live khong selector.
 Slice 10 them guarded remote selector query.
+Slice 11 them dedicated guarded DELETE api/cycle/backup/<name>.
 """
 import hmac
 import pathlib
@@ -61,6 +62,12 @@ def _write_authorized():
     return bool(expected) and hmac.compare_digest(supplied, f"Bearer {expected}")
 
 
+def _raw_request_path():
+    """Return the raw path when the WSGI server exposes it, without query data."""
+    raw = request.environ.get("RAW_URI") or request.environ.get("REQUEST_URI")
+    return (raw or request.path).split("?", 1)[0]
+
+
 def create_app():
     app = Flask(__name__, static_folder=None)
 
@@ -80,6 +87,23 @@ def create_app():
         if target.suffix not in ALLOWED_STATIC_EXT or not target.is_file():
             return jsonify({"error": "not found"}), 404
         return send_from_directory(str(target.parent), target.name)
+
+    @app.route("/up/api/cycle/backup/<name>", methods=["DELETE"])
+    def delete_backup(name):
+        """Dedicated dynamic backup DELETE boundary; no generic prefix dispatch."""
+        if not _write_authorized():
+            return jsonify({"error": "write authentication required"}), 401, {
+                "WWW-Authenticate": "Bearer"
+            }
+        try:
+            canonical_name = backup_service.canonical_backup_name(_raw_request_path(), name)
+        except backup_service.BackupNameError:
+            return jsonify({"error": "invalid backup name"}), 400
+        try:
+            body, status, ctype = backup_service.delete_cycle_backup(canonical_name)
+        except UpstreamError as e:
+            return Response(e.body, status=e.status, content_type="application/json")
+        return Response(body, status=status, content_type=ctype)
 
     @app.route("/up/<path:subpath>", methods=["GET", "POST", "PUT", "PATCH", "DELETE"])
     def upstream(subpath):

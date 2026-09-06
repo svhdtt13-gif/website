@@ -33,7 +33,6 @@ SOURCE_ORDER = (
 JSON_ENDPOINTS = frozenset(
     endpoint for endpoint in SOURCE_ORDER if not endpoint.startswith("cache/")
 )
-# Keep this ordered: the tuple is also the SQLite column mapping order.
 PUBLIC_SETTINGS_FIELDS = (
     "tunnel_port", "auto_restart_tunnel", "auto_telegram", "auto_open_browser",
 )
@@ -106,8 +105,6 @@ class AiToolHttpSource:
         if endpoint not in SOURCE_ORDER:
             raise SourceAcquisitionError("source endpoint is not allowlisted")
         if endpoint == "api/settings":
-            # settings_service returns only the four public fields. The raw
-            # upstream settings response never reaches this importer.
             try:
                 body, status, content_type = settings_service.get_settings()
             except UpstreamError as error:
@@ -128,7 +125,6 @@ class AiToolHttpSource:
                 raise SourceAcquisitionError("source JSON is invalid") from error
             if endpoint == "api/settings":
                 _validate_public_settings(payload)
-                # Re-serialize the already-redacted projection for stable input.
                 body = _json_bytes(payload)
         return SourceValue(
             endpoint=endpoint,
@@ -145,6 +141,10 @@ def _sha256(value):
 
 def _json_bytes(value):
     return json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+
+
+def _raw_json(value):
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
 
 
 def _canonical_bytes(endpoint, body):

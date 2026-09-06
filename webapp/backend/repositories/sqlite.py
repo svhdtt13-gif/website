@@ -181,16 +181,21 @@ class SQLiteCandidateRepository:
         self.connection = connection
         self.path = Path(path)
 
+    @staticmethod
+    def _connect(path):
+        connection = sqlite3.connect(str(path))
+        connection.execute("PRAGMA foreign_keys = ON")
+        connection.execute("PRAGMA journal_mode = WAL")
+        connection.execute("PRAGMA synchronous = NORMAL")
+        return connection
+
     @classmethod
     def create(cls, path):
         candidate = Path(path)
         if candidate.exists():
             raise CandidatePathError("candidate database already exists")
         candidate.parent.mkdir(parents=True, exist_ok=True)
-        connection = sqlite3.connect(str(candidate))
-        connection.execute("PRAGMA foreign_keys = ON")
-        connection.execute("PRAGMA journal_mode = WAL")
-        connection.execute("PRAGMA synchronous = NORMAL")
+        connection = cls._connect(candidate)
         connection.executescript(SCHEMA_SQL)
         connection.execute(
             "INSERT INTO schema_migrations(version, checksum, applied_at) VALUES (?, ?, datetime('now'))",
@@ -198,6 +203,13 @@ class SQLiteCandidateRepository:
         )
         connection.commit()
         return cls(connection, candidate)
+
+    @classmethod
+    def open_existing(cls, path):
+        candidate = Path(path)
+        if not candidate.is_file():
+            raise CandidatePathError("candidate database does not exist")
+        return cls(cls._connect(candidate), candidate)
 
     @contextmanager
     def transaction(self):

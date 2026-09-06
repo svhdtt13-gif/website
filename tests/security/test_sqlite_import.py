@@ -3,7 +3,6 @@
 import hashlib
 import json
 from pathlib import Path
-import sqlite3
 import sys
 import tempfile
 import unittest
@@ -144,21 +143,21 @@ class SQLiteImportTests(unittest.TestCase):
             self.assertTrue(checks["action_raw_bytes"])
             self.assertTrue(checks["no_settings_secret_columns"])
 
-            connection = sqlite3.connect(str(candidate))
-            self.assertEqual(connection.execute("PRAGMA journal_mode").fetchone()[0].lower(), "wal")
-            self.assertEqual(connection.execute("PRAGMA foreign_keys").fetchone()[0], 1)
+            repository = SQLiteCandidateRepository.open_existing(candidate)
+            self.assertEqual(repository.rows("PRAGMA journal_mode")[0][0].lower(), "wal")
+            self.assertEqual(repository.rows("PRAGMA foreign_keys")[0][0], 1)
             self.assertEqual(
-                connection.execute("SELECT client_id FROM master_clients WHERE run_id=? ORDER BY position",
-                                   (receipt.run_id,)).fetchall(),
+                repository.rows("SELECT client_id FROM master_clients WHERE run_id=? ORDER BY position",
+                                (receipt.run_id,)),
                 [("client_2",), ("client_1",)],
             )
-            settings_snapshot = connection.execute(
+            settings_snapshot = repository.rows(
                 "SELECT raw_bytes FROM source_snapshots WHERE run_id=? AND endpoint='api/settings'",
                 (receipt.run_id,),
-            ).fetchone()[0]
+            )[0][0]
             self.assertNotIn(b"telegram_bot_token", settings_snapshot)
             self.assertNotIn(b"cloudflared_path", settings_snapshot)
-            connection.close()
+            repository.close()
 
     def test_candidate_path_must_be_new(self):
         with tempfile.TemporaryDirectory() as directory:

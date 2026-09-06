@@ -1,7 +1,7 @@
 """Guarded SQLite generation publication, normalized reads, and write fencing."""
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import ctypes
 import hashlib
 import json
@@ -108,6 +108,7 @@ def _default_state():
             for group in GROUPS
         },
         "fences": {},
+        "refresh_lease": None,
     }
 
 
@@ -265,6 +266,7 @@ class SQLiteRuntimeCoordinator:
         state.setdefault("current", None)
         state.setdefault("groups", {})
         state.setdefault("fences", {})
+        state.setdefault("refresh_lease", None)
         for group in GROUPS:
             state["groups"].setdefault(
                 group,
@@ -287,15 +289,38 @@ class SQLiteRuntimeCoordinator:
             "updated_at": _utc_now(),
         }
 
-    def _mark_ineligible(self, group, reason):
+    def _mark_ineligible(self, group, reason, timeout_seconds=0):
         try:
-            with self._mutex.hold():
+            with self._mutex.hold(timeout_seconds=timeout_seconds):
                 state = self._load_state()
                 self._mark_ineligible_locked(state, group, reason)
                 _atomic_json(self.state_path, state)
         except (OSError, TimeoutError):
-            # A failed state transition is itself fail-closed; HTTP remains source.
+            # State marking is advisory; HTTP fallback must never wait on refresh.
             pass
+
+    def _release_refresh_lease(self, token):
+        if not token:
+            return
+        try:
+            with self._mutex.hold(timeout_seconds=0):
+                state = self._load_state()
+                lease = state.get("refresh_lease") or {}
+                if lease.get("token") == token:
+                    state["refresh_lease"] = None
+                    _atomic_json(self.state_path, state)
+        except (OSError, TimeoutError):
+            # Expiry is the crash-recovery backstop if the mutex is busy.
+            pass
+
+    @staticmethod
+    def _lease_active(lease):
+        if not isinstance(lease, dict) or not lease.get("token"):
+            return False
+        try:
+            return datetime.now(timezone.utc) < _parse_time(lease.get("expires_at"))
+        except RuntimeStateError:
+            return False
 
     def _eligible(self, state, group):
         current = state.get("current")
@@ -485,16 +510,16 @@ class SQLiteRuntimeCoordinator:
             return fallback()
         state = self._load_state()
         if not self._eligible(state, group):
-            self._mark_ineligible(group, "stale_or_not_eligible")
+            self._mark_ineligible(group, "stale_or_not_eligible", timeout_seconds=0)
             self.request_refresh(group)
             return fallback()
         try:
-            body, status, content_type = self._read_generation(state, route)
+            body, content_type = self._read_generation(state, route)
         except Exception:
-            self._mark_ineligible(group, "candidate_read_failed")
+            self._mark_ineligible(group, "candidate_read_failed", timeout_seconds=0)
             self.request_refresh(group)
             return fallback()
-        return body, status, content_type
+        return body, 200, content_type
 
     @staticmethod
     def _fence_observed(fence, snapshot):
@@ -618,7 +643,7 @@ class SQLiteRuntimeCoordinator:
                 self.refresh_now(group)
             except Exception:
                 # Background refresh must never produce an uncaught thread error.
-                self._mark_ineligible(group, "refresh_failed")
+                self._mark_ineligible(group, "refresh_failed", timeout_seconds=0)
 
     def _build_candidate(self, group, staging, deadline):
         try:
@@ -652,6 +677,8 @@ class SQLiteRuntimeCoordinator:
         staging = self.runtime_dir / (generation_id + ".sqlite3.staging")
         final = self.runtime_dir / (generation_id + ".sqlite3")
         published = False
+        lease_token = None
+        lease_release_deferred = False
         initial_generation_id = None
         initial_fence_token = None
         try:
@@ -662,8 +689,21 @@ class SQLiteRuntimeCoordinator:
                 state = self._load_state()
                 if not force and self._eligible(state, group):
                     return True
+                if self._lease_active(state.get("refresh_lease")):
+                    # Another process owns the refresh; its publication is shared.
+                    return True
                 initial_generation_id = (state.get("current") or {}).get("generation_id")
                 initial_fence_token = (state.get("fences", {}).get(group) or {}).get("token")
+                lease_token = uuid.uuid4().hex
+                state["refresh_lease"] = {
+                    "token": lease_token,
+                    "started_at": _utc_now(),
+                    "expires_at": (
+                        datetime.now(timezone.utc)
+                        + timedelta(seconds=max(1.0, self.refresh_timeout_seconds * 2))
+                    ).isoformat(),
+                }
+                _atomic_json(self.state_path, state)
 
             executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="sqlite-build")
             future = executor.submit(self._build_candidate, group, staging, deadline)
@@ -673,7 +713,13 @@ class SQLiteRuntimeCoordinator:
                     raise SourceAcquisitionError("refresh timeout")
                 snapshot, receipt = future.result(timeout=remaining)
             except FutureTimeoutError as error:
-                future.add_done_callback(lambda _future: _remove_candidate(staging))
+                lease_release_deferred = True
+                future.add_done_callback(
+                    lambda _future: (
+                        _remove_candidate(staging),
+                        self._release_refresh_lease(lease_token),
+                    )
+                )
                 raise SourceAcquisitionError("refresh timeout") from error
             finally:
                 executor.shutdown(wait=False, cancel_futures=True)
@@ -687,6 +733,10 @@ class SQLiteRuntimeCoordinator:
                 if self._clock() > deadline:
                     raise SourceAcquisitionError("refresh timeout")
                 state = self._load_state()
+                lease = state.get("refresh_lease") or {}
+                if lease.get("token") != lease_token:
+                    _remove_candidate(staging)
+                    return False
                 current_generation_id = (state.get("current") or {}).get("generation_id")
                 current_fence_token = (state.get("fences", {}).get(group) or {}).get("token")
                 if (
@@ -698,7 +748,8 @@ class SQLiteRuntimeCoordinator:
                         self.request_refresh(group)
                     return False
                 fence = state.get("fences", {}).get(group)
-                if fence is not None and not self._fence_observed(fence, snapshot):
+                fence_observed = fence is not None and self._fence_observed(fence, snapshot)
+                if fence is not None and not fence_observed:
                     raise RuntimeStateError("write mutation not observed")
                 if not force and self._eligible(state, group):
                     _remove_candidate(staging)
@@ -723,7 +774,7 @@ class SQLiteRuntimeCoordinator:
                 for target in GROUPS:
                     old = state["groups"].get(target, {})
                     target_fence = state.get("fences", {}).get(target)
-                    if target_fence is not None:
+                    if target_fence is not None and not (target == group and fence_observed):
                         state["groups"][target] = {
                             "eligible": False,
                             "generation_id": generation_id,
@@ -739,14 +790,18 @@ class SQLiteRuntimeCoordinator:
                         }
                     else:
                         state["groups"][target]["generation_id"] = generation_id
-                state["fences"].pop(group, None)
+                if fence_observed:
+                    state["fences"].pop(group, None)
+                state["refresh_lease"] = None
                 _atomic_json(self.state_path, state)
             return True
         except Exception:
             _remove_candidate(staging)
             if published:
                 _remove_candidate(final)
-            self._mark_ineligible(group, "refresh_failed")
+            if lease_token and not lease_release_deferred:
+                self._release_refresh_lease(lease_token)
+            self._mark_ineligible(group, "refresh_failed", timeout_seconds=0)
             return False
 
     def state(self):

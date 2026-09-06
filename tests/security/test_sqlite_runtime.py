@@ -116,6 +116,36 @@ class SQLiteRuntimeTests(unittest.TestCase):
             self.assertIsNone(runtime.state()["current"])
             self.assertFalse(list(Path(directory).glob("*.sqlite3")))
 
+    def test_refresh_lease_prevents_parallel_importers(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = enabled_runtime(directory, background_refresh=False)
+            started = threading.Event()
+            release = threading.Event()
+            calls = []
+
+            def slow_import(snapshot, path):
+                calls.append(True)
+                started.set()
+                release.wait(2)
+                return type(
+                    "FailedReceipt", (), {"status": "failed", "checks": {"ok": False}}
+                )()
+
+            runtime._importer = slow_import
+            first_result = []
+            first = threading.Thread(
+                target=lambda: first_result.append(
+                    runtime.refresh_now(GROUP_MASTER_DATABASE)
+                )
+            )
+            first.start()
+            self.assertTrue(started.wait(2))
+            self.assertTrue(runtime.refresh_now(GROUP_MASTER_DATABASE))
+            self.assertEqual(len(calls), 1)
+            release.set()
+            first.join(3)
+            self.assertEqual(first_result, [False])
+
     def test_captured_at_is_freshness_anchor(self):
         with tempfile.TemporaryDirectory() as directory:
             runtime = enabled_runtime(directory)
@@ -182,7 +212,9 @@ class SQLiteRuntimeTests(unittest.TestCase):
             )
             runtime._source_factory = lambda: FakeSource(values)
             self.assertTrue(runtime.refresh_now(GROUP_MASTER_DATABASE))
-            self.assertNotIn(GROUP_MASTER_DATABASE, runtime.state()["fences"])
+            state = runtime.state()
+            self.assertNotIn(GROUP_MASTER_DATABASE, state["fences"])
+            self.assertTrue(state["groups"][GROUP_MASTER_DATABASE]["eligible"])
 
     def test_normalized_corruption_falls_back_for_each_wave_one_table(self):
         cases = (
@@ -226,6 +258,19 @@ class SQLiteRuntimeTests(unittest.TestCase):
             sqlite_runtime._atomic_json(runtime.state_path, state)
             fallback = (b"http", 200, "application/json")
             self.assertEqual(runtime.read("api/master", lambda: fallback), fallback)
+
+    def test_reader_fallback_does_not_wait_for_refresh_mutex(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = enabled_runtime(directory, background_refresh=False)
+            self.assertTrue(runtime.refresh_now(GROUP_MASTER_DATABASE))
+            state = runtime.state()
+            state["current"]["captured_at"] = "2000-01-01T00:00:00+00:00"
+            sqlite_runtime._atomic_json(runtime.state_path, state)
+            fallback = (b"http", 200, "application/json")
+            started = time.monotonic()
+            with runtime._mutex.hold():
+                self.assertEqual(runtime.read("api/master", lambda: fallback), fallback)
+            self.assertLess(time.monotonic() - started, 0.15)
 
     def test_startup_refresh_queues_each_missing_group_while_active(self):
         with tempfile.TemporaryDirectory() as directory:

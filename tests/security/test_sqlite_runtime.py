@@ -266,7 +266,7 @@ class SQLiteRuntimeTests(unittest.TestCase):
 
     def test_timeout_before_future_wait_uses_deferred_lease_handoff(self):
         with tempfile.TemporaryDirectory() as directory:
-            clock_values = iter((0.0, 2.0))
+            clock_values = iter((0.0, 0.0, 2.0))
             runtime = SQLiteRuntimeCoordinator(
                 runtime_dir=directory,
                 read_enabled=True,

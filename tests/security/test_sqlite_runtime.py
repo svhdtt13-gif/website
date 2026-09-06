@@ -188,6 +188,47 @@ class SQLiteRuntimeTests(unittest.TestCase):
             self.assertEqual(state["refresh_pending"], [])
             request.assert_called_once_with(GROUP_PUBLIC_SETTINGS)
 
+    def test_cleanup_retries_until_generation_mutex_is_available(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = enabled_runtime(directory, background_refresh=True)
+            started = threading.Event()
+            release_build = threading.Event()
+
+            def failing_import(snapshot, path):
+                started.set()
+                release_build.wait(2)
+                return type(
+                    "FailedReceipt", (), {"status": "failed", "checks": {"ok": False}}
+                )()
+
+            runtime._importer = failing_import
+            state = runtime.state()
+            state["refresh_pending"] = [GROUP_PUBLIC_SETTINGS]
+            sqlite_runtime._atomic_json(runtime.state_path, state)
+            result = []
+            owner = threading.Thread(
+                target=lambda: result.append(
+                    runtime.refresh_now(GROUP_MASTER_DATABASE)
+                )
+            )
+            with patch.object(runtime, "request_refresh", return_value=True) as request:
+                owner.start()
+                self.assertTrue(started.wait(2))
+                with runtime._mutex.hold():
+                    release_build.set()
+                    owner.join(2)
+                    self.assertEqual(result, [False])
+                    self.assertIsNotNone(runtime.state()["refresh_lease"])
+                deadline = time.monotonic() + 2
+                while time.monotonic() < deadline:
+                    state = runtime.state()
+                    if state["refresh_lease"] is None and request.call_count:
+                        break
+                    time.sleep(0.05)
+                self.assertIsNone(runtime.state()["refresh_lease"])
+                self.assertEqual(runtime.state()["refresh_pending"], [])
+                request.assert_called_once_with(GROUP_PUBLIC_SETTINGS)
+
     def test_publication_revalidation_exit_releases_owner_lease(self):
         with tempfile.TemporaryDirectory() as directory:
             runtime = enabled_runtime(directory, background_refresh=False)

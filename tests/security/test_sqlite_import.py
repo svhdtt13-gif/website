@@ -80,9 +80,9 @@ def fixture_values():
         "cache/action.log": source_value("cache/action.log", action, "text/plain"),
         "api/ai_fix/status": source_value("api/ai_fix/status", {
             "pending": [{"file": "ai_fix_cycle_20260906_100000.json", "kind": "cycle"}],
-            "recent_done": [{"file": "ai_fix_web_20260906_095900.json", "kind": "web",
-                             "result": {"summary": "ok"}}],
-            "recent_failed": [{"file": "ai_fix_userimport_20260906_095800.json", "kind": "userimport"}],
+            "recent_done": [{"file": "ai_fix_web_20260906_095900.done.json", "kind": "web",
+                             "summary": "ok"}],
+            "recent_failed": [{"file": "ai_fix_userimport_20260906_095800.failed.json", "kind": "userimport"}],
         }),
         "api/cycle/backup": source_value("api/cycle/backup", {
             "backups": [{"name": "cycle_20260906.zip", "size": 12,

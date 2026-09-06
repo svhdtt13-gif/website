@@ -1,4 +1,5 @@
 """Guarded SQLite generation publication, normalized reads, and write fencing."""
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from contextlib import contextmanager
 from datetime import datetime, timezone
 import ctypes
@@ -246,6 +247,7 @@ class SQLiteRuntimeCoordinator:
         self._background_refresh = background_refresh
         self._refresh_guard = threading.Lock()
         self._refresh_active = False
+        self._refresh_pending = set()
 
     def configured_enabled(self, group):
         return self.read_enabled and self.group_enabled.get(group, False)
@@ -437,6 +439,7 @@ class SQLiteRuntimeCoordinator:
             if not snapshots:
                 raise RuntimeStateError("source snapshots missing")
             material = []
+            endpoint_hashes = {}
             for _position, source_endpoint, raw_bytes, raw_hash, canonical_hash in snapshots:
                 if not isinstance(raw_bytes, (bytes, bytearray, memoryview)):
                     raise RuntimeStateError("stored source snapshot is not bytes")
@@ -451,19 +454,23 @@ class SQLiteRuntimeCoordinator:
                     raise RuntimeStateError("stored canonical source is invalid") from error
                 if calculated_canonical != canonical_hash:
                     raise RuntimeStateError("stored canonical source hash mismatch")
+                endpoint_hashes[source_endpoint] = canonical_hash
                 material.append(
                     source_endpoint.encode("utf-8") + b"\0" + canonical_hash.encode("ascii")
                 )
             if hashlib.sha256(b"".join(material)).hexdigest() != current.get("source_hash"):
                 raise RuntimeStateError("stored source hash material mismatch")
             body = self._normalized_response(repository, current.get("run_id"), route)
+            expected_hash = endpoint_hashes.get(endpoint)
+            if expected_hash is None or _sha256(_canonical_bytes(endpoint, body)) != expected_hash:
+                raise RuntimeStateError("normalized response integrity mismatch")
             content = repository.rows(
                 "SELECT content_type FROM source_snapshots WHERE run_id=? AND endpoint=?",
                 (current.get("run_id"), endpoint),
             )
             if len(content) != 1:
                 raise RuntimeStateError("route content type missing")
-            return body, content[0][0] or "application/json"
+            return body, 200, content[0][0] or "application/json"
         finally:
             repository.close()
 
@@ -487,12 +494,44 @@ class SQLiteRuntimeCoordinator:
             return fallback()
         return body, 200, content_type
 
+    @staticmethod
+    def _fence_observed(fence, snapshot):
+        expected = fence.get("expected_observation")
+        if not isinstance(expected, dict):
+            return False
+        if fence.get("expected_revision") != _sha256(_json_bytes(expected)):
+            return False
+        endpoint = expected.get("endpoint")
+        try:
+            payload = json.loads(snapshot.value(endpoint).body.decode("utf-8"))
+        except (KeyError, UnicodeDecodeError, json.JSONDecodeError):
+            return False
+        if endpoint == "api/master":
+            clients = {
+                item.get("client"): item.get("name")
+                for item in payload.get("clients", [])
+                if isinstance(item, dict)
+            }
+            changes = expected.get("changes")
+            return isinstance(changes, list) and all(
+                isinstance(change, dict)
+                and clients.get(change.get("client")) == change.get("name")
+                for change in changes
+            )
+        if endpoint == "api/settings":
+            fields = expected.get("fields")
+            return isinstance(fields, dict) and all(
+                payload.get(key) == value for key, value in fields.items()
+            )
+        return False
+
     @contextmanager
-    def write_fence(self, group):
-        """Durably fence stale reads before the caller dispatches its write."""
+    def write_fence(self, group, expected_observation=None):
+        """Fence stale reads until a later snapshot observes the completed write."""
         if group not in GROUPS:
             yield
             return
+        expected = expected_observation or {}
         try:
             with self._mutex.hold():
                 state = self._load_state()
@@ -502,6 +541,8 @@ class SQLiteRuntimeCoordinator:
                     "token": token,
                     "created_at": _utc_now(),
                     "reason": "pre_dispatch_write",
+                    "expected_observation": expected,
+                    "expected_revision": _sha256(_json_bytes(expected)),
                 }
                 _atomic_json(self.state_path, state)
                 # The caller's upstream request executes while this mutex is held.
@@ -515,7 +556,7 @@ class SQLiteRuntimeCoordinator:
             self.request_refresh(group)
 
     def startup_refresh(self):
-        """Schedule refreshes for enabled groups without an eligible generation."""
+        """Queue refreshes for every enabled group without an eligible generation."""
         started = []
         state = self._load_state()
         for group in GROUPS:
@@ -527,12 +568,12 @@ class SQLiteRuntimeCoordinator:
         if not self.configured_enabled(group) or not self._background_refresh:
             return False
         with self._refresh_guard:
+            self._refresh_pending.add(group)
             if self._refresh_active:
-                return False
+                return True
             self._refresh_active = True
         thread = threading.Thread(
             target=self._run_background_refresh,
-            args=(group,),
             name="sqlite-refresh",
             daemon=True,
         )
@@ -540,37 +581,26 @@ class SQLiteRuntimeCoordinator:
             thread.start()
         except Exception:
             with self._refresh_guard:
+                self._refresh_pending.discard(group)
                 self._refresh_active = False
             return False
         return True
 
-    def _run_background_refresh(self, group):
-        try:
-            self.refresh_now(group)
-        finally:
+    def _run_background_refresh(self):
+        while True:
             with self._refresh_guard:
-                self._refresh_active = False
+                if not self._refresh_pending:
+                    self._refresh_active = False
+                    return
+                group = next(iter(self._refresh_pending))
+                self._refresh_pending.discard(group)
+            try:
+                self.refresh_now(group)
+            except Exception:
+                # Background refresh must never produce an uncaught thread error.
+                self._mark_ineligible(group, "refresh_failed")
 
-    def refresh_now(self, group, force=False):
-        """Build and publish one verified normalized generation."""
-        if group not in GROUPS or not self.configured_enabled(group):
-            return False
-        self.runtime_dir.mkdir(parents=True, exist_ok=True)
-        try:
-            with self._mutex.hold():
-                return self._refresh_locked(group, force)
-        except (OSError, TimeoutError):
-            # A lock failure cannot publish or serve a candidate.
-            return False
-
-    def _refresh_locked(self, group, force):
-        state = self._load_state()
-        if not force and self._eligible(state, group):
-            return True
-        generation_id = uuid.uuid4().hex
-        staging = self.runtime_dir / (generation_id + ".sqlite3.staging")
-        final = self.runtime_dir / (generation_id + ".sqlite3")
-        deadline = self._clock() + self.refresh_timeout_seconds
+    def _build_candidate(self, group, staging, deadline):
         try:
             if self._source_factory is None:
                 source = _BoundedAiToolHttpSource(deadline, self._clock)
@@ -587,45 +617,94 @@ class SQLiteRuntimeCoordinator:
             self._normalize_and_verify(staging, receipt.run_id, snapshot)
             if self._clock() > deadline:
                 raise SourceAcquisitionError("refresh timeout")
-            os.replace(staging, final)
-            completed_at = _utc_now()
-            current = {
-                "generation_id": generation_id,
-                "run_id": receipt.run_id,
-                "candidate_path": str(final),
-                "receipt_id": receipt.run_id,
-                "snapshot_id": receipt.snapshot_id,
-                "source_hash": receipt.source_hash,
-                "schema_version": SCHEMA_VERSION,
-                "schema_checksum": SCHEMA_CHECKSUM,
-                "status": "verified",
-                "captured_at": snapshot.captured_at,
-                "completed_at": completed_at,
-            }
-            state["current"] = current
-            for target in GROUPS:
-                old = state["groups"].get(target, {})
-                if (
-                    target == group
-                    or old.get("eligible")
-                    or (self.configured_enabled(target) and target not in state["fences"])
-                ):
-                    state["groups"][target] = {
-                        "eligible": True,
-                        "generation_id": generation_id,
-                        "reason": "verified",
-                        "updated_at": completed_at,
-                    }
-                else:
-                    state["groups"][target]["generation_id"] = generation_id
-            state["fences"].pop(group, None)
-            _atomic_json(self.state_path, state)
+            return snapshot, receipt
+        except Exception:
+            _remove_candidate(staging)
+            raise
+
+    def refresh_now(self, group, force=False):
+        """Build outside the mutex and atomically publish only within the deadline."""
+        if group not in GROUPS or not self.configured_enabled(group):
+            return False
+        self.runtime_dir.mkdir(parents=True, exist_ok=True)
+        deadline = self._clock() + self.refresh_timeout_seconds
+        generation_id = uuid.uuid4().hex
+        staging = self.runtime_dir / (generation_id + ".sqlite3.staging")
+        final = self.runtime_dir / (generation_id + ".sqlite3")
+        published = False
+        try:
+            with self._mutex.hold():
+                state = self._load_state()
+                if not force and self._eligible(state, group):
+                    return True
+
+            executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="sqlite-build")
+            future = executor.submit(self._build_candidate, group, staging, deadline)
+            try:
+                remaining = deadline - self._clock()
+                if remaining <= 0:
+                    raise SourceAcquisitionError("refresh timeout")
+                snapshot, receipt = future.result(timeout=remaining)
+            except FutureTimeoutError as error:
+                future.add_done_callback(lambda _future: _remove_candidate(staging))
+                raise SourceAcquisitionError("refresh timeout") from error
+            finally:
+                executor.shutdown(wait=False, cancel_futures=True)
+            if self._clock() > deadline:
+                raise SourceAcquisitionError("refresh timeout")
+
+            with self._mutex.hold():
+                state = self._load_state()
+                fence = state.get("fences", {}).get(group)
+                if fence is not None and not self._fence_observed(fence, snapshot):
+                    raise RuntimeStateError("write mutation not observed")
+                if not force and self._eligible(state, group):
+                    _remove_candidate(staging)
+                    return True
+                os.replace(staging, final)
+                published = True
+                completed_at = _utc_now()
+                current = {
+                    "generation_id": generation_id,
+                    "run_id": receipt.run_id,
+                    "candidate_path": str(final),
+                    "receipt_id": receipt.run_id,
+                    "snapshot_id": receipt.snapshot_id,
+                    "source_hash": receipt.source_hash,
+                    "schema_version": SCHEMA_VERSION,
+                    "schema_checksum": SCHEMA_CHECKSUM,
+                    "status": "verified",
+                    "captured_at": snapshot.captured_at,
+                    "completed_at": completed_at,
+                }
+                state["current"] = current
+                for target in GROUPS:
+                    old = state["groups"].get(target, {})
+                    target_fence = state.get("fences", {}).get(target)
+                    if target_fence is not None:
+                        state["groups"][target] = {
+                            "eligible": False,
+                            "generation_id": generation_id,
+                            "reason": "write_invalidation",
+                            "updated_at": completed_at,
+                        }
+                    elif target == group or old.get("eligible") or self.configured_enabled(target):
+                        state["groups"][target] = {
+                            "eligible": True,
+                            "generation_id": generation_id,
+                            "reason": "verified",
+                            "updated_at": completed_at,
+                        }
+                    else:
+                        state["groups"][target]["generation_id"] = generation_id
+                state["fences"].pop(group, None)
+                _atomic_json(self.state_path, state)
             return True
         except Exception:
             _remove_candidate(staging)
-            state = self._load_state()
-            self._mark_ineligible_locked(state, group, "refresh_failed")
-            _atomic_json(self.state_path, state)
+            if published:
+                _remove_candidate(final)
+            self._mark_ineligible(group, "refresh_failed")
             return False
 
     def state(self):

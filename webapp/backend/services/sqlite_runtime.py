@@ -304,19 +304,55 @@ class SQLiteRuntimeCoordinator:
 
     def _release_refresh_lease(self, token):
         if not token:
-            return True
+            return "released"
         try:
             with self._mutex.hold(timeout_seconds=0):
                 state = self._load_state()
                 lease = state.get("refresh_lease") or {}
                 if lease.get("token") != token:
-                    return False
+                    return "not_owner"
                 state["refresh_lease"] = None
                 _atomic_json(self.state_path, state)
-                return True
+                return "released"
         except (OSError, TimeoutError):
-            # Expiry is the crash-recovery backstop if the mutex is busy.
+            return "busy"
+
+    def _handoff_owner_lease(self, token, stop, heartbeat, follow_up=None):
+        """Keep the owner heartbeat alive until the lease can be cleared."""
+        def complete():
+            self._stop_lease_heartbeat(stop, heartbeat)
+            if follow_up is not None:
+                follow_up()
+            self._schedule_shared_pending()
+
+        def retry():
+            while True:
+                try:
+                    status = self._release_refresh_lease(token)
+                except Exception:
+                    self._stop_lease_heartbeat(stop, heartbeat)
+                    return
+                if status == "released":
+                    complete()
+                    return
+                if status == "not_owner":
+                    self._stop_lease_heartbeat(stop, heartbeat)
+                    return
+                time.sleep(0.05)
+
+        status = self._release_refresh_lease(token)
+        if status == "released":
+            complete()
+            return True
+        if status == "not_owner":
+            self._stop_lease_heartbeat(stop, heartbeat)
             return False
+        threading.Thread(
+            target=retry,
+            name="sqlite-lease-handoff",
+            daemon=True,
+        ).start()
+        return False
 
     @staticmethod
     def _lease_active(lease):
@@ -736,10 +772,8 @@ class SQLiteRuntimeCoordinator:
             raise
 
     def _finish_timed_out_build(self, token, stop, heartbeat, staging, future):
-        self._stop_lease_heartbeat(stop, heartbeat)
         _remove_candidate(staging)
-        if self._release_refresh_lease(token):
-            self._schedule_shared_pending()
+        self._handoff_owner_lease(token, stop, heartbeat)
 
     def refresh_now(self, group, force=False):
         """Build outside the mutex and atomically publish only within the deadline."""
@@ -813,7 +847,6 @@ class SQLiteRuntimeCoordinator:
                 executor.shutdown(wait=False, cancel_futures=True)
             if self._clock() > deadline:
                 raise SourceAcquisitionError("refresh timeout")
-            self._stop_lease_heartbeat(lease_stop, heartbeat)
 
             remaining = deadline - self._clock()
             if remaining <= 0:
@@ -891,12 +924,16 @@ class SQLiteRuntimeCoordinator:
                         _atomic_json(self.state_path, state)
                         result = True
             if lease_owned:
+                lease_released = self._handoff_owner_lease(
+                    lease_token,
+                    lease_stop,
+                    heartbeat,
+                    (lambda: self.request_refresh(group)) if requeue_group else None,
+                )
+            else:
                 self._stop_lease_heartbeat(lease_stop, heartbeat)
-                lease_released = self._release_refresh_lease(lease_token)
-                if lease_released:
-                    lease_owned = False
-            if requeue_group:
-                self.request_refresh(group)
+                if requeue_group:
+                    self.request_refresh(group)
             if lease_released:
                 self._schedule_shared_pending()
             return result
@@ -905,14 +942,11 @@ class SQLiteRuntimeCoordinator:
             if published:
                 _remove_candidate(final)
             if not lease_release_deferred:
-                self._stop_lease_heartbeat(lease_stop, heartbeat)
-                if lease_token and lease_owned:
-                    lease_released = self._release_refresh_lease(lease_token)
-                    if lease_released:
-                        lease_owned = False
                 self._mark_ineligible(group, "refresh_failed", timeout_seconds=0)
-                if lease_released:
-                    self._schedule_shared_pending()
+                if lease_token and lease_owned:
+                    self._handoff_owner_lease(lease_token, lease_stop, heartbeat)
+                else:
+                    self._stop_lease_heartbeat(lease_stop, heartbeat)
             return False
 
     def state(self):

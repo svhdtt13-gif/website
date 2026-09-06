@@ -172,6 +172,28 @@ def _parse_json(value, endpoint):
         raise SourceAcquisitionError("source JSON is invalid: " + endpoint) from error
 
 
+def _object(payload, endpoint):
+    if not isinstance(payload, dict):
+        raise FidelityError(endpoint + " projection is not an object")
+    return payload
+
+
+def _required(payload, key, field=None):
+    if key not in payload:
+        raise FidelityError("missing required field: " + (field or key))
+    return payload[key]
+
+
+def _string(value, field, nonempty=False):
+    if type(value) is not str or (nonempty and not value):
+        raise FidelityError("invalid string field: " + field)
+    return value
+
+
+def _required_string(payload, key, field=None, nonempty=False):
+    return _string(_required(payload, key, field), field or key, nonempty)
+
+
 def _validate_public_settings(payload):
     public_fields = set(PUBLIC_SETTINGS_FIELDS)
     if not isinstance(payload, dict) or set(payload) - public_fields:
@@ -205,123 +227,105 @@ def capture_stable_snapshot(source, max_passes=3):
     raise UnstableSnapshotError("source changed during stability fence")
 
 
-def _require_list(payload, key):
-    value = payload.get(key) if isinstance(payload, dict) else None
-    if type(value) is not list:
-        raise FidelityError("missing or invalid list: " + key)
-    return value
-
-
-def _text(value, field, allow_none=False):
-    if allow_none and value is None:
-        return None
-    if type(value) is not str or not value:
-        raise FidelityError("invalid text field: " + field)
-    return value
-
-
-def _raw_json(value):
-    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
-
-
 def _map_master(repo, run_id, snapshot):
-    payload = _parse_json(snapshot.value("api/master"), "api/master")
-    clients = _require_list(payload, "clients")
-    schedule = _require_list(payload, "schedule")
+    payload = _object(_parse_json(snapshot.value("api/master"), "api/master"), "api/master")
+    clients = _required(payload, "clients")
+    schedule = _required(payload, "schedule")
+    if type(clients) is not list or type(schedule) is not list:
+        raise FidelityError("master clients and schedule must be lists")
     for position, item in enumerate(clients):
-        if not isinstance(item, dict):
-            raise FidelityError("master client is not an object")
-        selected = item.get("selected", True)
+        item = _object(item, "master client")
+        selected = _required(item, "selected")
         if type(selected) is not bool:
             raise FidelityError("master selected is not boolean")
         repo.add_master_client(run_id, position, {
-            "client_id": _text(item.get("client"), "client"),
-            "display_name": _text(item.get("name"), "name"),
-            "remote_name": _text(item.get("remote_name"), "remote_name", True),
-            "group_name": _text(item.get("group"), "group"),
+            "client_id": _required_string(item, "client", "client", True),
+            "display_name": _required_string(item, "name", "name", True),
+            "remote_name": _required_string(item, "remote_name", "remote_name"),
+            "group_name": _required_string(item, "group", "group", True),
             "selected": selected,
-            "status": _text(item.get("status"), "status", True),
+            "status": _required_string(item, "status", "status"),
             "raw_json": _raw_json(item),
         })
     for position, item in enumerate(schedule):
-        if not isinstance(item, dict):
-            raise FidelityError("master schedule item is not an object")
+        item = _object(item, "master schedule")
         repo.add_schedule_slot(run_id, position, {
-            "group_name": _text(item.get("group"), "schedule group"),
-            "open_time": _text(item.get("time"), "schedule time"),
-            "close_time": _text(item.get("close"), "schedule close"),
+            "group_name": _required_string(item, "group", "schedule group", True),
+            "open_time": _required_string(item, "time", "schedule time", True),
+            "close_time": _required_string(item, "close", "schedule close", True),
             "raw_json": _raw_json(item),
         })
 
 
 def _map_database(repo, run_id, snapshot):
-    payload = _parse_json(snapshot.value("client_database.json"), "client_database.json")
-    clients = _require_list(payload, "clients")
-    schedule = _require_list(payload, "schedule")
-    last_updated = payload.get("lastUpdated")
-    if last_updated is not None:
-        _text(last_updated, "database lastUpdated")
+    payload = _object(_parse_json(snapshot.value("client_database.json"), "client_database.json"), "client_database.json")
+    last_updated = _required_string(payload, "lastUpdated", "database lastUpdated", True)
+    clients = _required(payload, "clients")
+    schedule = _required(payload, "schedule")
+    if type(clients) is not list or type(schedule) is not list:
+        raise FidelityError("database clients and schedule must be lists")
+    master_ids = {row[0] for row in repo.rows(
+        "SELECT client_id FROM master_clients WHERE run_id=?", (run_id,)
+    )}
     repo.set_database_meta(run_id, last_updated)
     for position, item in enumerate(clients):
-        if not isinstance(item, dict) or type(item.get("idx")) is not int:
-            raise FidelityError("database client index is invalid")
-        selected = item.get("selected")
-        if selected is not None and type(selected) is not bool:
-            raise FidelityError("database selected is not boolean")
+        item = _object(item, "database client")
+        remote_idx = _required(item, "idx", "database idx")
+        selected = _required(item, "selected", "database selected")
+        if type(remote_idx) is not int or type(selected) is not bool:
+            raise FidelityError("database client types are invalid")
+        client_id = _required_string(item, "client", "database client", True)
+        if client_id not in master_ids:
+            raise FidelityError("database client is not present in master")
         repo.add_database_client(run_id, position, {
-            "remote_idx": item["idx"],
-            "client_id": _text(item.get("client"), "database client"),
-            "display_name": _text(item.get("name"), "database name", True),
-            "status": _text(item.get("status"), "database status", True),
-            "group_name": _text(item.get("group"), "database group", True),
+            "remote_idx": remote_idx,
+            "client_id": client_id,
+            "display_name": _required_string(item, "name", "database name", True),
+            "status": _required_string(item, "status", "database status"),
+            "group_name": _required_string(item, "group", "database group", True),
             "selected": selected,
             "raw_json": _raw_json(item),
         })
     for position, item in enumerate(schedule):
-        if not isinstance(item, dict):
-            raise FidelityError("database schedule item is not an object")
-        repo.add_database_schedule(run_id, position, _raw_json(item))
+        repo.add_database_schedule(run_id, position, _raw_json(_object(item, "database schedule")))
 
 
 def _map_settings(repo, run_id, snapshot):
-    payload = _parse_json(snapshot.value("api/settings"), "api/settings")
+    payload = _object(_parse_json(snapshot.value("api/settings"), "api/settings"), "api/settings")
     _validate_public_settings(payload)
     repo.set_public_settings(run_id, payload, snapshot.captured_at)
 
 
 def _map_cycle(repo, run_id, snapshot):
-    payload = _parse_json(snapshot.value("api/cycle/status"), "api/cycle/status")
-    state = payload.get("state")
-    if state is None:
-        state = {}
-    if not isinstance(state, dict):
-        raise FidelityError("cycle state projection is not an object")
-    today = state.get("today")
-    if today is not None:
-        _text(today, "cycle today")
-    repo.set_cycle_state(run_id, today, _raw_json(state))
-    done = state.get("done", {})
-    if not isinstance(done, dict):
+    payload = _object(_parse_json(snapshot.value("api/cycle/status"), "api/cycle/status"), "api/cycle/status")
+    state = _required(payload, "state")
+    overrides = _required(payload, "manual_overrides")
+    if type(state) is not dict or type(overrides) is not list:
+        raise FidelityError("cycle state and manual_overrides have invalid types")
+    today = _required_string(state, "today", "cycle today", True)
+    done = _required(state, "done")
+    if type(done) is not dict:
         raise FidelityError("cycle done ledger is not an object")
-    for slot_key, result in done.items():
-        repo.add_cycle_slot(run_id, today or "", _text(str(slot_key), "cycle slot"), _text(str(result), "cycle result"))
-    overrides = payload.get("manual_overrides", [])
-    if type(overrides) is not list:
-        raise FidelityError("manual overrides projection is not a list")
-    for item in overrides:
-        if not isinstance(item, dict):
-            raise FidelityError("manual override is not an object")
-        change = item.get("change")
-        from_state = item.get("from")
-        to_state = item.get("to")
-        if from_state is None and to_state is None and isinstance(change, str) and "->" in change:
-            from_state, to_state = (part.strip() for part in change.split("->", 1))
-        repo.add_manual_override(run_id, {
-            "client_id": _text(item.get("client"), "override client"),
-            "until_at": _text(item.get("until"), "override until"),
-            "detected_at": _text(item.get("detected_at"), "override detected_at", True),
-            "from_state": _text(from_state, "override from", True),
-            "to_state": _text(to_state, "override to", True),
+    repo.set_cycle_state(run_id, today, _raw_json(state))
+    for position, (slot_key, result) in enumerate(done.items()):
+        if type(slot_key) is not str or type(result) is not str:
+            raise FidelityError("cycle ledger key/value must be strings")
+        repo.add_cycle_slot(run_id, today, position, slot_key, result)
+    for position, item in enumerate(overrides):
+        item = _object(item, "manual override")
+        change = _required_string(item, "change", "override change", True)
+        if change.count("->") != 1:
+            raise FidelityError("override change is not a single transition")
+        from_state, to_state = (part.strip() for part in change.split("->", 1))
+        if not from_state or not to_state:
+            raise FidelityError("override transition is empty")
+        repo.add_manual_override(run_id, position, {
+            "client_id": _required_string(item, "client", "override client", True),
+            "until_at": _required_string(item, "until", "override until", True),
+            "detected_at": _required_string(item, "detected_at", "override detected_at", True),
+            "from_state": from_state,
+            "to_state": to_state,
+            "raw_json": _raw_json(item),
         })
 
 
@@ -346,53 +350,86 @@ def _map_logs(repo, run_id, snapshot):
             offset += len(line)
 
 
+def _validate_ai_item(item):
+    item = _object(item, "AI-fix item")
+    file_name = _required_string(item, "file", "AI filename", True)
+    if not SAFE_AI_FILE.fullmatch(file_name):
+        raise FidelityError("AI-fix filename is unsafe or missing")
+    for field in ("kind", "time", "summary", "model", "answer"):
+        _required_string(item, field, "AI " + field)
+    return item
+
+
 def _map_ai_status(repo, run_id, snapshot):
-    payload = _parse_json(snapshot.value("api/ai_fix/status"), "api/ai_fix/status")
-    if not isinstance(payload, dict):
-        raise FidelityError("AI-fix status is not an object")
+    payload = _object(_parse_json(snapshot.value("api/ai_fix/status"), "api/ai_fix/status"), "api/ai_fix/status")
     position = 0
     for key, status in (("pending", "pending"), ("recent_done", "done"), ("recent_failed", "failed")):
-        for item in _require_list(payload, key):
-            if not isinstance(item, dict):
-                raise FidelityError("AI-fix item is not an object")
-            file_name = item.get("file") or item.get("file_name")
-            if type(file_name) is not str or not SAFE_AI_FILE.fullmatch(file_name):
-                raise FidelityError("AI-fix filename is unsafe or missing")
-            result = item.get("result")
+        items = _required(payload, key)
+        if type(items) is not list:
+            raise FidelityError("AI-fix list is not a list: " + key)
+        for item in items:
+            item = _validate_ai_item(item)
             repo.add_ai_fix_request(run_id, position, {
-                "file_name": file_name,
+                "file_name": item["file"],
                 "lifecycle_status": status,
-                "kind": _text(item.get("kind"), "AI kind", True),
-                "command": _text(item.get("command"), "AI command", True),
-                "user_text": _text(item.get("text"), "AI text", True),
-                "result_json": None if result is None else _raw_json(result),
+                "kind": item["kind"],
+                "command": item.get("command"),
+                "user_text": item.get("text"),
+                "result_json": None if item.get("result") is None else _raw_json(item["result"]),
                 "raw_json": _raw_json(item),
             })
             position += 1
 
 
+def _validate_backup_files(items, field):
+    if type(items) is not list:
+        raise FidelityError("backup " + field + " is not a list")
+    for item in items:
+        item = _object(item, "backup file")
+        _required_string(item, "path", "backup file path", True)
+        _required_string(item, "sha256", "backup file hash", True)
+        if type(_required(item, "size", "backup file size")) is not int:
+            raise FidelityError("backup file size is not an integer")
+
+
 def _map_backups(repo, run_id, snapshot):
-    payload = _parse_json(snapshot.value("api/cycle/backup"), "api/cycle/backup")
-    for position, item in enumerate(_require_list(payload, "backups")):
-        if not isinstance(item, dict):
-            raise FidelityError("backup item is not an object")
-        name = _text(item.get("name"), "backup name")
-        size = item.get("size")
-        if size is not None and type(size) is not int:
+    payload = _object(_parse_json(snapshot.value("api/cycle/backup"), "api/cycle/backup"), "api/cycle/backup")
+    backups = _required(payload, "backups")
+    if type(backups) is not list:
+        raise FidelityError("backups is not a list")
+    for position, item in enumerate(backups):
+        item = _object(item, "backup item")
+        size = _required(item, "size", "backup size")
+        if type(size) is not int:
             raise FidelityError("backup size is not an integer")
+        _validate_backup_files(_required(item, "files"), "files")
+        _validate_backup_files(_required(item, "script_files"), "script_files")
         repo.add_backup(run_id, position, {
-            "name": name,
+            "name": _required_string(item, "name", "backup name", True),
             "size": size,
-            "mtime": _text(item.get("mtime"), "backup mtime", True),
-            "label": _text(item.get("label"), "backup label", True),
-            "created_at": _text(item.get("created_at"), "backup created_at", True),
+            "mtime": _required_string(item, "mtime", "backup mtime", True),
+            "label": _required_string(item, "label", "backup label"),
+            "created_at": _required_string(item, "created_at", "backup created_at", True),
             "raw_json": _raw_json(item),
         })
 
 
 def _map_observations(repo, run_id, snapshot):
-    for endpoint in ("api/status", "api/sync_status"):
-        payload = _parse_json(snapshot.value(endpoint), endpoint)
+    status = _object(_parse_json(snapshot.value("api/status"), "api/status"), "api/status")
+    if type(_required(status, "clients")) is not int:
+        raise FidelityError("status clients is not an integer")
+    _required_string(status, "lastUpdated", "status lastUpdated", True)
+    _required_string(status, "time", "status time", True)
+    sync = _object(_parse_json(snapshot.value("api/sync_status"), "api/sync_status"), "api/sync_status")
+    if type(_required(sync, "continuous_running")) is not bool:
+        raise FidelityError("sync continuous_running is not boolean")
+    pid = _required(sync, "continuous_pid")
+    if pid is not None and type(pid) is not int:
+        raise FidelityError("sync continuous_pid is not an integer or null")
+    for field in ("interval_sec", "status_interval_sec"):
+        if type(_required(sync, field)) is not int:
+            raise FidelityError("sync field is not an integer: " + field)
+    for endpoint, payload in (("api/status", status), ("api/sync_status", sync)):
         repo.add_observation(run_id, endpoint, _raw_json(payload))
 
 
@@ -406,6 +443,14 @@ def _source_hash(snapshot):
 
 def _canonical_payload(endpoint, body):
     return _canonical_bytes(endpoint, body)
+
+
+def _same_projection(endpoint, actual, expected):
+    return _canonical_payload(endpoint, _json_bytes(actual)) == _canonical_payload(endpoint, _json_bytes(expected))
+
+
+def _raw_rows(repository, query, args):
+    return [json.loads(row[0]) for row in repository.rows(query, args)]
 
 
 def shadow_verify(repository, run_id, snapshot):
@@ -425,53 +470,104 @@ def shadow_verify(repository, run_id, snapshot):
         expected = snapshot.value(endpoint)
         if raw_hash != expected.raw_sha256 or canonical_hash != expected.canonical_sha256:
             mismatches.append("source hash mismatch: " + endpoint)
-    master_clients = [json.loads(row[0]) for row in repository.rows(
-        "SELECT raw_json FROM master_clients WHERE run_id=? ORDER BY position", (run_id,)
-    )]
-    master_schedule = [json.loads(row[0]) for row in repository.rows(
-        "SELECT raw_json FROM schedule_slots WHERE run_id=? ORDER BY position", (run_id,)
-    )]
+
     master_source = _parse_json(snapshot.value("api/master"), "api/master")
-    checks["master_order_and_projection"] = (
-        _canonical_payload("api/master", _json_bytes({"clients": master_clients, "schedule": master_schedule}))
-        == _canonical_payload("api/master", _json_bytes({"clients": master_source["clients"], "schedule": master_source["schedule"]}))
+    master_actual = {
+        "clients": _raw_rows(repository, "SELECT raw_json FROM master_clients WHERE run_id=? ORDER BY position", (run_id,)),
+        "schedule": _raw_rows(repository, "SELECT raw_json FROM schedule_slots WHERE run_id=? ORDER BY position", (run_id,)),
+    }
+    checks["master_order_and_projection"] = _same_projection(
+        "api/master", master_actual,
+        {"clients": master_source["clients"], "schedule": master_source["schedule"]},
     )
     if not checks["master_order_and_projection"]:
         mismatches.append("master order/projection mismatch")
-    db_clients = [json.loads(row[0]) for row in repository.rows(
-        "SELECT raw_json FROM database_clients WHERE run_id=? ORDER BY position", (run_id,)
-    )]
-    db_schedule = [json.loads(row[0]) for row in repository.rows(
-        "SELECT raw_json FROM database_schedule WHERE run_id=? ORDER BY position", (run_id,)
-    )]
+
     db_source = _parse_json(snapshot.value("client_database.json"), "client_database.json")
-    db_projected = {"lastUpdated": repository.rows(
-        "SELECT last_updated FROM database_meta WHERE run_id=?", (run_id,)
-    )[0][0], "clients": db_clients, "schedule": db_schedule}
-    checks["database_order_and_projection"] = (
-        _canonical_payload("client_database.json", _json_bytes(db_projected))
-        == _canonical_payload("client_database.json", _json_bytes({
-            "lastUpdated": db_source.get("lastUpdated"),
-            "clients": db_source["clients"],
-            "schedule": db_source["schedule"],
-        }))
+    db_actual = {
+        "lastUpdated": repository.rows("SELECT last_updated FROM database_meta WHERE run_id=?", (run_id,))[0][0],
+        "clients": _raw_rows(repository, "SELECT raw_json FROM database_clients WHERE run_id=? ORDER BY position", (run_id,)),
+        "schedule": _raw_rows(repository, "SELECT raw_json FROM database_schedule WHERE run_id=? ORDER BY position", (run_id,)),
+    }
+    checks["database_order_and_projection"] = _same_projection(
+        "client_database.json", db_actual,
+        {"lastUpdated": db_source["lastUpdated"], "clients": db_source["clients"], "schedule": db_source["schedule"]},
     )
     if not checks["database_order_and_projection"]:
         mismatches.append("database order/projection mismatch")
+
     settings_source = _parse_json(snapshot.value("api/settings"), "api/settings")
     settings_row = repository.rows(
         "SELECT tunnel_port, auto_restart_tunnel, auto_telegram, auto_open_browser FROM public_settings WHERE run_id=?",
         (run_id,),
     )[0]
-    settings_projected = {
+    settings_actual = {
         key: value for key, value in zip(PUBLIC_SETTINGS_FIELDS, settings_row) if value is not None
     }
     for key in ("auto_restart_tunnel", "auto_telegram", "auto_open_browser"):
-        if key in settings_projected:
-            settings_projected[key] = bool(settings_projected[key])
-    checks["settings_redacted_projection"] = settings_projected == settings_source
+        if key in settings_actual:
+            settings_actual[key] = bool(settings_actual[key])
+    checks["settings_redacted_projection"] = settings_actual == settings_source
     if not checks["settings_redacted_projection"]:
         mismatches.append("settings public projection mismatch")
+
+    cycle_source = _parse_json(snapshot.value("api/cycle/status"), "api/cycle/status")
+    state_row = repository.rows("SELECT today, state_json FROM cycle_state WHERE run_id=?", (run_id,))[0]
+    checks["cycle_state_projection"] = (
+        state_row[0] == cycle_source["state"]["today"]
+        and _same_projection("api/cycle/status", json.loads(state_row[1]), cycle_source["state"])
+    )
+    if not checks["cycle_state_projection"]:
+        mismatches.append("cycle state projection mismatch")
+    actual_slots = repository.rows(
+        "SELECT slot_key, result FROM cycle_slot_state WHERE run_id=? ORDER BY position", (run_id,)
+    )
+    expected_slots = list(cycle_source["state"]["done"].items())
+    checks["cycle_slot_ledger"] = actual_slots == expected_slots
+    if not checks["cycle_slot_ledger"]:
+        mismatches.append("cycle slot ledger mismatch")
+    checks["manual_overrides"] = _raw_rows(
+        repository,
+        "SELECT raw_json FROM manual_overrides WHERE run_id=? ORDER BY position",
+        (run_id,),
+    ) == cycle_source["manual_overrides"]
+    if not checks["manual_overrides"]:
+        mismatches.append("manual overrides mismatch")
+
+    ai_source = _parse_json(snapshot.value("api/ai_fix/status"), "api/ai_fix/status")
+    ai_ok = True
+    for key, status in (("pending", "pending"), ("recent_done", "done"), ("recent_failed", "failed")):
+        actual = _raw_rows(
+            repository,
+            "SELECT raw_json FROM ai_fix_requests WHERE run_id=? AND lifecycle_status=? ORDER BY position",
+            (run_id, status),
+        )
+        if actual != ai_source[key]:
+            ai_ok = False
+    checks["ai_fix_rows_and_order"] = ai_ok
+    if not ai_ok:
+        mismatches.append("AI-fix rows/order mismatch")
+
+    backup_source = _parse_json(snapshot.value("api/cycle/backup"), "api/cycle/backup")
+    checks["backup_metadata_and_order"] = _raw_rows(
+        repository,
+        "SELECT raw_json FROM backup_metadata WHERE run_id=? ORDER BY position",
+        (run_id,),
+    ) == backup_source["backups"]
+    if not checks["backup_metadata_and_order"]:
+        mismatches.append("backup metadata/order mismatch")
+
+    for endpoint in ("api/status", "api/sync_status"):
+        actual = repository.rows(
+            "SELECT payload_json FROM source_observations WHERE run_id=? AND endpoint=?",
+            (run_id, endpoint),
+        )[0][0]
+        checks[endpoint + "_observation"] = _same_projection(
+            endpoint, json.loads(actual), _parse_json(snapshot.value(endpoint), endpoint)
+        )
+        if not checks[endpoint + "_observation"]:
+            mismatches.append(endpoint + " observation mismatch")
+
     for endpoint, stream in LOG_STREAMS.items():
         rows = repository.rows(
             "SELECT raw_line FROM audit_events WHERE run_id=? AND stream=? ORDER BY stream_seq",

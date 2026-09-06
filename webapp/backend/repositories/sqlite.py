@@ -3,7 +3,6 @@ from contextlib import contextmanager
 import hashlib
 from pathlib import Path
 import sqlite3
-from urllib.parse import quote
 
 
 SCHEMA_VERSION = 2
@@ -244,6 +243,12 @@ class SQLiteCandidateRepository:
             raise
 
     def close(self):
+        try:
+            query_only = self.connection.execute("PRAGMA query_only").fetchone()[0]
+            if not query_only:
+                self.connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        except sqlite3.Error:
+            pass
         self.connection.close()
 
     def begin_import(self, run_id, snapshot_id, source_hash, started_at):

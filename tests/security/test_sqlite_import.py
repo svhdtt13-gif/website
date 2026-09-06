@@ -120,7 +120,7 @@ class SQLiteImportTests(unittest.TestCase):
         source = FakeSource(fixture_values())
         snapshot = capture_stable_snapshot(source)
         self.assertEqual(tuple(snapshot.values), SOURCE_ORDER)
-        self.assertEqual(source.calls[:len(SOURCE_ORDER)], SOURCE_ORDER)
+        self.assertEqual(tuple(source.calls[:len(SOURCE_ORDER)]), SOURCE_ORDER)
         self.assertEqual(len(source.calls), len(SOURCE_ORDER) * 2)
 
     def test_unstable_snapshot_fails_closed(self):
@@ -135,13 +135,14 @@ class SQLiteImportTests(unittest.TestCase):
             receipt = import_candidate(snapshot, candidate)
             self.assertEqual(receipt.status, "verified")
             self.assertTrue(receipt.checks["ok"])
-            self.assertTrue(receipt.checks["master_order_and_projection"])
-            self.assertTrue(receipt.checks["database_order_and_projection"])
-            self.assertTrue(receipt.checks["settings_redacted_projection"])
-            self.assertTrue(receipt.checks["activity_raw_bytes"])
-            self.assertTrue(receipt.checks["change_raw_bytes"])
-            self.assertTrue(receipt.checks["action_raw_bytes"])
-            self.assertTrue(receipt.checks["no_settings_secret_columns"])
+            checks = receipt.checks["checks"]
+            self.assertTrue(checks["master_order_and_projection"])
+            self.assertTrue(checks["database_order_and_projection"])
+            self.assertTrue(checks["settings_redacted_projection"])
+            self.assertTrue(checks["activity_raw_bytes"])
+            self.assertTrue(checks["change_raw_bytes"])
+            self.assertTrue(checks["action_raw_bytes"])
+            self.assertTrue(checks["no_settings_secret_columns"])
 
             connection = sqlite3.connect(str(candidate))
             self.assertEqual(connection.execute("PRAGMA journal_mode").fetchone()[0].lower(), "wal")

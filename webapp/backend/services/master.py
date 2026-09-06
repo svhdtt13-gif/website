@@ -210,11 +210,18 @@ def update_master_names(body, content_type="application/json", before_upstream_w
             ensure_ascii=False,
             separators=(",", ":"),
         ).encode("utf-8")
+        expected_observation = {
+            "endpoint": "api/master",
+            "changes": [
+                {"client": client_id, "name": name}
+                for client_id, _expected_name, name in changes
+            ],
+        }
         try:
             if before_upstream_write is None:
                 result = ai_tool.post("api/master", canonical, "application/json")
                 return _validate_success(*result)
-            with before_upstream_write():
+            with before_upstream_write(expected_observation):
                 result = ai_tool.post("api/master", canonical, "application/json")
                 return _validate_success(*result)
         except UpstreamError as error:

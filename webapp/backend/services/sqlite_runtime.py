@@ -16,7 +16,6 @@ from repositories.sqlite import SCHEMA_CHECKSUM, SCHEMA_VERSION, SQLiteCandidate
 from services import settings as settings_service
 from services.sqlite_import import (
     AiToolHttpSource,
-    JSON_ENDPOINTS,
     PUBLIC_SETTINGS_FIELDS,
     SourceAcquisitionError,
     SourceValue,
@@ -394,7 +393,7 @@ class SQLiteRuntimeCoordinator:
         try:
             with repository.transaction():
                 master = json.loads(snapshot.value("api/master").body.decode("utf-8"))
-                if not isinstance(master.get("meta"), dict):
+                if not isinstance(master, dict) or not isinstance(master.get("meta"), dict):
                     raise RuntimeStateError("master meta is not an object")
                 repository.set_master_meta(run_id, _json_text(master["meta"]))
                 for route, endpoint in (
@@ -557,68 +556,77 @@ class SQLiteRuntimeCoordinator:
         if group not in GROUPS or not self.configured_enabled(group):
             return False
         self.runtime_dir.mkdir(parents=True, exist_ok=True)
-        staging = None
-        with self._mutex.hold():
-            state = self._load_state()
-            if not force and self._eligible(state, group):
-                return True
-            generation_id = uuid.uuid4().hex
-            staging = self.runtime_dir / (generation_id + ".sqlite3.staging")
-            final = self.runtime_dir / (generation_id + ".sqlite3")
-            deadline = self._clock() + self.refresh_timeout_seconds
-            try:
-                if self._source_factory is None:
-                    source = _BoundedAiToolHttpSource(deadline, self._clock)
+        try:
+            with self._mutex.hold():
+                return self._refresh_locked(group, force)
+        except (OSError, TimeoutError):
+            # A lock failure cannot publish or serve a candidate.
+            return False
+
+    def _refresh_locked(self, group, force):
+        state = self._load_state()
+        if not force and self._eligible(state, group):
+            return True
+        generation_id = uuid.uuid4().hex
+        staging = self.runtime_dir / (generation_id + ".sqlite3.staging")
+        final = self.runtime_dir / (generation_id + ".sqlite3")
+        deadline = self._clock() + self.refresh_timeout_seconds
+        try:
+            if self._source_factory is None:
+                source = _BoundedAiToolHttpSource(deadline, self._clock)
+            else:
+                source = _DeadlineSource(
+                    self._source_factory(), deadline, self._clock
+                )
+            snapshot = capture_stable_snapshot(source, max_passes=3)
+            if self._clock() > deadline:
+                raise SourceAcquisitionError("refresh timeout")
+            receipt = self._importer(snapshot, staging)
+            if receipt.status != "verified" or not receipt.checks.get("ok"):
+                raise RuntimeStateError("candidate verification failed")
+            self._normalize_and_verify(staging, receipt.run_id, snapshot)
+            if self._clock() > deadline:
+                raise SourceAcquisitionError("refresh timeout")
+            os.replace(staging, final)
+            completed_at = _utc_now()
+            current = {
+                "generation_id": generation_id,
+                "run_id": receipt.run_id,
+                "candidate_path": str(final),
+                "receipt_id": receipt.run_id,
+                "snapshot_id": receipt.snapshot_id,
+                "source_hash": receipt.source_hash,
+                "schema_version": SCHEMA_VERSION,
+                "schema_checksum": SCHEMA_CHECKSUM,
+                "status": "verified",
+                "captured_at": snapshot.captured_at,
+                "completed_at": completed_at,
+            }
+            state["current"] = current
+            for target in GROUPS:
+                old = state["groups"].get(target, {})
+                if (
+                    target == group
+                    or old.get("eligible")
+                    or (self.configured_enabled(target) and target not in state["fences"])
+                ):
+                    state["groups"][target] = {
+                        "eligible": True,
+                        "generation_id": generation_id,
+                        "reason": "verified",
+                        "updated_at": completed_at,
+                    }
                 else:
-                    source = _DeadlineSource(
-                        self._source_factory(), deadline, self._clock
-                    )
-                snapshot = capture_stable_snapshot(source, max_passes=3)
-                if self._clock() > deadline:
-                    raise SourceAcquisitionError("refresh timeout")
-                receipt = self._importer(snapshot, staging)
-                if receipt.status != "verified" or not receipt.checks.get("ok"):
-                    raise RuntimeStateError("candidate verification failed")
-                self._normalize_and_verify(staging, receipt.run_id, snapshot)
-                if self._clock() > deadline:
-                    raise SourceAcquisitionError("refresh timeout")
-                os.replace(staging, final)
-                completed_at = _utc_now()
-                current = {
-                    "generation_id": generation_id,
-                    "run_id": receipt.run_id,
-                    "candidate_path": str(final),
-                    "receipt_id": receipt.run_id,
-                    "snapshot_id": receipt.snapshot_id,
-                    "source_hash": receipt.source_hash,
-                    "schema_version": SCHEMA_VERSION,
-                    "schema_checksum": SCHEMA_CHECKSUM,
-                    "status": "verified",
-                    "captured_at": snapshot.captured_at,
-                    "completed_at": completed_at,
-                }
-                state["current"] = current
-                for target in GROUPS:
-                    old = state["groups"].get(target, {})
-                    if target == group or old.get("eligible"):
-                        state["groups"][target] = {
-                            "eligible": True,
-                            "generation_id": generation_id,
-                            "reason": "verified",
-                            "updated_at": completed_at,
-                        }
-                    else:
-                        state["groups"][target]["generation_id"] = generation_id
-                state["fences"].pop(group, None)
-                _atomic_json(self.state_path, state)
-                return True
-            except Exception:
-                if staging is not None:
-                    _remove_candidate(staging)
-                state = self._load_state()
-                self._mark_ineligible_locked(state, group, "refresh_failed")
-                _atomic_json(self.state_path, state)
-                return False
+                    state["groups"][target]["generation_id"] = generation_id
+            state["fences"].pop(group, None)
+            _atomic_json(self.state_path, state)
+            return True
+        except Exception:
+            _remove_candidate(staging)
+            state = self._load_state()
+            self._mark_ineligible_locked(state, group, "refresh_failed")
+            _atomic_json(self.state_path, state)
+            return False
 
     def state(self):
         """Return redacted runtime state for tests/diagnostics, never source data."""

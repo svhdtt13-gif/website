@@ -309,7 +309,7 @@ class SQLiteCandidateRepository:
 
     def add_cycle_slot(self, run_id, today, position, slot_key, result):
         self.connection.execute(
-            "INSERT INTO cycle_slot_state(run_id, today, position, slot_key, result) VALUES (?, ?, ?, ?, ?)"",
+            "INSERT INTO cycle_slot_state(run_id, today, position, slot_key, result) VALUES (?, ?, ?, ?, ?)",
             (run_id, today, position, slot_key, result),
         )
 

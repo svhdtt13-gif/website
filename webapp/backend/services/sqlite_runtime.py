@@ -890,6 +890,11 @@ class SQLiteRuntimeCoordinator:
                         lease_released = True
                         _atomic_json(self.state_path, state)
                         result = True
+            if lease_owned:
+                self._stop_lease_heartbeat(lease_stop, heartbeat)
+                lease_released = self._release_refresh_lease(lease_token)
+                if lease_released:
+                    lease_owned = False
             if requeue_group:
                 self.request_refresh(group)
             if lease_released:

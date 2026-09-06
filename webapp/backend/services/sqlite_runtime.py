@@ -322,6 +322,40 @@ class SQLiteRuntimeCoordinator:
         except RuntimeStateError:
             return False
 
+    def _lease_expiry(self):
+        return (
+            datetime.now(timezone.utc)
+            + timedelta(seconds=max(1.0, self.refresh_timeout_seconds * 2))
+        ).isoformat()
+
+    def _renew_refresh_lease(self, token):
+        try:
+            with self._mutex.hold(timeout_seconds=0):
+                state = self._load_state()
+                lease = state.get("refresh_lease") or {}
+                if lease.get("token") != token:
+                    return False
+                lease["expires_at"] = self._lease_expiry()
+                lease["heartbeat_at"] = _utc_now()
+                state["refresh_lease"] = lease
+                _atomic_json(self.state_path, state)
+                return True
+        except (OSError, TimeoutError):
+            return True
+
+    def _refresh_lease_heartbeat(self, token, stop):
+        interval = max(0.05, min(1.0, self.refresh_timeout_seconds / 3))
+        while not stop.wait(interval):
+            if not self._renew_refresh_lease(token):
+                return
+
+    def _stop_lease_heartbeat(self, stop, heartbeat):
+        if stop is None:
+            return
+        stop.set()
+        if heartbeat is not None and heartbeat is not threading.current_thread():
+            heartbeat.join(1)
+
     def _eligible(self, state, group):
         current = state.get("current")
         group_state = state.get("groups", {}).get(group, {})
@@ -514,12 +548,12 @@ class SQLiteRuntimeCoordinator:
             self.request_refresh(group)
             return fallback()
         try:
-            body, content_type = self._read_generation(state, route)
+            body, status, content_type = self._read_generation(state, route)
         except Exception:
             self._mark_ineligible(group, "candidate_read_failed", timeout_seconds=0)
             self.request_refresh(group)
             return fallback()
-        return body, 200, content_type
+        return body, status, content_type
 
     @staticmethod
     def _fence_observed(fence, snapshot):
@@ -667,6 +701,11 @@ class SQLiteRuntimeCoordinator:
             _remove_candidate(staging)
             raise
 
+    def _finish_timed_out_build(self, token, stop, heartbeat, staging, future):
+        self._stop_lease_heartbeat(stop, heartbeat)
+        _remove_candidate(staging)
+        self._release_refresh_lease(token)
+
     def refresh_now(self, group, force=False):
         """Build outside the mutex and atomically publish only within the deadline."""
         if group not in GROUPS or not self.configured_enabled(group):
@@ -678,6 +717,8 @@ class SQLiteRuntimeCoordinator:
         final = self.runtime_dir / (generation_id + ".sqlite3")
         published = False
         lease_token = None
+        lease_stop = None
+        heartbeat = None
         lease_release_deferred = False
         initial_generation_id = None
         initial_fence_token = None
@@ -697,13 +738,20 @@ class SQLiteRuntimeCoordinator:
                 lease_token = uuid.uuid4().hex
                 state["refresh_lease"] = {
                     "token": lease_token,
+                    "owner_pid": os.getpid(),
                     "started_at": _utc_now(),
-                    "expires_at": (
-                        datetime.now(timezone.utc)
-                        + timedelta(seconds=max(1.0, self.refresh_timeout_seconds * 2))
-                    ).isoformat(),
+                    "heartbeat_at": _utc_now(),
+                    "expires_at": self._lease_expiry(),
                 }
                 _atomic_json(self.state_path, state)
+            lease_stop = threading.Event()
+            heartbeat = threading.Thread(
+                target=self._refresh_lease_heartbeat,
+                args=(lease_token, lease_stop),
+                name="sqlite-refresh-lease",
+                daemon=True,
+            )
+            heartbeat.start()
 
             executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="sqlite-build")
             future = executor.submit(self._build_candidate, group, staging, deadline)
@@ -715,9 +763,8 @@ class SQLiteRuntimeCoordinator:
             except FutureTimeoutError as error:
                 lease_release_deferred = True
                 future.add_done_callback(
-                    lambda _future: (
-                        _remove_candidate(staging),
-                        self._release_refresh_lease(lease_token),
+                    lambda completed: self._finish_timed_out_build(
+                        lease_token, lease_stop, heartbeat, staging, completed
                     )
                 )
                 raise SourceAcquisitionError("refresh timeout") from error
@@ -725,6 +772,7 @@ class SQLiteRuntimeCoordinator:
                 executor.shutdown(wait=False, cancel_futures=True)
             if self._clock() > deadline:
                 raise SourceAcquisitionError("refresh timeout")
+            self._stop_lease_heartbeat(lease_stop, heartbeat)
 
             remaining = deadline - self._clock()
             if remaining <= 0:
@@ -799,6 +847,7 @@ class SQLiteRuntimeCoordinator:
             _remove_candidate(staging)
             if published:
                 _remove_candidate(final)
+            self._stop_lease_heartbeat(lease_stop, heartbeat)
             if lease_token and not lease_release_deferred:
                 self._release_refresh_lease(lease_token)
             self._mark_ineligible(group, "refresh_failed", timeout_seconds=0)

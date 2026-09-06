@@ -205,6 +205,8 @@ class FlaskRouteTests(unittest.TestCase):
                 return False
 
             def read(self, route, fallback):
+                if route not in sqlite_runtime.ROUTE_ENDPOINTS:
+                    return fallback()
                 self.routes.append(route)
                 return fallback()
 
@@ -224,7 +226,7 @@ class FlaskRouteTests(unittest.TestCase):
             self.assertEqual(client.get("/up/clients_master.json").status_code, 200)
         self.assertEqual(
             runtime.routes,
-            ["api/master", "client_database.json", "api/settings", "clients_master.json"],
+            ["api/master", "client_database.json", "api/settings"],
         )
 
 

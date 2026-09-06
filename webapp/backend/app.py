@@ -100,6 +100,9 @@ def create_app(runtime=None):
         mutex_name=config.SQLITE_MUTEX_NAME,
     )
     app.extensions["sqlite_runtime"] = sqlite
+    startup_refresh = getattr(sqlite, "startup_refresh", None)
+    if startup_refresh is not None:
+        startup_refresh()
 
     @app.route("/")
     def index():
@@ -197,9 +200,7 @@ def create_app(runtime=None):
                 # Allowlist co path chua co service: chan thay vi forward truc tiep.
                 return jsonify({"error": "read-only proxy: endpoint not allowed"}), 403
             try:
-                body, status, ctype = sqlite.read(
-                    subpath, handler
-                )
+                body, status, ctype = sqlite.read(subpath, handler)
             except UpstreamError as e:
                 return Response(e.body, status=e.status, content_type="application/json")
             return Response(body, status=status, content_type=ctype)
@@ -215,20 +216,24 @@ def create_app(runtime=None):
                 return jsonify({"error": "read-only proxy: endpoint not allowed"}), 403
             try:
                 if subpath == "api/master":
-                    body, status, ctype = handler(
-                        request.get_data(),
-                        request.content_type,
-                        before_upstream_write=lambda: sqlite.write_fence(
+                    before_write = None
+                    if sqlite.configured_enabled(sqlite_runtime.GROUP_MASTER_DATABASE):
+                        before_write = lambda: sqlite.write_fence(
                             sqlite_runtime.GROUP_MASTER_DATABASE
-                        ),
+                        )
+                    body, status, ctype = handler(
+                        request.get_data(), request.content_type,
+                        before_upstream_write=before_write,
                     )
                 elif subpath == "api/settings":
-                    body, status, ctype = handler(
-                        request.get_data(),
-                        request.content_type,
-                        before_upstream_write=lambda: sqlite.write_fence(
+                    before_write = None
+                    if sqlite.configured_enabled(sqlite_runtime.GROUP_PUBLIC_SETTINGS):
+                        before_write = lambda: sqlite.write_fence(
                             sqlite_runtime.GROUP_PUBLIC_SETTINGS
-                        ),
+                        )
+                    body, status, ctype = handler(
+                        request.get_data(), request.content_type,
+                        before_upstream_write=before_write,
                     )
                 else:
                     body, status, ctype = handler(

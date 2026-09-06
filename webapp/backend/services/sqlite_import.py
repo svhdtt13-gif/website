@@ -42,7 +42,10 @@ LOG_STREAMS = {
     "cache/change_log.jsonl": "change",
     "cache/action.log": "action",
 }
-SAFE_AI_FILE = re.compile(r"^ai_fix_(?:cycle|web|userimport)_\d{8}_\d{6}\.json$")
+SAFE_AI_FILE = re.compile(
+    r"^ai_fix_(?:cycle|web|userimport)_\d{8}_\d{6}"
+    r"(?:\.(?:processing|done|failed))?\.json$"
+)
 VOLATILE_FIELDS = {
     "api/status": frozenset({"time"}),
     "api/cycle/status": frozenset({"checked_at"}),

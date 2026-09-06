@@ -10,7 +10,7 @@ import tempfile
 import threading
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "webapp" / "backend"))
@@ -110,10 +110,18 @@ class SQLiteRuntimeTests(unittest.TestCase):
     def test_checkpoint_failure_never_publishes(self):
         with tempfile.TemporaryDirectory() as directory:
             runtime = enabled_runtime(directory, background_refresh=False)
+
+            def fail_close(repository):
+                try:
+                    raise sqlite3.DatabaseError("checkpoint failed")
+                finally:
+                    repository.connection.close()
+
             with patch.object(
                 SQLiteCandidateRepository,
                 "close",
-                side_effect=sqlite3.DatabaseError("checkpoint failed"),
+                autospec=True,
+                side_effect=fail_close,
             ):
                 self.assertFalse(runtime.refresh_now(GROUP_MASTER_DATABASE))
             self.assertIsNone(runtime.state()["current"])
@@ -313,7 +321,7 @@ class SQLiteRuntimeTests(unittest.TestCase):
     def test_mutex_timeout_is_fail_closed(self):
         with tempfile.TemporaryDirectory() as directory:
             runtime = enabled_runtime(directory)
-            runtime._mutex.timeout_seconds = 0.05
+            runtime.refresh_timeout_seconds = 0.05
             result = []
             with runtime._mutex.hold():
                 worker = threading.Thread(
@@ -548,15 +556,27 @@ class FlaskRouteTests(unittest.TestCase):
         return RuntimeStub()
 
     def test_sqlite_runtime_is_only_called_for_wave_one_routes(self):
+        import app as app_module
         from app import create_app
 
         runtime = self._runtime_stub()
         app = create_app(runtime=runtime)
         app.testing = True
-        with patch("app.master_service.get_api_master", return_value=(b'{"meta":{},"clients":[],"schedule":[]}', 200, "application/json")), \
-             patch("app.master_service.get_master", return_value=(b'{"clients":[],"schedule":[]}', 200, "application/json")), \
-             patch("app.master_service.get_database", return_value=(b'{"lastUpdated":"x","clients":[],"schedule":[]}', 200, "application/json")), \
-             patch("app.settings_service.get_settings", return_value=(b"{}", 200, "application/json")):
+        with patch.dict(
+            app_module.READ_HANDLERS,
+            {
+                "api/master": Mock(
+                    return_value=(b'{"meta":{},"clients":[],"schedule":[]}', 200, "application/json")
+                ),
+                "clients_master.json": Mock(
+                    return_value=(b'{"clients":[],"schedule":[]}', 200, "application/json")
+                ),
+                "client_database.json": Mock(
+                    return_value=(b'{"lastUpdated":"x","clients":[],"schedule":[]}', 200, "application/json")
+                ),
+                "api/settings": Mock(return_value=(b"{}", 200, "application/json")),
+            },
+        ):
             client = app.test_client()
             expected = {
                 "/up/api/master": b'{"meta":{},"clients":[],"schedule":[]}',
@@ -575,6 +595,7 @@ class FlaskRouteTests(unittest.TestCase):
         )
 
     def test_wave_one_typed_errors_preserve_status_and_json_contract(self):
+        import app as app_module
         from app import create_app
 
         cases = (
@@ -587,9 +608,13 @@ class FlaskRouteTests(unittest.TestCase):
             with self.subTest(route=route):
                 app = create_app(runtime=self._runtime_stub())
                 app.testing = True
-                with patch(
-                    "app." + target,
-                    side_effect=UpstreamError(503, b'{"error":"typed"}'),
+                with patch.dict(
+                    app_module.READ_HANDLERS,
+                    {
+                        route: Mock(
+                            side_effect=UpstreamError(503, b'{"error":"typed"}')
+                        )
+                    },
                 ):
                     response = app.test_client().get("/up/" + route)
                 self.assertEqual(response.status_code, 503)

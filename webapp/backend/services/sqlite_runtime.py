@@ -56,9 +56,10 @@ class NamedGenerationMutex:
             self._fallback = _FALLBACK_LOCKS.setdefault(name, threading.Lock())
 
     @contextmanager
-    def hold(self):
+    def hold(self, timeout_seconds=None):
+        timeout = self.timeout_seconds if timeout_seconds is None else timeout_seconds
         if os.name != "nt":
-            if not self._fallback.acquire(timeout=self.timeout_seconds):
+            if not self._fallback.acquire(timeout=timeout):
                 raise TimeoutError("SQLite generation mutex timeout")
             try:
                 yield
@@ -77,7 +78,7 @@ class NamedGenerationMutex:
             raise OSError(ctypes.get_last_error(), "CreateMutexW failed")
         try:
             result = kernel32.WaitForSingleObject(
-                handle, int(self.timeout_seconds * 1000)
+                handle, max(0, int(timeout * 1000))
             )
             if result not in (0, 0x80):
                 raise TimeoutError("SQLite generation mutex timeout")
@@ -132,11 +133,12 @@ def _atomic_json(path, value):
 
 
 def _remove_candidate(path):
+    """Best-effort cleanup; Windows may keep a timed-out SQLite file open."""
     path = Path(path)
     for candidate in (path, Path(str(path) + "-wal"), Path(str(path) + "-shm")):
         try:
             candidate.unlink()
-        except FileNotFoundError:
+        except OSError:
             pass
 
 
@@ -487,12 +489,12 @@ class SQLiteRuntimeCoordinator:
             self.request_refresh(group)
             return fallback()
         try:
-            body, content_type = self._read_generation(state, route)
+            body, status, content_type = self._read_generation(state, route)
         except Exception:
             self._mark_ineligible(group, "candidate_read_failed")
             self.request_refresh(group)
             return fallback()
-        return body, 200, content_type
+        return body, status, content_type
 
     @staticmethod
     def _fence_observed(fence, snapshot):
@@ -507,18 +509,36 @@ class SQLiteRuntimeCoordinator:
         except (KeyError, UnicodeDecodeError, json.JSONDecodeError):
             return False
         if endpoint == "api/master":
-            clients = {
+            if not isinstance(payload, dict):
+                return False
+            master_clients = {
                 item.get("client"): item.get("name")
                 for item in payload.get("clients", [])
+                if isinstance(item, dict)
+            }
+            try:
+                database = json.loads(
+                    snapshot.value("client_database.json").body.decode("utf-8")
+                )
+            except (KeyError, UnicodeDecodeError, json.JSONDecodeError):
+                return False
+            if not isinstance(database, dict):
+                return False
+            database_clients = {
+                item.get("client"): item.get("name")
+                for item in database.get("clients", [])
                 if isinstance(item, dict)
             }
             changes = expected.get("changes")
             return isinstance(changes, list) and all(
                 isinstance(change, dict)
-                and clients.get(change.get("client")) == change.get("name")
+                and master_clients.get(change.get("client")) == change.get("name")
+                and database_clients.get(change.get("client")) == change.get("name")
                 for change in changes
             )
         if endpoint == "api/settings":
+            if not isinstance(payload, dict):
+                return False
             fields = expected.get("fields")
             return isinstance(fields, dict) and all(
                 payload.get(key) == value for key, value in fields.items()
@@ -635,7 +655,10 @@ class SQLiteRuntimeCoordinator:
         initial_generation_id = None
         initial_fence_token = None
         try:
-            with self._mutex.hold():
+            remaining = deadline - self._clock()
+            if remaining <= 0:
+                raise SourceAcquisitionError("refresh timeout")
+            with self._mutex.hold(timeout_seconds=remaining):
                 state = self._load_state()
                 if not force and self._eligible(state, group):
                     return True
@@ -657,7 +680,12 @@ class SQLiteRuntimeCoordinator:
             if self._clock() > deadline:
                 raise SourceAcquisitionError("refresh timeout")
 
-            with self._mutex.hold():
+            remaining = deadline - self._clock()
+            if remaining <= 0:
+                raise SourceAcquisitionError("refresh timeout")
+            with self._mutex.hold(timeout_seconds=remaining):
+                if self._clock() > deadline:
+                    raise SourceAcquisitionError("refresh timeout")
                 state = self._load_state()
                 current_generation_id = (state.get("current") or {}).get("generation_id")
                 current_fence_token = (state.get("fences", {}).get(group) or {}).get("token")

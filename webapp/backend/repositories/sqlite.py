@@ -66,7 +66,7 @@ CREATE TABLE IF NOT EXISTS schedule_slots (
 
 CREATE TABLE IF NOT EXISTS database_meta (
     run_id TEXT PRIMARY KEY REFERENCES import_runs(run_id),
-    last_updated TEXT
+    last_updated TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS database_clients (
@@ -74,13 +74,14 @@ CREATE TABLE IF NOT EXISTS database_clients (
     position INTEGER NOT NULL,
     remote_idx INTEGER NOT NULL,
     client_id TEXT NOT NULL,
-    display_name TEXT,
-    status TEXT,
-    group_name TEXT,
-    selected INTEGER CHECK (selected IN (0, 1)),
+    display_name TEXT NOT NULL,
+    status TEXT NOT NULL,
+    group_name TEXT NOT NULL,
+    selected INTEGER NOT NULL CHECK (selected IN (0, 1)),
     raw_json TEXT NOT NULL,
     PRIMARY KEY (run_id, position),
-    UNIQUE (run_id, client_id)
+    UNIQUE (run_id, client_id),
+    FOREIGN KEY (run_id, client_id) REFERENCES master_clients(run_id, client_id)
 );
 
 CREATE TABLE IF NOT EXISTS database_schedule (
@@ -101,26 +102,31 @@ CREATE TABLE IF NOT EXISTS public_settings (
 
 CREATE TABLE IF NOT EXISTS cycle_state (
     run_id TEXT PRIMARY KEY REFERENCES import_runs(run_id),
-    today TEXT,
+    today TEXT NOT NULL,
     state_json TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS cycle_slot_state (
     run_id TEXT NOT NULL REFERENCES import_runs(run_id),
     today TEXT NOT NULL,
+    position INTEGER NOT NULL,
     slot_key TEXT NOT NULL,
     result TEXT NOT NULL,
-    PRIMARY KEY (run_id, today, slot_key)
+    PRIMARY KEY (run_id, today, slot_key),
+    UNIQUE (run_id, today, position)
 );
 
 CREATE TABLE IF NOT EXISTS manual_overrides (
     run_id TEXT NOT NULL REFERENCES import_runs(run_id),
+    position INTEGER NOT NULL,
     client_id TEXT NOT NULL,
     until_at TEXT NOT NULL,
-    detected_at TEXT,
-    from_state TEXT,
-    to_state TEXT,
-    PRIMARY KEY (run_id, client_id)
+    detected_at TEXT NOT NULL,
+    from_state TEXT NOT NULL,
+    to_state TEXT NOT NULL,
+    raw_json TEXT NOT NULL,
+    PRIMARY KEY (run_id, client_id),
+    UNIQUE (run_id, position)
 );
 
 CREATE TABLE IF NOT EXISTS audit_events (
@@ -138,7 +144,7 @@ CREATE TABLE IF NOT EXISTS ai_fix_requests (
     position INTEGER NOT NULL,
     file_name TEXT NOT NULL,
     lifecycle_status TEXT NOT NULL,
-    kind TEXT,
+    kind TEXT NOT NULL,
     command TEXT,
     user_text TEXT,
     result_json TEXT,
@@ -151,10 +157,10 @@ CREATE TABLE IF NOT EXISTS backup_metadata (
     run_id TEXT NOT NULL REFERENCES import_runs(run_id),
     position INTEGER NOT NULL,
     name TEXT NOT NULL,
-    size INTEGER,
-    mtime TEXT,
-    label TEXT,
-    created_at TEXT,
+    size INTEGER NOT NULL,
+    mtime TEXT NOT NULL,
+    label TEXT NOT NULL,
+    created_at TEXT NOT NULL,
     raw_json TEXT NOT NULL,
     PRIMARY KEY (run_id, position),
     UNIQUE (run_id, name)
@@ -272,10 +278,8 @@ class SQLiteCandidateRepository:
              group_name, selected, raw_json)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (run_id, position, client["remote_idx"], client["client_id"],
-             client.get("display_name"), client.get("status"),
-             client.get("group_name"),
-             None if client.get("selected") is None else int(client["selected"]),
-             client["raw_json"]),
+             client["display_name"], client["status"], client["group_name"],
+             int(client["selected"]), client["raw_json"]),
         )
 
     def add_database_schedule(self, run_id, position, raw_json):
@@ -293,7 +297,7 @@ class SQLiteCandidateRepository:
             (run_id, settings.get("tunnel_port"),
              None if settings.get("auto_restart_tunnel") is None else int(settings["auto_restart_tunnel"]),
              None if settings.get("auto_telegram") is None else int(settings["auto_telegram"]),
-             None if settings.get("auto_open_browser") is None else int(settings["auto_open_browser"]),
+             None if settings.get("auto_telegram") is None else int(settings["auto_open_browser"]),
              observed_at),
         )
 
@@ -303,20 +307,20 @@ class SQLiteCandidateRepository:
             (run_id, today, state_json),
         )
 
-    def add_cycle_slot(self, run_id, today, slot_key, result):
+    def add_cycle_slot(self, run_id, today, position, slot_key, result):
         self.connection.execute(
-            "INSERT INTO cycle_slot_state(run_id, today, slot_key, result) VALUES (?, ?, ?, ?)",
-            (run_id, today, slot_key, result),
+            "INSERT INTO cycle_slot_state(run_id, today, position, slot_key, result) VALUES (?, ?, ?, ?, ?)",
+            (run_id, today, position, slot_key, result),
         )
 
-    def add_manual_override(self, run_id, override):
+    def add_manual_override(self, run_id, position, override):
         self.connection.execute(
             """INSERT INTO manual_overrides
-            (run_id, client_id, until_at, detected_at, from_state, to_state)
-            VALUES (?, ?, ?, ?, ?, ?)""",
-            (run_id, override["client_id"], override["until_at"],
-             override.get("detected_at"), override.get("from_state"),
-             override.get("to_state")),
+            (run_id, position, client_id, until_at, detected_at, from_state, to_state, raw_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (run_id, position, override["client_id"], override["until_at"],
+             override["detected_at"], override["from_state"],
+             override["to_state"], override["raw_json"]),
         )
 
     def add_audit_event(self, run_id, event):
@@ -335,7 +339,7 @@ class SQLiteCandidateRepository:
              user_text, result_json, raw_json)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (run_id, position, item["file_name"], item["lifecycle_status"],
-             item.get("kind"), item.get("command"), item.get("user_text"),
+             item["kind"], item.get("command"), item.get("user_text"),
              item.get("result_json"), item["raw_json"]),
         )
 
@@ -344,8 +348,8 @@ class SQLiteCandidateRepository:
             """INSERT INTO backup_metadata
             (run_id, position, name, size, mtime, label, created_at, raw_json)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-            (run_id, position, backup["name"], backup.get("size"),
-             backup.get("mtime"), backup.get("label"), backup.get("created_at"),
+            (run_id, position, backup["name"], backup["size"],
+             backup["mtime"], backup["label"], backup["created_at"],
              backup["raw_json"]),
         )
 

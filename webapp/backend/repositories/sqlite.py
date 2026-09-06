@@ -192,7 +192,7 @@ class SQLiteCandidateRepository:
     def _connect(path, read_only=False):
         candidate = Path(path).resolve()
         if read_only:
-            uri = candidate.as_uri() + "?mode=ro"
+            uri = candidate.as_uri() + "?mode=ro&immutable=1"
             connection = sqlite3.connect(uri, uri=True)
         else:
             connection = sqlite3.connect(str(candidate))
@@ -339,7 +339,7 @@ class SQLiteCandidateRepository:
 
     def add_cycle_slot(self, run_id, today, position, slot_key, result):
         self.connection.execute(
-            "INSERT INTO cycle_slot_state(run_id, today, position, slot_key, result) VALUES (?, ?, ?, ?, ?)" ,
+            "INSERT INTO cycle_slot_state(run_id, today, position, slot_key, result) VALUES (?, ?, ?, ?, ?)",
             (run_id, today, position, slot_key, result),
         )
 

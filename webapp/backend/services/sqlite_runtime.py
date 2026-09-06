@@ -1,4 +1,4 @@
-"""Guarded SQLite generation publication, reads, refresh, and write fencing."""
+"""Guarded SQLite generation publication, normalized reads, and write fencing."""
 from contextlib import contextmanager
 from datetime import datetime, timezone
 import ctypes
@@ -11,12 +11,19 @@ import threading
 import time
 import uuid
 
-from repositories.aitool import UpstreamError
+from repositories.aitool import UpstreamError, ai_tool
 from repositories.sqlite import SCHEMA_CHECKSUM, SCHEMA_VERSION, SQLiteCandidateRepository
+from services import settings as settings_service
 from services.sqlite_import import (
     AiToolHttpSource,
+    JSON_ENDPOINTS,
+    PUBLIC_SETTINGS_FIELDS,
     SourceAcquisitionError,
+    SourceValue,
     _canonical_bytes,
+    _json_bytes,
+    _sha256,
+    _validate_public_settings,
     capture_stable_snapshot,
     import_candidate,
 )
@@ -29,7 +36,7 @@ ROUTE_ENDPOINTS = {
     "client_database.json": (GROUP_MASTER_DATABASE, "client_database.json"),
     "api/settings": (GROUP_PUBLIC_SETTINGS, "api/settings"),
 }
-MUTEX_NAME = r"Local\WebsiteSQLiteGenerationMutex"
+MUTEX_NAME = "Local\\WebsiteSQLiteGenerationMutex"
 
 _FALLBACK_LOCKS = {}
 _FALLBACK_LOCKS_GUARD = threading.Lock()
@@ -40,7 +47,7 @@ class RuntimeStateError(RuntimeError):
 
 
 class NamedGenerationMutex:
-    """Explicit cross-process mutex; POSIX fallback is only for unit tests."""
+    """Explicit Windows cross-process mutex; POSIX fallback is test-only."""
 
     def __init__(self, name=MUTEX_NAME, timeout_seconds=15):
         self.name = name
@@ -140,8 +147,65 @@ def _parse_time(value):
         raise RuntimeStateError("invalid generation timestamp") from error
 
 
+class _TimedRepository:
+    """Give each upstream request only the remaining refresh budget."""
+
+    def __init__(self, deadline, clock):
+        self.deadline = deadline
+        self.clock = clock
+
+    def _remaining(self):
+        remaining = self.deadline - self.clock()
+        if remaining <= 0:
+            raise SourceAcquisitionError("refresh timeout")
+        return remaining
+
+    def get(self, endpoint):
+        return ai_tool.get(endpoint, timeout=self._remaining())
+
+
+class _BoundedAiToolHttpSource(AiToolHttpSource):
+    """Use the real HTTP source with a per-request remaining deadline."""
+
+    def __init__(self, deadline, clock):
+        super().__init__(repository=_TimedRepository(deadline, clock))
+        self.deadline = deadline
+        self.clock = clock
+
+    def _remaining(self):
+        remaining = self.deadline - self.clock()
+        if remaining <= 0:
+            raise SourceAcquisitionError("refresh timeout")
+        return remaining
+
+    def fetch(self, endpoint):
+        if endpoint != "api/settings":
+            return super().fetch(endpoint)
+        try:
+            body, status, content_type = settings_service.get_settings(
+                timeout=self._remaining()
+            )
+        except UpstreamError as error:
+            raise SourceAcquisitionError("public settings unavailable") from error
+        if status != 200 or not isinstance(body, bytes):
+            raise SourceAcquisitionError("settings source returned unexpected response")
+        try:
+            payload = json.loads(body.decode("utf-8"))
+            _validate_public_settings(payload)
+            body = _json_bytes(payload)
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise SourceAcquisitionError("source JSON is invalid") from error
+        return SourceValue(
+            endpoint=endpoint,
+            body=body,
+            content_type=content_type or "",
+            raw_sha256=_sha256(body),
+            canonical_sha256=_sha256(_canonical_bytes(endpoint, body)),
+        )
+
+
 class _DeadlineSource:
-    """Stop starting new HTTP fetches after the coordinator deadline."""
+    """Stop starting new fetches after the coordinator deadline."""
 
     def __init__(self, source, deadline, clock):
         self.source = source
@@ -178,7 +242,7 @@ class SQLiteRuntimeCoordinator:
         self.refresh_timeout_seconds = refresh_timeout_seconds
         self._clock = clock or time.monotonic
         self._mutex = NamedGenerationMutex(mutex_name, refresh_timeout_seconds)
-        self._source_factory = source_factory or (lambda: AiToolHttpSource())
+        self._source_factory = source_factory
         self._importer = importer
         self._background_refresh = background_refresh
         self._refresh_guard = threading.Lock()
@@ -240,10 +304,10 @@ class SQLiteRuntimeCoordinator:
         if group_state.get("generation_id") != current.get("generation_id"):
             return False
         try:
-            completed_at = _parse_time(current.get("completed_at"))
+            captured_at = _parse_time(current.get("captured_at"))
         except RuntimeStateError:
             return False
-        age = (datetime.now(timezone.utc) - completed_at).total_seconds()
+        age = (datetime.now(timezone.utc) - captured_at).total_seconds()
         return 0 <= age <= self.freshness_seconds
 
     def _candidate_for_current(self, state):
@@ -264,10 +328,91 @@ class SQLiteRuntimeCoordinator:
             raise RuntimeStateError("schema version mismatch")
         return current, candidate
 
+    @staticmethod
+    def _rows_json(repository, query, args):
+        return [json.loads(row[0]) for row in repository.rows(query, args)]
+
+    def _normalized_response(self, repository, run_id, route):
+        if route == "api/master":
+            meta = repository.rows(
+                "SELECT raw_json FROM master_meta WHERE run_id=?", (run_id,)
+            )
+            if len(meta) != 1:
+                raise RuntimeStateError("normalized master meta missing")
+            return _json_bytes({
+                "meta": json.loads(meta[0][0]),
+                "clients": self._rows_json(
+                    repository,
+                    "SELECT raw_json FROM master_clients WHERE run_id=? ORDER BY position",
+                    (run_id,),
+                ),
+                "schedule": self._rows_json(
+                    repository,
+                    "SELECT raw_json FROM schedule_slots WHERE run_id=? ORDER BY position",
+                    (run_id,),
+                ),
+            })
+        if route == "client_database.json":
+            meta = repository.rows(
+                "SELECT last_updated FROM database_meta WHERE run_id=?", (run_id,)
+            )
+            if len(meta) != 1:
+                raise RuntimeStateError("normalized database meta missing")
+            return _json_bytes({
+                "lastUpdated": meta[0][0],
+                "clients": self._rows_json(
+                    repository,
+                    "SELECT raw_json FROM database_clients WHERE run_id=? ORDER BY position",
+                    (run_id,),
+                ),
+                "schedule": self._rows_json(
+                    repository,
+                    "SELECT raw_json FROM database_schedule WHERE run_id=? ORDER BY position",
+                    (run_id,),
+                ),
+            })
+        if route == "api/settings":
+            rows = repository.rows(
+                "SELECT tunnel_port, auto_restart_tunnel, auto_telegram, auto_open_browser "
+                "FROM public_settings WHERE run_id=?",
+                (run_id,),
+            )
+            if len(rows) != 1:
+                raise RuntimeStateError("normalized public settings missing")
+            payload = {
+                key: value for key, value in zip(PUBLIC_SETTINGS_FIELDS, rows[0])
+                if value is not None
+            }
+            for key in PUBLIC_SETTINGS_FIELDS[1:]:
+                if key in payload:
+                    payload[key] = bool(payload[key])
+            return _json_bytes(payload)
+        raise RuntimeStateError("route is not SQLite allowlisted")
+
+    def _normalize_and_verify(self, candidate, run_id, snapshot):
+        repository = SQLiteCandidateRepository.open_existing(candidate)
+        try:
+            with repository.transaction():
+                master = json.loads(snapshot.value("api/master").body.decode("utf-8"))
+                if not isinstance(master.get("meta"), dict):
+                    raise RuntimeStateError("master meta is not an object")
+                repository.set_master_meta(run_id, _json_text(master["meta"]))
+                for route, endpoint in (
+                    ("api/master", "api/master"),
+                    ("client_database.json", "client_database.json"),
+                    ("api/settings", "api/settings"),
+                ):
+                    actual = self._normalized_response(repository, run_id, route)
+                    expected = snapshot.value(endpoint).body
+                    if _canonical_bytes(endpoint, actual) != _canonical_bytes(endpoint, expected):
+                        raise RuntimeStateError("normalized route parity failed")
+        finally:
+            repository.close()
+
     def _read_generation(self, state, route):
         _group, endpoint = ROUTE_ENDPOINTS[route]
         current, candidate = self._candidate_for_current(state)
-        repository = SQLiteCandidateRepository.open_existing(candidate)
+        repository = SQLiteCandidateRepository.open_read_only(candidate)
         try:
             schema = repository.rows(
                 "SELECT version, checksum FROM schema_migrations ORDER BY version"
@@ -312,22 +457,19 @@ class SQLiteRuntimeCoordinator:
                 )
             if hashlib.sha256(b"".join(material)).hexdigest() != current.get("source_hash"):
                 raise RuntimeStateError("stored source hash material mismatch")
-            rows = repository.rows(
-                "SELECT content_type, raw_bytes FROM source_snapshots "
-                "WHERE run_id=? AND endpoint=?",
+            body = self._normalized_response(repository, current.get("run_id"), route)
+            content = repository.rows(
+                "SELECT content_type FROM source_snapshots WHERE run_id=? AND endpoint=?",
                 (current.get("run_id"), endpoint),
             )
-            if len(rows) != 1:
-                raise RuntimeStateError("route source snapshot missing")
-            content_type, body = rows[0]
-            if not isinstance(body, (bytes, bytearray, memoryview)):
-                raise RuntimeStateError("route source snapshot is not bytes")
-            return bytes(body), content_type or "application/json"
+            if len(content) != 1:
+                raise RuntimeStateError("route content type missing")
+            return body, content[0][0] or "application/json"
         finally:
             repository.close()
 
     def read(self, route, fallback):
-        """Return a complete SQLite response or invoke the typed HTTP fallback."""
+        """Return a complete normalized SQLite response or invoke HTTP fallback."""
         if route not in ROUTE_ENDPOINTS:
             return fallback()
         group = ROUTE_ENDPOINTS[route][0]
@@ -373,6 +515,15 @@ class SQLiteRuntimeCoordinator:
             # A crash skips this trigger but cannot lose the durable fence.
             self.request_refresh(group)
 
+    def startup_refresh(self):
+        """Schedule refreshes for enabled groups without an eligible generation."""
+        started = []
+        state = self._load_state()
+        for group in GROUPS:
+            if self.configured_enabled(group) and not self._eligible(state, group):
+                started.append((group, self.request_refresh(group)))
+        return started
+
     def request_refresh(self, group):
         if not self.configured_enabled(group) or not self._background_refresh:
             return False
@@ -402,7 +553,7 @@ class SQLiteRuntimeCoordinator:
                 self._refresh_active = False
 
     def refresh_now(self, group, force=False):
-        """Build and publish one verified generation, never a partial candidate."""
+        """Build and publish one verified normalized generation."""
         if group not in GROUPS or not self.configured_enabled(group):
             return False
         self.runtime_dir.mkdir(parents=True, exist_ok=True)
@@ -416,15 +567,19 @@ class SQLiteRuntimeCoordinator:
             final = self.runtime_dir / (generation_id + ".sqlite3")
             deadline = self._clock() + self.refresh_timeout_seconds
             try:
-                source = _DeadlineSource(
-                    self._source_factory(), deadline, self._clock
-                )
+                if self._source_factory is None:
+                    source = _BoundedAiToolHttpSource(deadline, self._clock)
+                else:
+                    source = _DeadlineSource(
+                        self._source_factory(), deadline, self._clock
+                    )
                 snapshot = capture_stable_snapshot(source, max_passes=3)
                 if self._clock() > deadline:
                     raise SourceAcquisitionError("refresh timeout")
                 receipt = self._importer(snapshot, staging)
                 if receipt.status != "verified" or not receipt.checks.get("ok"):
                     raise RuntimeStateError("candidate verification failed")
+                self._normalize_and_verify(staging, receipt.run_id, snapshot)
                 if self._clock() > deadline:
                     raise SourceAcquisitionError("refresh timeout")
                 os.replace(staging, final)
@@ -439,6 +594,7 @@ class SQLiteRuntimeCoordinator:
                     "schema_version": SCHEMA_VERSION,
                     "schema_checksum": SCHEMA_CHECKSUM,
                     "status": "verified",
+                    "captured_at": snapshot.captured_at,
                     "completed_at": completed_at,
                 }
                 state["current"] = current
@@ -467,3 +623,7 @@ class SQLiteRuntimeCoordinator:
     def state(self):
         """Return redacted runtime state for tests/diagnostics, never source data."""
         return self._load_state()
+
+
+def _json_text(value):
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))

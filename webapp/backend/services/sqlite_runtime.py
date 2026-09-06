@@ -2,6 +2,7 @@
 from contextlib import contextmanager
 from datetime import datetime, timezone
 import ctypes
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -10,10 +11,12 @@ import threading
 import time
 import uuid
 
+from repositories.aitool import UpstreamError
 from repositories.sqlite import SCHEMA_CHECKSUM, SCHEMA_VERSION, SQLiteCandidateRepository
 from services.sqlite_import import (
     AiToolHttpSource,
     SourceAcquisitionError,
+    _canonical_bytes,
     capture_stable_snapshot,
     import_candidate,
 )
@@ -236,7 +239,10 @@ class SQLiteRuntimeCoordinator:
             return False
         if group_state.get("generation_id") != current.get("generation_id"):
             return False
-        completed_at = _parse_time(current.get("completed_at"))
+        try:
+            completed_at = _parse_time(current.get("completed_at"))
+        except RuntimeStateError:
+            return False
         age = (datetime.now(timezone.utc) - completed_at).total_seconds()
         return 0 <= age <= self.freshness_seconds
 
@@ -259,7 +265,7 @@ class SQLiteRuntimeCoordinator:
         return current, candidate
 
     def _read_generation(self, state, route):
-        group, endpoint = ROUTE_ENDPOINTS[route]
+        _group, endpoint = ROUTE_ENDPOINTS[route]
         current, candidate = self._candidate_for_current(state)
         repository = SQLiteCandidateRepository.open_existing(candidate)
         try:
@@ -279,6 +285,33 @@ class SQLiteRuntimeCoordinator:
                 raise RuntimeStateError("stored source hash mismatch")
             if run[0][0] != current.get("snapshot_id"):
                 raise RuntimeStateError("stored snapshot identity mismatch")
+            snapshots = repository.rows(
+                "SELECT position, endpoint, raw_bytes, raw_sha256, canonical_sha256 "
+                "FROM source_snapshots WHERE run_id=? ORDER BY position",
+                (current.get("run_id"),),
+            )
+            if not snapshots:
+                raise RuntimeStateError("source snapshots missing")
+            material = []
+            for _position, source_endpoint, raw_bytes, raw_hash, canonical_hash in snapshots:
+                if not isinstance(raw_bytes, (bytes, bytearray, memoryview)):
+                    raise RuntimeStateError("stored source snapshot is not bytes")
+                raw_bytes = bytes(raw_bytes)
+                if hashlib.sha256(raw_bytes).hexdigest() != raw_hash:
+                    raise RuntimeStateError("stored raw source hash mismatch")
+                try:
+                    calculated_canonical = hashlib.sha256(
+                        _canonical_bytes(source_endpoint, raw_bytes)
+                    ).hexdigest()
+                except Exception as error:
+                    raise RuntimeStateError("stored canonical source is invalid") from error
+                if calculated_canonical != canonical_hash:
+                    raise RuntimeStateError("stored canonical source hash mismatch")
+                material.append(
+                    source_endpoint.encode("utf-8") + b"\0" + canonical_hash.encode("ascii")
+                )
+            if hashlib.sha256(b"".join(material)).hexdigest() != current.get("source_hash"):
+                raise RuntimeStateError("stored source hash material mismatch")
             rows = repository.rows(
                 "SELECT content_type, raw_bytes FROM source_snapshots "
                 "WHERE run_id=? AND endpoint=?",
@@ -332,6 +365,10 @@ class SQLiteRuntimeCoordinator:
                 _atomic_json(self.state_path, state)
                 # The caller's upstream request executes while this mutex is held.
                 yield
+        except (OSError, TimeoutError) as error:
+            raise UpstreamError(
+                503, b'{"error":"sqlite generation fence unavailable"}'
+            ) from error
         finally:
             # A crash skips this trigger but cannot lose the durable fence.
             self.request_refresh(group)

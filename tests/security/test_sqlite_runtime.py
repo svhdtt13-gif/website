@@ -243,6 +243,65 @@ class SQLiteRuntimeTests(unittest.TestCase):
             self.assertFalse(runtime.refresh_now(GROUP_MASTER_DATABASE))
             self.assertIsNone(runtime.state()["refresh_lease"])
 
+    def test_read_falls_back_while_write_fence_holds_mutex(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = enabled_runtime(directory, background_refresh=False)
+            self.assertTrue(runtime.refresh_now(GROUP_MASTER_DATABASE))
+            entered = threading.Event()
+            release = threading.Event()
+
+            def writer():
+                with runtime.write_fence(GROUP_MASTER_DATABASE):
+                    entered.set()
+                    release.wait(2)
+
+            worker = threading.Thread(target=writer)
+            worker.start()
+            self.assertTrue(entered.wait(2))
+            fallback = (b"http", 200, "application/json")
+            self.assertEqual(runtime.read("api/master", lambda: fallback), fallback)
+            release.set()
+            worker.join(2)
+            self.assertFalse(worker.is_alive())
+
+    def test_timeout_before_future_wait_uses_deferred_lease_handoff(self):
+        with tempfile.TemporaryDirectory() as directory:
+            clock_values = iter((0.0, 2.0))
+            runtime = SQLiteRuntimeCoordinator(
+                runtime_dir=directory,
+                read_enabled=True,
+                group_enabled={GROUP_MASTER_DATABASE: True},
+                refresh_timeout_seconds=1,
+                background_refresh=False,
+                clock=lambda: next(clock_values),
+                source_factory=lambda: FakeSource(fixture_values()),
+            )
+            started = threading.Event()
+            release = threading.Event()
+
+            def slow_build(group, staging, deadline):
+                started.set()
+                release.wait(2)
+                return object(), object()
+
+            runtime._build_candidate = slow_build
+            result = []
+            owner = threading.Thread(
+                target=lambda: result.append(
+                    runtime.refresh_now(GROUP_MASTER_DATABASE)
+                )
+            )
+            owner.start()
+            self.assertTrue(started.wait(2))
+            owner.join(2)
+            self.assertEqual(result, [False])
+            self.assertIsNotNone(runtime.state()["refresh_lease"])
+            release.set()
+            deadline = time.monotonic() + 2
+            while time.monotonic() < deadline and runtime.state()["refresh_lease"]:
+                time.sleep(0.05)
+            self.assertIsNone(runtime.state()["refresh_lease"])
+
     def test_captured_at_is_freshness_anchor(self):
         with tempfile.TemporaryDirectory() as directory:
             runtime = enabled_runtime(directory)

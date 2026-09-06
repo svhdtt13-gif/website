@@ -109,6 +109,7 @@ def _default_state():
         },
         "fences": {},
         "refresh_lease": None,
+        "refresh_pending": [],
     }
 
 
@@ -267,6 +268,8 @@ class SQLiteRuntimeCoordinator:
         state.setdefault("groups", {})
         state.setdefault("fences", {})
         state.setdefault("refresh_lease", None)
+        pending = state.get("refresh_pending")
+        state["refresh_pending"] = pending if isinstance(pending, list) else []
         for group in GROUPS:
             state["groups"].setdefault(
                 group,
@@ -355,6 +358,35 @@ class SQLiteRuntimeCoordinator:
         stop.set()
         if heartbeat is not None and heartbeat is not threading.current_thread():
             heartbeat.join(1)
+
+    def _queue_shared_pending_locked(self, state, group):
+        pending = state.setdefault("refresh_pending", [])
+        if group not in pending:
+            pending.append(group)
+
+    def _schedule_shared_pending(self):
+        group = None
+        try:
+            with self._mutex.hold(timeout_seconds=0):
+                state = self._load_state()
+                pending = state.get("refresh_pending", [])
+                if pending:
+                    group = pending.pop(0)
+                    state["refresh_pending"] = pending
+                    _atomic_json(self.state_path, state)
+        except (OSError, TimeoutError):
+            return
+        if group is None:
+            return
+        if self.request_refresh(group):
+            return
+        try:
+            with self._mutex.hold(timeout_seconds=0):
+                state = self._load_state()
+                self._queue_shared_pending_locked(state, group)
+                _atomic_json(self.state_path, state)
+        except (OSError, TimeoutError):
+            pass
 
     def _eligible(self, state, group):
         current = state.get("current")
@@ -705,6 +737,7 @@ class SQLiteRuntimeCoordinator:
         self._stop_lease_heartbeat(stop, heartbeat)
         _remove_candidate(staging)
         self._release_refresh_lease(token)
+        self._schedule_shared_pending()
 
     def refresh_now(self, group, force=False):
         """Build outside the mutex and atomically publish only within the deadline."""
@@ -731,6 +764,8 @@ class SQLiteRuntimeCoordinator:
                 if not force and self._eligible(state, group):
                     return True
                 if self._lease_active(state.get("refresh_lease")):
+                    self._queue_shared_pending_locked(state, group)
+                    _atomic_json(self.state_path, state)
                     # Another process owns the refresh; its publication is shared.
                     return True
                 initial_generation_id = (state.get("current") or {}).get("generation_id")
@@ -842,6 +877,7 @@ class SQLiteRuntimeCoordinator:
                     state["fences"].pop(group, None)
                 state["refresh_lease"] = None
                 _atomic_json(self.state_path, state)
+            self._schedule_shared_pending()
             return True
         except Exception:
             _remove_candidate(staging)

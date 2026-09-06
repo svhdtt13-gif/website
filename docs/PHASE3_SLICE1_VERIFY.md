@@ -17,7 +17,10 @@ The candidate importer:
   foreign keys;
 - records an import receipt and fails shadow verification closed.
 
-## Verification Command
+The current live source shape and read-only audit are recorded in
+`docs/PHASE3_GOLDEN_DELTA_20260906.md`.
+
+## Verification Commands
 
 Run from the repository root:
 
@@ -26,12 +29,13 @@ python tests\security\test_sqlite_import.py
 python -m py_compile webapp\backend\repositories\sqlite.py webapp\backend\services\sqlite_import.py tests\security\test_sqlite_import.py
 ```
 
-Result on commit `b9912f2` before the final documentation-only commit:
+Result on the reviewed head:
 
-- `5` tests passed, `0` failed.
-- Both importer modules compiled successfully.
-- The test uses fake HTTP source values and temporary databases; it does not
-  contact the live ai tool.
+- `11` tests passed, `0` failed.
+- All three edited Python files compiled successfully.
+- Tests use fake source values and temporary databases; the separate golden
+  audit also ran the importer against the current live HTTP source without
+  writing upstream.
 
 ## Review Gate
 

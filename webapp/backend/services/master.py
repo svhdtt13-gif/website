@@ -171,12 +171,12 @@ def _validate_success(body, status, content_type):
 
 
 def get_master():
-    """GET clients_master.json — handler legacy, khong doi upstream path."""
+    """GET clients_master.json - handler legacy, khong doi upstream path."""
     return ai_tool.get("clients_master.json")
 
 
 def get_api_master():
-    """GET api/master — handler rieng cho API master cua ai tool."""
+    """GET api/master - handler rieng cho API master cua ai tool."""
     return ai_tool.get("api/master")
 
 
@@ -185,7 +185,7 @@ def get_database():
     return ai_tool.get("client_database.json")
 
 
-def update_master_names(body, content_type="application/json"):
+def update_master_names(body, content_type="application/json", before_upstream_write=None):
     """Apply name-only per-field CAS changes against a fresh master snapshot."""
     changes = _prepare_changes(body, content_type)
     with _MASTER_WRITE_LOCK:
@@ -211,7 +211,11 @@ def update_master_names(body, content_type="application/json"):
             separators=(",", ":"),
         ).encode("utf-8")
         try:
-            result = ai_tool.post("api/master", canonical, "application/json")
+            if before_upstream_write is None:
+                result = ai_tool.post("api/master", canonical, "application/json")
+            else:
+                with before_upstream_write():
+                    result = ai_tool.post("api/master", canonical, "application/json")
         except UpstreamError as error:
             _safe_upstream_error(error.status)
         return _validate_success(*result)

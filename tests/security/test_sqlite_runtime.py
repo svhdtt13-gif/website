@@ -156,7 +156,7 @@ class SQLiteRuntimeTests(unittest.TestCase):
             self.assertFalse(runtime.refresh_now(GROUP_MASTER_DATABASE))
             self.assertLess(time.monotonic() - started, 0.15)
 
-    def test_write_fence_requires_observed_mutation_before_clear(self):
+    def test_write_fence_requires_observed_master_and_database_mutation(self):
         with tempfile.TemporaryDirectory() as directory:
             runtime = enabled_runtime(directory, background_refresh=False)
             self.assertTrue(runtime.refresh_now(GROUP_MASTER_DATABASE))
@@ -173,6 +173,11 @@ class SQLiteRuntimeTests(unittest.TestCase):
             replace_json(
                 values,
                 "api/master",
+                lambda payload: payload["clients"][0].update(name="Second-new"),
+            )
+            replace_json(
+                values,
+                "client_database.json",
                 lambda payload: payload["clients"][0].update(name="Second-new"),
             )
             runtime._source_factory = lambda: FakeSource(values)

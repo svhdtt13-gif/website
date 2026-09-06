@@ -151,6 +151,27 @@ class SQLiteRuntimeTests(unittest.TestCase):
             first.join(3)
             self.assertEqual(first_result, [False])
 
+    def test_cross_process_pending_group_survives_active_lease(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = enabled_runtime(directory, background_refresh=False)
+            state = runtime.state()
+            state["refresh_lease"] = {
+                "token": "other-process",
+                "owner_pid": 987654,
+                "started_at": "2026-09-06T10:00:00+00:00",
+                "heartbeat_at": "2026-09-06T10:00:01+00:00",
+                "expires_at": "2999-01-01T00:00:00+00:00",
+            }
+            sqlite_runtime._atomic_json(runtime.state_path, state)
+            self.assertTrue(runtime.refresh_now(GROUP_PUBLIC_SETTINGS))
+            self.assertEqual(
+                runtime.state()["refresh_pending"], [GROUP_PUBLIC_SETTINGS]
+            )
+            with patch.object(runtime, "request_refresh", return_value=True) as request:
+                runtime._schedule_shared_pending()
+            self.assertEqual(runtime.state()["refresh_pending"], [])
+            request.assert_called_once_with(GROUP_PUBLIC_SETTINGS)
+
     def test_captured_at_is_freshness_anchor(self):
         with tempfile.TemporaryDirectory() as directory:
             runtime = enabled_runtime(directory)

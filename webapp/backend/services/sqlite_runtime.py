@@ -137,6 +137,20 @@ def _parse_time(value):
         raise RuntimeStateError("invalid generation timestamp") from error
 
 
+class _DeadlineSource:
+    """Stop starting new HTTP fetches after the coordinator deadline."""
+
+    def __init__(self, source, deadline, clock):
+        self.source = source
+        self.deadline = deadline
+        self.clock = clock
+
+    def fetch(self, endpoint):
+        if self.clock() >= self.deadline:
+            raise SourceAcquisitionError("refresh timeout")
+        return self.source.fetch(endpoint)
+
+
 class SQLiteRuntimeCoordinator:
     """Select only verified immutable generations and fail closed to HTTP."""
 
@@ -161,9 +175,7 @@ class SQLiteRuntimeCoordinator:
         self.refresh_timeout_seconds = refresh_timeout_seconds
         self._clock = clock or time.monotonic
         self._mutex = NamedGenerationMutex(mutex_name, refresh_timeout_seconds)
-        self._source_factory = source_factory or (
-            lambda: AiToolHttpSource(timeout=refresh_timeout_seconds)
-        )
+        self._source_factory = source_factory or (lambda: AiToolHttpSource())
         self._importer = importer
         self._background_refresh = background_refresh
         self._refresh_guard = threading.Lock()
@@ -367,10 +379,10 @@ class SQLiteRuntimeCoordinator:
             final = self.runtime_dir / (generation_id + ".sqlite3")
             deadline = self._clock() + self.refresh_timeout_seconds
             try:
-                source = self._source_factory()
-                snapshot = capture_stable_snapshot(
-                    source, max_passes=3, deadline=deadline
+                source = _DeadlineSource(
+                    self._source_factory(), deadline, self._clock
                 )
+                snapshot = capture_stable_snapshot(source, max_passes=3)
                 if self._clock() > deadline:
                     raise SourceAcquisitionError("refresh timeout")
                 receipt = self._importer(snapshot, staging)

@@ -4,6 +4,7 @@ import multiprocessing
 import os
 from pathlib import Path
 import queue
+import sqlite3
 import sys
 import tempfile
 import threading
@@ -103,6 +104,18 @@ class SQLiteRuntimeTests(unittest.TestCase):
             self.assertIsNone(runtime.state()["current"])
             self.assertFalse(list(Path(directory).glob("*.staging")))
 
+    def test_checkpoint_failure_never_publishes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = enabled_runtime(directory, background_refresh=False)
+            with patch.object(
+                SQLiteCandidateRepository,
+                "close",
+                side_effect=sqlite3.DatabaseError("checkpoint failed"),
+            ):
+                self.assertFalse(runtime.refresh_now(GROUP_MASTER_DATABASE))
+            self.assertIsNone(runtime.state()["current"])
+            self.assertFalse(list(Path(directory).glob("*.sqlite3")))
+
     def test_captured_at_is_freshness_anchor(self):
         with tempfile.TemporaryDirectory() as directory:
             runtime = enabled_runtime(directory)
@@ -166,20 +179,38 @@ class SQLiteRuntimeTests(unittest.TestCase):
             self.assertTrue(runtime.refresh_now(GROUP_MASTER_DATABASE))
             self.assertNotIn(GROUP_MASTER_DATABASE, runtime.state()["fences"])
 
-    def test_normalized_corruption_falls_back(self):
-        with tempfile.TemporaryDirectory() as directory:
-            runtime = enabled_runtime(directory, background_refresh=False)
-            self.assertTrue(runtime.refresh_now(GROUP_MASTER_DATABASE))
-            candidate = Path(runtime.state()["current"]["candidate_path"])
-            repository = SQLiteCandidateRepository.open_existing(candidate)
-            with repository.transaction():
-                repository.connection.execute(
-                    "UPDATE master_clients SET raw_json=?",
-                    ('{"client":"client_2","name":"tampered","group":"fixed","selected":true}',),
-                )
-            repository.close()
-            fallback = (b"http", 200, "application/json")
-            self.assertEqual(runtime.read("api/master", lambda: fallback), fallback)
+    def test_normalized_corruption_falls_back_for_each_wave_one_table(self):
+        cases = (
+            (
+                "master_clients",
+                "UPDATE master_clients SET raw_json=?",
+                ('{"client":"client_2","name":"tampered","group":"fixed","selected":true}',),
+                "api/master",
+            ),
+            (
+                "database_clients",
+                "UPDATE database_clients SET raw_json=?",
+                ('{"idx":9,"client":"client_2","name":"tampered","status":"offline","group":"fixed","selected":true}',),
+                "client_database.json",
+            ),
+            (
+                "public_settings",
+                "UPDATE public_settings SET auto_telegram=1",
+                (),
+                "api/settings",
+            ),
+        )
+        for table, statement, args, route in cases:
+            with self.subTest(table=table), tempfile.TemporaryDirectory() as directory:
+                runtime = enabled_runtime(directory, background_refresh=False)
+                self.assertTrue(runtime.refresh_now(GROUP_MASTER_DATABASE))
+                candidate = Path(runtime.state()["current"]["candidate_path"])
+                repository = SQLiteCandidateRepository.open_existing(candidate)
+                with repository.transaction():
+                    repository.connection.execute(statement, args)
+                repository.close()
+                fallback = (b"http", 200, "application/json")
+                self.assertEqual(runtime.read(route, lambda: fallback), fallback)
 
     def test_schema_mismatch_falls_back(self):
         with tempfile.TemporaryDirectory() as directory:

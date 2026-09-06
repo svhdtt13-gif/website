@@ -172,6 +172,36 @@ class SQLiteRuntimeTests(unittest.TestCase):
             self.assertEqual(runtime.state()["refresh_pending"], [])
             request.assert_called_once_with(GROUP_PUBLIC_SETTINGS)
 
+    def test_failed_owner_releases_lease_before_draining_pending(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = enabled_runtime(directory, background_refresh=True)
+            runtime._importer = lambda snapshot, path: type(
+                "FailedReceipt", (), {"status": "failed", "checks": {"ok": False}}
+            )()
+            state = runtime.state()
+            state["refresh_pending"] = [GROUP_PUBLIC_SETTINGS]
+            sqlite_runtime._atomic_json(runtime.state_path, state)
+            with patch.object(runtime, "request_refresh", return_value=True) as request:
+                self.assertFalse(runtime.refresh_now(GROUP_MASTER_DATABASE))
+            state = runtime.state()
+            self.assertIsNone(state["refresh_lease"])
+            self.assertEqual(state["refresh_pending"], [])
+            request.assert_called_once_with(GROUP_PUBLIC_SETTINGS)
+
+    def test_publication_revalidation_exit_releases_owner_lease(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = enabled_runtime(directory, background_refresh=False)
+
+            def stale_build(group, staging, deadline):
+                state = runtime.state()
+                state["current"] = {"generation_id": "newer"}
+                sqlite_runtime._atomic_json(runtime.state_path, state)
+                return object(), object()
+
+            runtime._build_candidate = stale_build
+            self.assertFalse(runtime.refresh_now(GROUP_MASTER_DATABASE))
+            self.assertIsNone(runtime.state()["refresh_lease"])
+
     def test_captured_at_is_freshness_anchor(self):
         with tempfile.TemporaryDirectory() as directory:
             runtime = enabled_runtime(directory)

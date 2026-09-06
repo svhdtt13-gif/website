@@ -171,12 +171,12 @@ def _validate_success(body, status, content_type):
 
 
 def get_master():
-    """GET clients_master.json — handler legacy, khong doi upstream path."""
+    """GET clients_master.json - handler legacy, khong doi upstream path."""
     return ai_tool.get("clients_master.json")
 
 
 def get_api_master():
-    """GET api/master — handler rieng cho API master cua ai tool."""
+    """GET api/master - handler rieng cho API master cua ai tool."""
     return ai_tool.get("api/master")
 
 
@@ -185,7 +185,7 @@ def get_database():
     return ai_tool.get("client_database.json")
 
 
-def update_master_names(body, content_type="application/json"):
+def update_master_names(body, content_type="application/json", before_upstream_write=None):
     """Apply name-only per-field CAS changes against a fresh master snapshot."""
     changes = _prepare_changes(body, content_type)
     with _MASTER_WRITE_LOCK:
@@ -210,8 +210,19 @@ def update_master_names(body, content_type="application/json"):
             ensure_ascii=False,
             separators=(",", ":"),
         ).encode("utf-8")
+        expected_observation = {
+            "endpoint": "api/master",
+            "changes": [
+                {"client": client_id, "name": name}
+                for client_id, _expected_name, name in changes
+            ],
+        }
         try:
-            result = ai_tool.post("api/master", canonical, "application/json")
+            if before_upstream_write is None:
+                result = ai_tool.post("api/master", canonical, "application/json")
+                return _validate_success(*result)
+            with before_upstream_write(expected_observation):
+                result = ai_tool.post("api/master", canonical, "application/json")
+                return _validate_success(*result)
         except UpstreamError as error:
             _safe_upstream_error(error.status)
-        return _validate_success(*result)

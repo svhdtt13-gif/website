@@ -632,11 +632,15 @@ class SQLiteRuntimeCoordinator:
         staging = self.runtime_dir / (generation_id + ".sqlite3.staging")
         final = self.runtime_dir / (generation_id + ".sqlite3")
         published = False
+        initial_generation_id = None
+        initial_fence_token = None
         try:
             with self._mutex.hold():
                 state = self._load_state()
                 if not force and self._eligible(state, group):
                     return True
+                initial_generation_id = (state.get("current") or {}).get("generation_id")
+                initial_fence_token = (state.get("fences", {}).get(group) or {}).get("token")
 
             executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="sqlite-build")
             future = executor.submit(self._build_candidate, group, staging, deadline)
@@ -655,6 +659,16 @@ class SQLiteRuntimeCoordinator:
 
             with self._mutex.hold():
                 state = self._load_state()
+                current_generation_id = (state.get("current") or {}).get("generation_id")
+                current_fence_token = (state.get("fences", {}).get(group) or {}).get("token")
+                if (
+                    current_generation_id != initial_generation_id
+                    or current_fence_token != initial_fence_token
+                ):
+                    _remove_candidate(staging)
+                    if not self._eligible(state, group):
+                        self.request_refresh(group)
+                    return False
                 fence = state.get("fences", {}).get(group)
                 if fence is not None and not self._fence_observed(fence, snapshot):
                     raise RuntimeStateError("write mutation not observed")

@@ -7,12 +7,15 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "webapp" / "backend"))
 sys.path.insert(0, str(ROOT / "tests" / "security"))
 
 from repositories.aitool import UpstreamError  # noqa: E402
+from repositories.sqlite import SQLiteCandidateRepository  # noqa: E402
+from services import sqlite_runtime  # noqa: E402
 from services.sqlite_runtime import (  # noqa: E402
     GROUP_MASTER_DATABASE,
     GROUP_PUBLIC_SETTINGS,
@@ -44,7 +47,7 @@ def mutex_worker(name, entered, release):
 
 
 class SQLiteRuntimeTests(unittest.TestCase):
-    def test_verified_generation_preserves_route_shapes_and_meta(self):
+    def test_verified_generation_reconstructs_normalized_route_shapes(self):
         with tempfile.TemporaryDirectory() as directory:
             runtime = enabled_runtime(directory)
             self.assertTrue(runtime.refresh_now(GROUP_MASTER_DATABASE))
@@ -62,8 +65,19 @@ class SQLiteRuntimeTests(unittest.TestCase):
                 state["current"]["generation_id"],
             )
             self.assertIn("meta", master[0].decode("utf-8"))
+            candidate = Path(state["current"]["candidate_path"])
+            repository = SQLiteCandidateRepository.open_read_only(candidate)
+            self.assertEqual(repository.rows("PRAGMA query_only")[0][0], 1)
+            self.assertEqual(
+                repository.rows(
+                    "SELECT raw_json FROM master_meta WHERE run_id=?",
+                    (state["current"]["run_id"],),
+                )[0][0],
+                '{"source":"test"}',
+            )
+            repository.close()
 
-    def test_settings_uses_separate_group_but_same_published_candidate(self):
+    def test_settings_uses_separate_group_but_published_generation(self):
         with tempfile.TemporaryDirectory() as directory:
             runtime = enabled_runtime(directory)
             self.assertTrue(runtime.refresh_now(GROUP_PUBLIC_SETTINGS))
@@ -86,6 +100,25 @@ class SQLiteRuntimeTests(unittest.TestCase):
             self.assertFalse(runtime.refresh_now(GROUP_MASTER_DATABASE))
             self.assertIsNone(runtime.state()["current"])
             self.assertFalse(list(Path(directory).glob("*.staging")))
+
+    def test_captured_at_is_freshness_anchor(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = enabled_runtime(directory)
+            self.assertTrue(runtime.refresh_now(GROUP_MASTER_DATABASE))
+            state = runtime.state()
+            state["current"]["captured_at"] = "2000-01-01T00:00:00+00:00"
+            self.assertFalse(runtime._eligible(state, GROUP_MASTER_DATABASE))
+
+    def test_startup_refresh_requests_each_enabled_missing_group(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = enabled_runtime(directory, background_refresh=True)
+            with patch.object(runtime, "request_refresh", return_value=True) as refresh:
+                started = runtime.startup_refresh()
+            self.assertEqual(
+                [group for group, result in started],
+                [GROUP_MASTER_DATABASE, GROUP_PUBLIC_SETTINGS],
+            )
+            self.assertEqual(refresh.call_count, 2)
 
     def test_pre_dispatch_fence_survives_restart_and_blocks_stale_read(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -111,6 +144,20 @@ class SQLiteRuntimeTests(unittest.TestCase):
                 ),
             )
 
+    def test_ineligible_http_error_never_stale_serves(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = enabled_runtime(directory)
+            self.assertTrue(runtime.refresh_now(GROUP_MASTER_DATABASE))
+            with runtime.write_fence(GROUP_MASTER_DATABASE):
+                with self.assertRaises(UpstreamError) as error:
+                    runtime.read(
+                        "api/master",
+                        lambda: (_ for _ in ()).throw(
+                            UpstreamError(503, b'{"error":"http unavailable"}')
+                        ),
+                    )
+            self.assertEqual(error.exception.status, 503)
+
     def test_runtime_eligibility_does_not_change_configuration(self):
         with tempfile.TemporaryDirectory() as directory:
             runtime = enabled_runtime(directory)
@@ -131,17 +178,54 @@ class SQLiteRuntimeTests(unittest.TestCase):
         first = context.Process(target=mutex_worker, args=(name, entered, release))
         second = context.Process(target=mutex_worker, args=(name, entered, release))
         first.start()
-        self.assertEqual(entered.get(timeout=5), first.pid)
+        first_pid = entered.get(timeout=5)
+        self.assertEqual(first_pid, first.pid)
         second.start()
         time.sleep(0.3)
         self.assertTrue(entered.empty())
         release.set()
-        self.assertIn(entered.get(timeout=5), (first.pid, second.pid))
-        self.assertIn(entered.get(timeout=5), (first.pid, second.pid))
+        second_pid = entered.get(timeout=5)
+        self.assertIn(second_pid, (first.pid, second.pid))
         first.join(5)
         second.join(5)
         self.assertEqual(first.exitcode, 0)
         self.assertEqual(second.exitcode, 0)
+
+
+class FlaskRouteTests(unittest.TestCase):
+    def test_sqlite_runtime_is_only_called_for_wave_one_routes(self):
+        class RuntimeStub:
+            def __init__(self):
+                self.routes = []
+
+            def startup_refresh(self):
+                return []
+
+            def configured_enabled(self, _group):
+                return False
+
+            def read(self, route, fallback):
+                self.routes.append(route)
+                return fallback()
+
+        from app import create_app
+
+        runtime = RuntimeStub()
+        app = create_app(runtime=runtime)
+        app.testing = True
+        with patch("app.master_service.get_api_master", return_value=(b'{"meta":{},"clients":[],"schedule":[]}', 200, "application/json")), \
+             patch("app.master_service.get_master", return_value=(b'{"clients":[],"schedule":[]}', 200, "application/json")), \
+             patch("app.master_service.get_database", return_value=(b'{"lastUpdated":"x","clients":[],"schedule":[]}', 200, "application/json")), \
+             patch("app.settings_service.get_settings", return_value=(b"{}", 200, "application/json")):
+            client = app.test_client()
+            self.assertEqual(client.get("/up/api/master").status_code, 200)
+            self.assertEqual(client.get("/up/client_database.json").status_code, 200)
+            self.assertEqual(client.get("/up/api/settings").status_code, 200)
+            self.assertEqual(client.get("/up/clients_master.json").status_code, 200)
+        self.assertEqual(
+            runtime.routes,
+            ["api/master", "client_database.json", "api/settings", "clients_master.json"],
+        )
 
 
 if __name__ == "__main__":

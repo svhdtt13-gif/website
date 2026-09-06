@@ -125,12 +125,16 @@ def _project_success(body, status, content_type):
 def update_settings(body, content_type="application/json", before_upstream_write=None):
     """Validate safe partial settings, write once, then redact the response."""
     request_body = _prepare_update(body, content_type)
+    expected_observation = {
+        "endpoint": "api/settings",
+        "fields": json.loads(request_body.decode("utf-8")),
+    }
     with _SETTINGS_WRITE_LOCK:
         try:
             if before_upstream_write is None:
                 result = ai_tool.post("api/settings", request_body, "application/json")
                 return _project_success(*result)
-            with before_upstream_write():
+            with before_upstream_write(expected_observation):
                 result = ai_tool.post("api/settings", request_body, "application/json")
                 return _project_success(*result)
         except UpstreamError as error:

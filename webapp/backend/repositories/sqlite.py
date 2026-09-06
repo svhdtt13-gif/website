@@ -246,10 +246,13 @@ class SQLiteCandidateRepository:
         try:
             query_only = self.connection.execute("PRAGMA query_only").fetchone()[0]
             if not query_only:
-                self.connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-        except sqlite3.Error:
-            pass
-        self.connection.close()
+                result = self.connection.execute(
+                    "PRAGMA wal_checkpoint(TRUNCATE)"
+                ).fetchone()
+                if not result or result[0] != 0:
+                    raise sqlite3.DatabaseError("WAL checkpoint did not complete")
+        finally:
+            self.connection.close()
 
     def begin_import(self, run_id, snapshot_id, source_hash, started_at):
         self.connection.execute(
@@ -323,6 +326,7 @@ class SQLiteCandidateRepository:
             VALUES (?, ?, ?, ?, ?, ?)""",
             (run_id, settings.get("tunnel_port"),
              None if settings.get("auto_restart_tunnel") is None else int(settings["auto_restart_tunnel"]),
+             None if settings.get("auto_telegram") is None else int(settings["auto_telegram"]),
              None if settings.get("auto_telegram") is None else int(settings["auto_telegram"]),
              None if settings.get("auto_open_browser") is None else int(settings["auto_open_browser"]),
              observed_at),

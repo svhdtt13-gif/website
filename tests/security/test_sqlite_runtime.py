@@ -61,7 +61,9 @@ class SQLiteRuntimeTests(unittest.TestCase):
                 "client_database.json", lambda: (_ for _ in ()).throw(AssertionError("HTTP fallback"))
             )
             self.assertEqual(master[0], fixture_values()["api/master"].body)
+            self.assertEqual(master[1], 200)
             self.assertEqual(database[0], fixture_values()["client_database.json"].body)
+            self.assertEqual(database[1], 200)
             state = runtime.state()
             self.assertEqual(
                 state["groups"][GROUP_MASTER_DATABASE]["generation_id"],
@@ -88,6 +90,7 @@ class SQLiteRuntimeTests(unittest.TestCase):
                 "api/settings", lambda: (_ for _ in ()).throw(AssertionError("HTTP fallback"))
             )
             self.assertEqual(response[0], fixture_values()["api/settings"].body)
+            self.assertEqual(response[1], 200)
             state = runtime.state()
             self.assertEqual(
                 state["groups"][GROUP_PUBLIC_SETTINGS]["generation_id"],
@@ -116,9 +119,10 @@ class SQLiteRuntimeTests(unittest.TestCase):
             self.assertIsNone(runtime.state()["current"])
             self.assertFalse(list(Path(directory).glob("*.sqlite3")))
 
-    def test_refresh_lease_prevents_parallel_importers(self):
+    def test_refresh_lease_prevents_parallel_importers_past_nominal_ttl(self):
         with tempfile.TemporaryDirectory() as directory:
             runtime = enabled_runtime(directory, background_refresh=False)
+            runtime.refresh_timeout_seconds = 0.05
             started = threading.Event()
             release = threading.Event()
             calls = []
@@ -140,6 +144,7 @@ class SQLiteRuntimeTests(unittest.TestCase):
             )
             first.start()
             self.assertTrue(started.wait(2))
+            time.sleep(1.1)
             self.assertTrue(runtime.refresh_now(GROUP_MASTER_DATABASE))
             self.assertEqual(len(calls), 1)
             release.set()

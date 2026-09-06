@@ -200,9 +200,10 @@ class SQLiteRuntimeTests(unittest.TestCase):
                 [group for group, result in started],
                 [GROUP_MASTER_DATABASE, GROUP_PUBLIC_SETTINGS],
             )
-            self.assertEqual(set(runtime._refresh_pending), set(runtime.GROUPS) if hasattr(runtime, "GROUPS") else {
-                GROUP_MASTER_DATABASE, GROUP_PUBLIC_SETTINGS,
-            })
+            self.assertEqual(
+                set(runtime._refresh_pending),
+                {GROUP_MASTER_DATABASE, GROUP_PUBLIC_SETTINGS},
+            )
             runtime._refresh_pending.clear()
             runtime._refresh_active = False
 
@@ -230,9 +231,7 @@ class SQLiteRuntimeTests(unittest.TestCase):
                 )
             restarted = enabled_runtime(directory)
             self.assertFalse(
-                restarted.state()[GROUP_MASTER_DATABASE]["eligible"]
-                if GROUP_MASTER_DATABASE in restarted.state()
-                else restarted.state()["groups"][GROUP_MASTER_DATABASE]["eligible"]
+                restarted.state()["groups"][GROUP_MASTER_DATABASE]["eligible"]
             )
             self.assertRaises(
                 UpstreamError,

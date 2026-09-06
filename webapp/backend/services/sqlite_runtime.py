@@ -612,18 +612,27 @@ class SQLiteRuntimeCoordinator:
         group = ROUTE_ENDPOINTS[route][0]
         if not self.configured_enabled(group):
             return fallback()
-        state = self._load_state()
-        if not self._eligible(state, group):
-            self._mark_ineligible(group, "stale_or_not_eligible", timeout_seconds=0)
-            self.request_refresh(group)
-            return fallback()
+        stale = False
         try:
-            body, status, content_type = self._read_generation(state, route)
+            # Nonblocking lock acquisition gives reads a clear linearization point
+            # with write fences without waiting behind refresh or upstream writes.
+            with self._mutex.hold(timeout_seconds=0):
+                state = self._load_state()
+                if not self._eligible(state, group):
+                    stale = True
+                else:
+                    response = self._read_generation(state, route)
+        except (OSError, TimeoutError):
+            return fallback()
         except Exception:
             self._mark_ineligible(group, "candidate_read_failed", timeout_seconds=0)
             self.request_refresh(group)
             return fallback()
-        return body, status, content_type
+        if stale:
+            self._mark_ineligible(group, "stale_or_not_eligible", timeout_seconds=0)
+            self.request_refresh(group)
+            return fallback()
+        return response
 
     @staticmethod
     def _fence_observed(fence, snapshot):
@@ -830,18 +839,24 @@ class SQLiteRuntimeCoordinator:
 
             executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="sqlite-build")
             future = executor.submit(self._build_candidate, group, staging, deadline)
-            try:
-                remaining = deadline - self._clock()
-                if remaining <= 0:
-                    raise SourceAcquisitionError("refresh timeout")
-                snapshot, receipt = future.result(timeout=remaining)
-            except FutureTimeoutError as error:
+
+            def defer_timed_out_build():
+                nonlocal lease_release_deferred
                 lease_release_deferred = True
                 future.add_done_callback(
                     lambda completed: self._finish_timed_out_build(
                         lease_token, lease_stop, heartbeat, staging, completed
                     )
                 )
+
+            try:
+                remaining = deadline - self._clock()
+                if remaining <= 0:
+                    defer_timed_out_build()
+                    raise SourceAcquisitionError("refresh timeout")
+                snapshot, receipt = future.result(timeout=remaining)
+            except FutureTimeoutError as error:
+                defer_timed_out_build()
                 raise SourceAcquisitionError("refresh timeout") from error
             finally:
                 executor.shutdown(wait=False, cancel_futures=True)

@@ -304,17 +304,19 @@ class SQLiteRuntimeCoordinator:
 
     def _release_refresh_lease(self, token):
         if not token:
-            return
+            return True
         try:
             with self._mutex.hold(timeout_seconds=0):
                 state = self._load_state()
                 lease = state.get("refresh_lease") or {}
-                if lease.get("token") == token:
-                    state["refresh_lease"] = None
-                    _atomic_json(self.state_path, state)
+                if lease.get("token") != token:
+                    return False
+                state["refresh_lease"] = None
+                _atomic_json(self.state_path, state)
+                return True
         except (OSError, TimeoutError):
             # Expiry is the crash-recovery backstop if the mutex is busy.
-            pass
+            return False
 
     @staticmethod
     def _lease_active(lease):
@@ -736,8 +738,8 @@ class SQLiteRuntimeCoordinator:
     def _finish_timed_out_build(self, token, stop, heartbeat, staging, future):
         self._stop_lease_heartbeat(stop, heartbeat)
         _remove_candidate(staging)
-        self._release_refresh_lease(token)
-        self._schedule_shared_pending()
+        if self._release_refresh_lease(token):
+            self._schedule_shared_pending()
 
     def refresh_now(self, group, force=False):
         """Build outside the mutex and atomically publish only within the deadline."""
@@ -753,8 +755,11 @@ class SQLiteRuntimeCoordinator:
         lease_stop = None
         heartbeat = None
         lease_release_deferred = False
+        lease_owned = False
+        lease_released = False
         initial_generation_id = None
         initial_fence_token = None
+        requeue_group = False
         try:
             remaining = deadline - self._clock()
             if remaining <= 0:
@@ -779,6 +784,7 @@ class SQLiteRuntimeCoordinator:
                     "expires_at": self._lease_expiry(),
                 }
                 _atomic_json(self.state_path, state)
+                lease_owned = True
             lease_stop = threading.Event()
             heartbeat = threading.Thread(
                 target=self._refresh_lease_heartbeat,
@@ -812,6 +818,7 @@ class SQLiteRuntimeCoordinator:
             remaining = deadline - self._clock()
             if remaining <= 0:
                 raise SourceAcquisitionError("refresh timeout")
+            result = None
             with self._mutex.hold(timeout_seconds=remaining):
                 if self._clock() > deadline:
                     raise SourceAcquisitionError("refresh timeout")
@@ -819,75 +826,88 @@ class SQLiteRuntimeCoordinator:
                 lease = state.get("refresh_lease") or {}
                 if lease.get("token") != lease_token:
                     _remove_candidate(staging)
-                    return False
-                current_generation_id = (state.get("current") or {}).get("generation_id")
-                current_fence_token = (state.get("fences", {}).get(group) or {}).get("token")
-                if (
-                    current_generation_id != initial_generation_id
-                    or current_fence_token != initial_fence_token
-                ):
-                    _remove_candidate(staging)
-                    if not self._eligible(state, group):
-                        self.request_refresh(group)
-                    return False
-                fence = state.get("fences", {}).get(group)
-                fence_observed = fence is not None and self._fence_observed(fence, snapshot)
-                if fence is not None and not fence_observed:
-                    raise RuntimeStateError("write mutation not observed")
-                if not force and self._eligible(state, group):
-                    _remove_candidate(staging)
-                    return True
-                os.replace(staging, final)
-                published = True
-                completed_at = _utc_now()
-                current = {
-                    "generation_id": generation_id,
-                    "run_id": receipt.run_id,
-                    "candidate_path": str(final),
-                    "receipt_id": receipt.run_id,
-                    "snapshot_id": receipt.snapshot_id,
-                    "source_hash": receipt.source_hash,
-                    "schema_version": SCHEMA_VERSION,
-                    "schema_checksum": SCHEMA_CHECKSUM,
-                    "status": "verified",
-                    "captured_at": snapshot.captured_at,
-                    "completed_at": completed_at,
-                }
-                state["current"] = current
-                for target in GROUPS:
-                    old = state["groups"].get(target, {})
-                    target_fence = state.get("fences", {}).get(target)
-                    if target_fence is not None and not (target == group and fence_observed):
-                        state["groups"][target] = {
-                            "eligible": False,
-                            "generation_id": generation_id,
-                            "reason": "write_invalidation",
-                            "updated_at": completed_at,
-                        }
-                    elif target == group or old.get("eligible") or self.configured_enabled(target):
-                        state["groups"][target] = {
-                            "eligible": True,
-                            "generation_id": generation_id,
-                            "reason": "verified",
-                            "updated_at": completed_at,
-                        }
+                    lease_owned = False
+                    requeue_group = not self._eligible(state, group)
+                    result = False
+                else:
+                    current_generation_id = (state.get("current") or {}).get("generation_id")
+                    current_fence_token = (state.get("fences", {}).get(group) or {}).get("token")
+                    if (
+                        current_generation_id != initial_generation_id
+                        or current_fence_token != initial_fence_token
+                    ):
+                        _remove_candidate(staging)
+                        requeue_group = not self._eligible(state, group)
+                        result = False
+                    elif not force and self._eligible(state, group):
+                        _remove_candidate(staging)
+                        result = True
                     else:
-                        state["groups"][target]["generation_id"] = generation_id
-                if fence_observed:
-                    state["fences"].pop(group, None)
-                state["refresh_lease"] = None
-                _atomic_json(self.state_path, state)
-            self._schedule_shared_pending()
-            return True
+                        fence = state.get("fences", {}).get(group)
+                        fence_observed = fence is not None and self._fence_observed(fence, snapshot)
+                        if fence is not None and not fence_observed:
+                            raise RuntimeStateError("write mutation not observed")
+                        os.replace(staging, final)
+                        published = True
+                        completed_at = _utc_now()
+                        current = {
+                            "generation_id": generation_id,
+                            "run_id": receipt.run_id,
+                            "candidate_path": str(final),
+                            "receipt_id": receipt.run_id,
+                            "snapshot_id": receipt.snapshot_id,
+                            "source_hash": receipt.source_hash,
+                            "schema_version": SCHEMA_VERSION,
+                            "schema_checksum": SCHEMA_CHECKSUM,
+                            "status": "verified",
+                            "captured_at": snapshot.captured_at,
+                            "completed_at": completed_at,
+                        }
+                        state["current"] = current
+                        for target in GROUPS:
+                            old = state["groups"].get(target, {})
+                            target_fence = state.get("fences", {}).get(target)
+                            if target_fence is not None and not (target == group and fence_observed):
+                                state["groups"][target] = {
+                                    "eligible": False,
+                                    "generation_id": generation_id,
+                                    "reason": "write_invalidation",
+                                    "updated_at": completed_at,
+                                }
+                            elif target == group or old.get("eligible") or self.configured_enabled(target):
+                                state["groups"][target] = {
+                                    "eligible": True,
+                                    "generation_id": generation_id,
+                                    "reason": "verified",
+                                    "updated_at": completed_at,
+                                }
+                            else:
+                                state["groups"][target]["generation_id"] = generation_id
+                        if fence_observed:
+                            state["fences"].pop(group, None)
+                        state["refresh_lease"] = None
+                        lease_owned = False
+                        lease_released = True
+                        _atomic_json(self.state_path, state)
+                        result = True
+            if requeue_group:
+                self.request_refresh(group)
+            if lease_released:
+                self._schedule_shared_pending()
+            return result
         except Exception:
             _remove_candidate(staging)
             if published:
                 _remove_candidate(final)
             if not lease_release_deferred:
                 self._stop_lease_heartbeat(lease_stop, heartbeat)
-                if lease_token:
-                    self._release_refresh_lease(lease_token)
-            self._mark_ineligible(group, "refresh_failed", timeout_seconds=0)
+                if lease_token and lease_owned:
+                    lease_released = self._release_refresh_lease(lease_token)
+                    if lease_released:
+                        lease_owned = False
+                self._mark_ineligible(group, "refresh_failed", timeout_seconds=0)
+                if lease_released:
+                    self._schedule_shared_pending()
             return False
 
     def state(self):

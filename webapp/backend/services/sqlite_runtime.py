@@ -847,9 +847,10 @@ class SQLiteRuntimeCoordinator:
             _remove_candidate(staging)
             if published:
                 _remove_candidate(final)
-            self._stop_lease_heartbeat(lease_stop, heartbeat)
-            if lease_token and not lease_release_deferred:
-                self._release_refresh_lease(lease_token)
+            if not lease_release_deferred:
+                self._stop_lease_heartbeat(lease_stop, heartbeat)
+                if lease_token:
+                    self._release_refresh_lease(lease_token)
             self._mark_ineligible(group, "refresh_failed", timeout_seconds=0)
             return False
 

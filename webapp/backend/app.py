@@ -13,6 +13,7 @@ Slice 10 them guarded remote selector query.
 Slice 11 them dedicated guarded DELETE api/cycle/backup/<name>.
 Bundle 1 them guarded settings Telegram test va browser open actions.
 Bundle 2 chi mo guarded AI-fix creation; sync/answers/watcher remain deferred.
+Phase 3 adds guarded SQLite generation reads; enablement remains disabled by default.
 """
 import hmac
 import pathlib
@@ -29,6 +30,7 @@ from services import master as master_service
 from services import remote_live as remote_live_service
 from services import settings as settings_service
 from services import settings_actions as settings_actions_service
+from services import sqlite_runtime
 from services import sync as sync_service
 
 BASE = pathlib.Path(__file__).resolve().parent
@@ -84,8 +86,20 @@ def _settings_action_gate():
     return None
 
 
-def create_app():
+def create_app(runtime=None):
     app = Flask(__name__, static_folder=None)
+    sqlite = runtime or sqlite_runtime.SQLiteRuntimeCoordinator(
+        runtime_dir=config.SQLITE_RUNTIME_DIR,
+        read_enabled=config.SQLITE_READ_ENABLED,
+        group_enabled={
+            sqlite_runtime.GROUP_MASTER_DATABASE: config.SQLITE_MASTER_DATABASE_READ_ENABLED,
+            sqlite_runtime.GROUP_PUBLIC_SETTINGS: config.SQLITE_PUBLIC_SETTINGS_READ_ENABLED,
+        },
+        freshness_seconds=config.SQLITE_FRESHNESS_SECONDS,
+        refresh_timeout_seconds=config.SQLITE_REFRESH_TIMEOUT_SECONDS,
+        mutex_name=config.SQLITE_MUTEX_NAME,
+    )
+    app.extensions["sqlite_runtime"] = sqlite
 
     @app.route("/")
     def index():
@@ -183,7 +197,9 @@ def create_app():
                 # Allowlist co path chua co service: chan thay vi forward truc tiep.
                 return jsonify({"error": "read-only proxy: endpoint not allowed"}), 403
             try:
-                body, status, ctype = handler()
+                body, status, ctype = sqlite.read(
+                    subpath, handler
+                )
             except UpstreamError as e:
                 return Response(e.body, status=e.status, content_type="application/json")
             return Response(body, status=status, content_type=ctype)
@@ -198,7 +214,26 @@ def create_app():
             if handler is None:
                 return jsonify({"error": "read-only proxy: endpoint not allowed"}), 403
             try:
-                body, status, ctype = handler(request.get_data(), request.content_type)
+                if subpath == "api/master":
+                    body, status, ctype = handler(
+                        request.get_data(),
+                        request.content_type,
+                        before_upstream_write=lambda: sqlite.write_fence(
+                            sqlite_runtime.GROUP_MASTER_DATABASE
+                        ),
+                    )
+                elif subpath == "api/settings":
+                    body, status, ctype = handler(
+                        request.get_data(),
+                        request.content_type,
+                        before_upstream_write=lambda: sqlite.write_fence(
+                            sqlite_runtime.GROUP_PUBLIC_SETTINGS
+                        ),
+                    )
+                else:
+                    body, status, ctype = handler(
+                        request.get_data(), request.content_type
+                    )
             except UpstreamError as e:
                 return Response(e.body, status=e.status, content_type="application/json")
             return Response(body, status=status, content_type=ctype)

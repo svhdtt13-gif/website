@@ -171,7 +171,7 @@ class SQLiteRuntimeTests(unittest.TestCase):
 
     @unittest.skipUnless(os.name == "nt", "requires Windows named mutex")
     def test_two_process_named_mutex_is_single_flight(self):
-        name = r"Local\WebsiteSQLiteGenerationMutexTest" + str(os.getpid())
+        name = "Local\\WebsiteSQLiteGenerationMutexTest" + str(os.getpid())
         context = multiprocessing.get_context("spawn")
         entered = context.Queue()
         release = context.Event()

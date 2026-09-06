@@ -23,7 +23,7 @@ SQLITE_RUNTIME_DIR = Path(os.environ.get(
 ))
 SQLITE_FRESHNESS_SECONDS = int(os.environ.get("SQLITE_FRESHNESS_SECONDS", "60"))
 SQLITE_REFRESH_TIMEOUT_SECONDS = int(os.environ.get("SQLITE_REFRESH_TIMEOUT_SECONDS", "15"))
-SQLITE_MUTEX_NAME = r"Local\WebsiteSQLiteGenerationMutex"
+SQLITE_MUTEX_NAME = "Local\\WebsiteSQLiteGenerationMutex"
 
 # Chi cac endpoint GET nay duoc proxy (read-only). Moi thu khac -> 403.
 READ_ONLY_ALLOWLIST = {

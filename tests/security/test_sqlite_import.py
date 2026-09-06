@@ -2,7 +2,6 @@
 """Disposable tests for the Phase 3 candidate importer and SQLite store."""
 import hashlib
 import json
-import os
 from pathlib import Path
 import sqlite3
 import sys
@@ -12,7 +11,7 @@ import unittest
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "webapp" / "backend"))
 
-from repositories.sqlite import SQLiteCandidateRepository  # noqa: E402
+from repositories.sqlite import CandidatePathError, SQLiteCandidateRepository  # noqa: E402
 from services.sqlite_import import (  # noqa: E402
     AiToolHttpSource,
     SOURCE_ORDER,
@@ -161,11 +160,11 @@ class SQLiteImportTests(unittest.TestCase):
             connection.close()
 
     def test_candidate_path_must_be_new(self):
-        repository = SQLiteCandidateRepository.create(Path(tempfile.gettempdir()) / "phase3-new-candidate.sqlite3")
-        repository.close()
-        os.unlink(repository.path)
-        with self.assertRaises(ValueError):
-            SQLiteCandidateRepository.create(repository.path.parent / "does-not-exist" / "candidate.sqlite3")
+        with tempfile.TemporaryDirectory() as directory:
+            candidate = Path(directory) / "candidate.sqlite3"
+            candidate.write_bytes(b"existing")
+            with self.assertRaises(CandidatePathError):
+                SQLiteCandidateRepository.create(candidate)
 
     def test_source_client_rejects_unknown_endpoint(self):
         with self.assertRaises(Exception):

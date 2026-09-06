@@ -33,9 +33,10 @@ SOURCE_ORDER = (
 JSON_ENDPOINTS = frozenset(
     endpoint for endpoint in SOURCE_ORDER if not endpoint.startswith("cache/")
 )
-PUBLIC_SETTINGS_FIELDS = frozenset({
+# Keep this ordered: the tuple is also the SQLite column mapping order.
+PUBLIC_SETTINGS_FIELDS = (
     "tunnel_port", "auto_restart_tunnel", "auto_telegram", "auto_open_browser",
-})
+)
 LOG_STREAMS = {
     "cache/activity_history.jsonl": "activity",
     "cache/change_log.jsonl": "change",
@@ -126,8 +127,6 @@ class AiToolHttpSource:
                 _validate_public_settings(payload)
                 # Re-serialize the already-redacted projection for stable input.
                 body = _json_bytes(payload)
-            else:
-                body = body
         return SourceValue(
             endpoint=endpoint,
             body=body,
@@ -171,13 +170,14 @@ def _parse_json(value, endpoint):
 
 
 def _validate_public_settings(payload):
-    if not isinstance(payload, dict) or set(payload) - PUBLIC_SETTINGS_FIELDS:
+    public_fields = set(PUBLIC_SETTINGS_FIELDS)
+    if not isinstance(payload, dict) or set(payload) - public_fields:
         raise FidelityError("settings projection contains a non-public field")
     if "tunnel_port" in payload and (
         type(payload["tunnel_port"]) is not int or not 1 <= payload["tunnel_port"] <= 65535
     ):
         raise FidelityError("settings tunnel_port has invalid type or range")
-    for field in PUBLIC_SETTINGS_FIELDS - {"tunnel_port"}:
+    for field in public_fields - {"tunnel_port"}:
         if field in payload and type(payload[field]) is not bool:
             raise FidelityError("settings boolean has invalid type")
 
@@ -255,7 +255,10 @@ def _map_database(repo, run_id, snapshot):
     payload = _parse_json(snapshot.value("client_database.json"), "client_database.json")
     clients = _require_list(payload, "clients")
     schedule = _require_list(payload, "schedule")
-    repo.set_database_meta(run_id, payload.get("lastUpdated"))
+    last_updated = payload.get("lastUpdated")
+    if last_updated is not None:
+        _text(last_updated, "database lastUpdated")
+    repo.set_database_meta(run_id, last_updated)
     for position, item in enumerate(clients):
         if not isinstance(item, dict) or type(item.get("idx")) is not int:
             raise FidelityError("database client index is invalid")
@@ -305,12 +308,17 @@ def _map_cycle(repo, run_id, snapshot):
     for item in overrides:
         if not isinstance(item, dict):
             raise FidelityError("manual override is not an object")
+        change = item.get("change")
+        from_state = item.get("from")
+        to_state = item.get("to")
+        if from_state is None and to_state is None and isinstance(change, str) and "->" in change:
+            from_state, to_state = (part.strip() for part in change.split("->", 1))
         repo.add_manual_override(run_id, {
             "client_id": _text(item.get("client"), "override client"),
             "until_at": _text(item.get("until"), "override until"),
             "detected_at": _text(item.get("detected_at"), "override detected_at", True),
-            "from_state": _text(item.get("change", ""), "override from", True),
-            "to_state": None,
+            "from_state": _text(from_state, "override from", True),
+            "to_state": _text(to_state, "override to", True),
         })
 
 
@@ -366,9 +374,12 @@ def _map_backups(repo, run_id, snapshot):
         if not isinstance(item, dict):
             raise FidelityError("backup item is not an object")
         name = _text(item.get("name"), "backup name")
+        size = item.get("size")
+        if size is not None and type(size) is not int:
+            raise FidelityError("backup size is not an integer")
         repo.add_backup(run_id, position, {
             "name": name,
-            "size": item.get("size"),
+            "size": size,
             "mtime": _text(item.get("mtime"), "backup mtime", True),
             "label": _text(item.get("label"), "backup label", True),
             "created_at": _text(item.get("created_at"), "backup created_at", True),

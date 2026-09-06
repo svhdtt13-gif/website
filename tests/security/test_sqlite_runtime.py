@@ -3,8 +3,10 @@
 import multiprocessing
 import os
 from pathlib import Path
+import queue
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from unittest.mock import patch
@@ -109,6 +111,22 @@ class SQLiteRuntimeTests(unittest.TestCase):
             state["current"]["captured_at"] = "2000-01-01T00:00:00+00:00"
             self.assertFalse(runtime._eligible(state, GROUP_MASTER_DATABASE))
 
+    def test_mutex_timeout_is_fail_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = enabled_runtime(directory)
+            runtime._mutex.timeout_seconds = 0.05
+            result = []
+            with runtime._mutex.hold():
+                worker = threading.Thread(
+                    target=lambda: result.append(
+                        runtime.refresh_now(GROUP_MASTER_DATABASE)
+                    )
+                )
+                worker.start()
+                worker.join(1)
+            self.assertFalse(worker.is_alive())
+            self.assertEqual(result, [False])
+
     def test_startup_refresh_requests_each_enabled_missing_group(self):
         with tempfile.TemporaryDirectory() as directory:
             runtime = enabled_runtime(directory, background_refresh=True)
@@ -181,8 +199,8 @@ class SQLiteRuntimeTests(unittest.TestCase):
         first_pid = entered.get(timeout=5)
         self.assertEqual(first_pid, first.pid)
         second.start()
-        time.sleep(0.3)
-        self.assertTrue(entered.empty())
+        with self.assertRaises(queue.Empty):
+            entered.get(timeout=0.3)
         release.set()
         second_pid = entered.get(timeout=5)
         self.assertIn(second_pid, (first.pid, second.pid))
@@ -228,6 +246,39 @@ class FlaskRouteTests(unittest.TestCase):
             runtime.routes,
             ["api/master", "client_database.json", "api/settings"],
         )
+
+    def test_default_off_write_path_has_no_sqlite_fence(self):
+        class RuntimeStub:
+            def startup_refresh(self):
+                return []
+
+            def configured_enabled(self, _group):
+                return False
+
+            def read(self, _route, fallback):
+                return fallback()
+
+        import app as app_module
+        from app import create_app
+
+        captured = {}
+
+        def handler(_body, _content_type, before_upstream_write=None):
+            captured["fence"] = before_upstream_write
+            return b"{}", 200, "application/json"
+
+        app = create_app(runtime=RuntimeStub())
+        app.testing = True
+        with patch("app._write_authorized", return_value=True), patch.dict(
+            app_module.WRITE_HANDLERS, {"api/master": handler}, clear=False
+        ):
+            response = app.test_client().post(
+                "/up/api/master",
+                data=b"{}",
+                content_type="application/json",
+            )
+        self.assertEqual(response.status_code, 200)
+        self.assertIsNone(captured["fence"])
 
 
 if __name__ == "__main__":

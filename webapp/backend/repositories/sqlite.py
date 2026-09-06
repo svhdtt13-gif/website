@@ -1,15 +1,11 @@
-"""Versioned SQLite candidate store for Phase 3 shadow imports.
-
-This module is deliberately not wired into Flask routes. It owns only a new
-candidate database and never reads or writes ai tool files or processes.
-"""
+"""Versioned SQLite candidate store for Phase 3 shadow imports."""
 from contextlib import contextmanager
 import hashlib
 from pathlib import Path
 import sqlite3
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS schema_migrations (
     version INTEGER PRIMARY KEY,
@@ -38,6 +34,11 @@ CREATE TABLE IF NOT EXISTS source_snapshots (
     canonical_sha256 TEXT NOT NULL,
     PRIMARY KEY (run_id, endpoint),
     UNIQUE (run_id, position)
+);
+
+CREATE TABLE IF NOT EXISTS master_meta (
+    run_id TEXT PRIMARY KEY REFERENCES import_runs(run_id),
+    raw_json TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS master_clients (
@@ -181,18 +182,25 @@ class CandidatePathError(ValueError):
 
 
 class SQLiteCandidateRepository:
-    """Typed repository for one new candidate database."""
+    """Typed repository for one candidate database."""
 
     def __init__(self, connection, path):
         self.connection = connection
         self.path = Path(path)
 
     @staticmethod
-    def _connect(path):
-        connection = sqlite3.connect(str(path))
+    def _connect(path, read_only=False):
+        candidate = Path(path).resolve()
+        if read_only:
+            uri = candidate.as_uri() + "?mode=ro&immutable=1"
+            connection = sqlite3.connect(uri, uri=True)
+        else:
+            connection = sqlite3.connect(str(candidate))
+            connection.execute("PRAGMA journal_mode = WAL")
+            connection.execute("PRAGMA synchronous = NORMAL")
         connection.execute("PRAGMA foreign_keys = ON")
-        connection.execute("PRAGMA journal_mode = WAL")
-        connection.execute("PRAGMA synchronous = NORMAL")
+        if read_only:
+            connection.execute("PRAGMA query_only = ON")
         return connection
 
     @classmethod
@@ -217,6 +225,13 @@ class SQLiteCandidateRepository:
             raise CandidatePathError("candidate database does not exist")
         return cls(cls._connect(candidate), candidate)
 
+    @classmethod
+    def open_read_only(cls, path):
+        candidate = Path(path)
+        if not candidate.is_file():
+            raise CandidatePathError("candidate database does not exist")
+        return cls(cls._connect(candidate, read_only=True), candidate)
+
     @contextmanager
     def transaction(self):
         try:
@@ -228,7 +243,16 @@ class SQLiteCandidateRepository:
             raise
 
     def close(self):
-        self.connection.close()
+        try:
+            query_only = self.connection.execute("PRAGMA query_only").fetchone()[0]
+            if not query_only:
+                result = self.connection.execute(
+                    "PRAGMA wal_checkpoint(TRUNCATE)"
+                ).fetchone()
+                if not result or result[0] != 0:
+                    raise sqlite3.DatabaseError("WAL checkpoint did not complete")
+        finally:
+            self.connection.close()
 
     def begin_import(self, run_id, snapshot_id, source_hash, started_at):
         self.connection.execute(
@@ -243,6 +267,12 @@ class SQLiteCandidateRepository:
             VALUES (?, ?, ?, ?, ?, ?, ?)""",
             (run_id, position, value.endpoint, value.content_type, value.body,
              value.raw_sha256, value.canonical_sha256),
+        )
+
+    def set_master_meta(self, run_id, raw_json):
+        self.connection.execute(
+            "INSERT INTO master_meta(run_id, raw_json) VALUES (?, ?)",
+            (run_id, raw_json),
         )
 
     def add_master_client(self, run_id, position, client):

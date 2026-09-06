@@ -218,8 +218,8 @@ def create_app(runtime=None):
                 if subpath == "api/master":
                     before_write = None
                     if sqlite.configured_enabled(sqlite_runtime.GROUP_MASTER_DATABASE):
-                        before_write = lambda: sqlite.write_fence(
-                            sqlite_runtime.GROUP_MASTER_DATABASE
+                        before_write = lambda expected: sqlite.write_fence(
+                            sqlite_runtime.GROUP_MASTER_DATABASE, expected
                         )
                     body, status, ctype = handler(
                         request.get_data(), request.content_type,
@@ -228,8 +228,8 @@ def create_app(runtime=None):
                 elif subpath == "api/settings":
                     before_write = None
                     if sqlite.configured_enabled(sqlite_runtime.GROUP_PUBLIC_SETTINGS):
-                        before_write = lambda: sqlite.write_fence(
-                            sqlite_runtime.GROUP_PUBLIC_SETTINGS
+                        before_write = lambda expected: sqlite.write_fence(
+                            sqlite_runtime.GROUP_PUBLIC_SETTINGS, expected
                         )
                     body, status, ctype = handler(
                         request.get_data(), request.content_type,

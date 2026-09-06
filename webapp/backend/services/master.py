@@ -213,9 +213,9 @@ def update_master_names(body, content_type="application/json", before_upstream_w
         try:
             if before_upstream_write is None:
                 result = ai_tool.post("api/master", canonical, "application/json")
-            else:
-                with before_upstream_write():
-                    result = ai_tool.post("api/master", canonical, "application/json")
+                return _validate_success(*result)
+            with before_upstream_write():
+                result = ai_tool.post("api/master", canonical, "application/json")
+                return _validate_success(*result)
         except UpstreamError as error:
             _safe_upstream_error(error.status)
-        return _validate_success(*result)

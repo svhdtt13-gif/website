@@ -129,9 +129,9 @@ def update_settings(body, content_type="application/json", before_upstream_write
         try:
             if before_upstream_write is None:
                 result = ai_tool.post("api/settings", request_body, "application/json")
-            else:
-                with before_upstream_write():
-                    result = ai_tool.post("api/settings", request_body, "application/json")
+                return _project_success(*result)
+            with before_upstream_write():
+                result = ai_tool.post("api/settings", request_body, "application/json")
+                return _project_success(*result)
         except UpstreamError as error:
             _safe_upstream_error(error.status)
-        return _project_success(*result)

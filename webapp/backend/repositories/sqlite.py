@@ -297,7 +297,7 @@ class SQLiteCandidateRepository:
             (run_id, settings.get("tunnel_port"),
              None if settings.get("auto_restart_tunnel") is None else int(settings["auto_restart_tunnel"]),
              None if settings.get("auto_telegram") is None else int(settings["auto_telegram"]),
-             None if settings.get("auto_telegram") is None else int(settings["auto_open_browser"]),
+             None if settings.get("auto_open_browser") is None else int(settings["auto_open_browser"]),
              observed_at),
         )
 
@@ -309,7 +309,7 @@ class SQLiteCandidateRepository:
 
     def add_cycle_slot(self, run_id, today, position, slot_key, result):
         self.connection.execute(
-            "INSERT INTO cycle_slot_state(run_id, today, position, slot_key, result) VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO cycle_slot_state(run_id, today, position, slot_key, result) VALUES (?, ?, ?, ?, ?)"",
             (run_id, today, position, slot_key, result),
         )
 

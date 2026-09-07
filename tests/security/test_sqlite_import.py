@@ -114,6 +114,12 @@ def fixture_values():
     }
 
 
+HTTP_ONLY_SOURCE_ORDER = tuple(
+    endpoint for endpoint in SOURCE_ORDER
+    if endpoint not in WAVE1_RUNTIME_SOURCE_ORDER
+)
+
+
 class FakeSource:
     def __init__(self, values, mutate_after=None):
         self.values = values
@@ -154,18 +160,30 @@ class Wave1MutatingSource(FakeSource):
 
 
 class Wave1HttpOnlyChangingSource(FakeSource):
-    def __init__(self, values):
+    def __init__(self, values, endpoint):
         super().__init__(values)
+        self.endpoint = endpoint
         self.changed = False
 
     def fetch(self, endpoint):
         value = super().fetch(endpoint)
         if not self.changed and len(self.calls) == len(WAVE1_RUNTIME_SOURCE_ORDER):
-            replace_json(
-                self.values,
-                "api/cycle/status",
-                lambda payload: payload.update({"checked_at": "changed"}),
-            )
+            if self.endpoint in (
+                "cache/activity_history.jsonl",
+                "cache/change_log.jsonl",
+                "cache/action.log",
+            ):
+                replace_bytes(
+                    self.values,
+                    self.endpoint,
+                    lambda body: body + b"mutation\n",
+                )
+            else:
+                replace_json(
+                    self.values,
+                    self.endpoint,
+                    lambda payload: payload.update({"mutation": True}),
+                )
             self.changed = True
         return value
 
@@ -185,6 +203,13 @@ def replace_json(values, endpoint, mutate):
     payload = json.loads(values[endpoint].body.decode("utf-8"))
     mutate(payload)
     values[endpoint] = source_value(endpoint, payload, values[endpoint].content_type)
+
+
+def replace_bytes(values, endpoint, mutate):
+    value = values[endpoint]
+    values[endpoint] = source_value(
+        endpoint, mutate(value.body), value.content_type
+    )
 
 
 class SQLiteImportTests(unittest.TestCase):
@@ -275,16 +300,19 @@ class SQLiteImportTests(unittest.TestCase):
                     source_set=SOURCE_SET_WAVE1,
                 )
 
-    def test_http_only_change_does_not_affect_wave1_stability(self):
-        source = Wave1HttpOnlyChangingSource(fixture_values())
-        snapshot = capture_stable_snapshot(
-            source,
-            max_passes=2,
-            source_order=WAVE1_RUNTIME_SOURCE_ORDER,
-            source_set=SOURCE_SET_WAVE1,
-        )
-        self.assertEqual(snapshot.source_set, SOURCE_SET_WAVE1)
-        self.assertEqual(source.calls, list(WAVE1_RUNTIME_SOURCE_ORDER) * 2)
+    def test_each_http_only_change_does_not_affect_wave1_stability(self):
+        for endpoint in HTTP_ONLY_SOURCE_ORDER:
+            with self.subTest(endpoint=endpoint):
+                source = Wave1HttpOnlyChangingSource(fixture_values(), endpoint)
+                snapshot = capture_stable_snapshot(
+                    source,
+                    max_passes=2,
+                    source_order=WAVE1_RUNTIME_SOURCE_ORDER,
+                    source_set=SOURCE_SET_WAVE1,
+                )
+                self.assertTrue(source.changed)
+                self.assertEqual(snapshot.source_set, SOURCE_SET_WAVE1)
+                self.assertEqual(source.calls, list(WAVE1_RUNTIME_SOURCE_ORDER) * 2)
 
     def test_runtime_publishes_wave1_and_rejects_non_wave1_manifest(self):
         from services.sqlite_runtime import GROUP_MASTER_DATABASE, SQLiteRuntimeCoordinator

@@ -18,8 +18,10 @@ from services import settings as settings_service
 from services.sqlite_import import (
     AiToolHttpSource,
     PUBLIC_SETTINGS_FIELDS,
+    SOURCE_SET_WAVE1,
     SourceAcquisitionError,
     SourceValue,
+    WAVE1_RUNTIME_SOURCE_ORDER,
     _canonical_bytes,
     _json_bytes,
     _sha256,
@@ -431,6 +433,8 @@ class SQLiteRuntimeCoordinator:
         group_state = state.get("groups", {}).get(group, {})
         if not current or current.get("status") != "verified":
             return False
+        if current.get("source_set") != SOURCE_SET_WAVE1:
+            return False
         if not group_state.get("eligible"):
             return False
         if group_state.get("generation_id") != current.get("generation_id"):
@@ -552,7 +556,7 @@ class SQLiteRuntimeCoordinator:
             if schema != [(SCHEMA_VERSION, SCHEMA_CHECKSUM)]:
                 raise RuntimeStateError("stored schema validation failed")
             run = repository.rows(
-                "SELECT snapshot_id, source_hash, status, completed_at "
+                "SELECT snapshot_id, source_hash, status, checks_json "
                 "FROM import_runs WHERE run_id=?",
                 (current.get("run_id"),),
             )
@@ -562,6 +566,18 @@ class SQLiteRuntimeCoordinator:
                 raise RuntimeStateError("stored source hash mismatch")
             if run[0][0] != current.get("snapshot_id"):
                 raise RuntimeStateError("stored snapshot identity mismatch")
+            try:
+                checks = json.loads(run[0][3])
+            except (TypeError, ValueError, json.JSONDecodeError) as error:
+                raise RuntimeStateError("stored import checks are invalid") from error
+            nested_checks = checks.get("checks") if isinstance(checks, dict) else None
+            if (
+                not isinstance(checks, dict)
+                or checks.get("source_set") != SOURCE_SET_WAVE1
+                or not isinstance(nested_checks, dict)
+                or nested_checks.get("source_set") != SOURCE_SET_WAVE1
+            ):
+                raise RuntimeStateError("stored import source set mismatch")
             snapshots = repository.rows(
                 "SELECT position, endpoint, raw_bytes, raw_sha256, canonical_sha256 "
                 "FROM source_snapshots WHERE run_id=? ORDER BY position",
@@ -766,7 +782,12 @@ class SQLiteRuntimeCoordinator:
                 source = _DeadlineSource(
                     self._source_factory(), deadline, self._clock
                 )
-            snapshot = capture_stable_snapshot(source, max_passes=3)
+            snapshot = capture_stable_snapshot(
+                source,
+                max_passes=3,
+                source_order=WAVE1_RUNTIME_SOURCE_ORDER,
+                source_set=SOURCE_SET_WAVE1,
+            )
             if self._clock() > deadline:
                 raise SourceAcquisitionError("refresh timeout")
             receipt = self._importer(snapshot, staging)
@@ -905,6 +926,7 @@ class SQLiteRuntimeCoordinator:
                             "receipt_id": receipt.run_id,
                             "snapshot_id": receipt.snapshot_id,
                             "source_hash": receipt.source_hash,
+                            "source_set": SOURCE_SET_WAVE1,
                             "schema_version": SCHEMA_VERSION,
                             "schema_checksum": SCHEMA_CHECKSUM,
                             "status": "verified",

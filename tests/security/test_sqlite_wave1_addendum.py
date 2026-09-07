@@ -18,13 +18,17 @@ from services.sqlite_import import (  # noqa: E402
     UnstableSnapshotError,
     capture_stable_snapshot,
     import_candidate,
-    source_value,
 )
 from services.sqlite_runtime import (  # noqa: E402
     GROUP_MASTER_DATABASE,
     SQLiteRuntimeCoordinator,
 )
-from test_sqlite_import import FakeSource, fixture_values, replace_json  # noqa: E402
+from test_sqlite_import import (  # noqa: E402
+    FakeSource,
+    fixture_values,
+    replace_json,
+    source_value,
+)
 
 
 class EndpointMutatingSource(FakeSource):

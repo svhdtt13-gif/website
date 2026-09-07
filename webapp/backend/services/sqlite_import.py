@@ -17,7 +17,7 @@ from repositories.sqlite import SQLiteCandidateRepository
 from services import settings as settings_service
 
 
-SOURCE_ORDER = (
+FULL_SOURCE_ORDER = (
     "api/master",
     "client_database.json",
     "api/settings",
@@ -30,8 +30,16 @@ SOURCE_ORDER = (
     "api/status",
     "api/sync_status",
 )
+SOURCE_ORDER = FULL_SOURCE_ORDER
+WAVE1_RUNTIME_SOURCE_ORDER = (
+    "api/master",
+    "client_database.json",
+    "api/settings",
+)
+SOURCE_SET_FULL = "full_audit"
+SOURCE_SET_WAVE1 = "wave1"
 JSON_ENDPOINTS = frozenset(
-    endpoint for endpoint in SOURCE_ORDER if not endpoint.startswith("cache/")
+    endpoint for endpoint in FULL_SOURCE_ORDER if not endpoint.startswith("cache/")
 )
 PUBLIC_SETTINGS_FIELDS = (
     "tunnel_port", "auto_restart_tunnel", "auto_telegram", "auto_open_browser",
@@ -77,6 +85,8 @@ class StableSnapshot:
     snapshot_id: str
     captured_at: str
     values: dict
+    source_order: tuple = FULL_SOURCE_ORDER
+    source_set: str = SOURCE_SET_FULL
 
     def value(self, endpoint):
         try:
@@ -93,6 +103,7 @@ class ImportReceipt:
     source_hash: str
     status: str
     checks: dict
+    source_set: str = SOURCE_SET_FULL
 
 
 class AiToolHttpSource:
@@ -102,7 +113,7 @@ class AiToolHttpSource:
         self.repository = repository or ai_tool
 
     def fetch(self, endpoint):
-        if endpoint not in SOURCE_ORDER:
+        if endpoint not in FULL_SOURCE_ORDER:
             raise SourceAcquisitionError("source endpoint is not allowlisted")
         if endpoint == "api/settings":
             try:
@@ -207,21 +218,29 @@ def _validate_public_settings(payload):
             raise FidelityError("settings boolean has invalid type")
 
 
-def capture_stable_snapshot(source, max_passes=3):
+def capture_stable_snapshot(
+    source,
+    max_passes=3,
+    source_order=FULL_SOURCE_ORDER,
+    source_set=SOURCE_SET_FULL,
+):
     if max_passes < 2:
         raise ValueError("stable snapshot requires at least two passes")
+    source_order = tuple(source_order)
     previous = None
     for _attempt in range(max_passes):
-        values = {endpoint: source.fetch(endpoint) for endpoint in SOURCE_ORDER}
+        values = {endpoint: source.fetch(endpoint) for endpoint in source_order}
         signature = tuple(
             (endpoint, values[endpoint].canonical_sha256)
-            for endpoint in SOURCE_ORDER
+            for endpoint in source_order
         )
         if previous == signature:
             return StableSnapshot(
                 snapshot_id=uuid.uuid4().hex,
                 captured_at=datetime.now(timezone.utc).isoformat(),
                 values=values,
+                source_order=source_order,
+                source_set=source_set,
             )
         previous = signature
     raise UnstableSnapshotError("source changed during stability fence")
@@ -436,7 +455,7 @@ def _map_observations(repo, run_id, snapshot):
 def _source_hash(snapshot):
     material = b"".join(
         endpoint.encode("utf-8") + b"\0" + snapshot.values[endpoint].canonical_sha256.encode("ascii")
-        for endpoint in SOURCE_ORDER
+        for endpoint in snapshot.source_order
     )
     return _sha256(material)
 
@@ -454,7 +473,8 @@ def _raw_rows(repository, query, args):
 
 
 def shadow_verify(repository, run_id, snapshot):
-    checks = {}
+    available = set(snapshot.source_order)
+    checks = {"source_set": snapshot.source_set}
     mismatches = []
     checks["integrity"] = repository.integrity_check() == "ok"
     if not checks["integrity"]:
@@ -463,7 +483,7 @@ def shadow_verify(repository, run_id, snapshot):
         "SELECT endpoint, raw_sha256, canonical_sha256 FROM source_snapshots WHERE run_id=? ORDER BY position",
         (run_id,),
     )
-    checks["source_snapshot_count"] = len(source_rows) == len(SOURCE_ORDER)
+    checks["source_snapshot_count"] = len(source_rows) == len(snapshot.source_order)
     if not checks["source_snapshot_count"]:
         mismatches.append("source snapshot count mismatch")
     for endpoint, raw_hash, canonical_hash in source_rows:
@@ -471,111 +491,119 @@ def shadow_verify(repository, run_id, snapshot):
         if raw_hash != expected.raw_sha256 or canonical_hash != expected.canonical_sha256:
             mismatches.append("source hash mismatch: " + endpoint)
 
-    master_source = _parse_json(snapshot.value("api/master"), "api/master")
-    master_actual = {
-        "clients": _raw_rows(repository, "SELECT raw_json FROM master_clients WHERE run_id=? ORDER BY position", (run_id,)),
-        "schedule": _raw_rows(repository, "SELECT raw_json FROM schedule_slots WHERE run_id=? ORDER BY position", (run_id,)),
-    }
-    checks["master_order_and_projection"] = _same_projection(
-        "api/master", master_actual,
-        {"clients": master_source["clients"], "schedule": master_source["schedule"]},
-    )
-    if not checks["master_order_and_projection"]:
-        mismatches.append("master order/projection mismatch")
+    if "api/master" in available:
+        master_source = _parse_json(snapshot.value("api/master"), "api/master")
+        master_actual = {
+            "clients": _raw_rows(repository, "SELECT raw_json FROM master_clients WHERE run_id=? ORDER BY position", (run_id,)),
+            "schedule": _raw_rows(repository, "SELECT raw_json FROM schedule_slots WHERE run_id=? ORDER BY position", (run_id,)),
+        }
+        checks["master_order_and_projection"] = _same_projection(
+            "api/master", master_actual,
+            {"clients": master_source["clients"], "schedule": master_source["schedule"]},
+        )
+        if not checks["master_order_and_projection"]:
+            mismatches.append("master order/projection mismatch")
 
-    db_source = _parse_json(snapshot.value("client_database.json"), "client_database.json")
-    db_actual = {
-        "lastUpdated": repository.rows("SELECT last_updated FROM database_meta WHERE run_id=?", (run_id,))[0][0],
-        "clients": _raw_rows(repository, "SELECT raw_json FROM database_clients WHERE run_id=? ORDER BY position", (run_id,)),
-        "schedule": _raw_rows(repository, "SELECT raw_json FROM database_schedule WHERE run_id=? ORDER BY position", (run_id,)),
-    }
-    checks["database_order_and_projection"] = _same_projection(
-        "client_database.json", db_actual,
-        {"lastUpdated": db_source["lastUpdated"], "clients": db_source["clients"], "schedule": db_source["schedule"]},
-    )
-    if not checks["database_order_and_projection"]:
-        mismatches.append("database order/projection mismatch")
+    if "client_database.json" in available:
+        db_source = _parse_json(snapshot.value("client_database.json"), "client_database.json")
+        db_actual = {
+            "lastUpdated": repository.rows("SELECT last_updated FROM database_meta WHERE run_id=?", (run_id,))[0][0],
+            "clients": _raw_rows(repository, "SELECT raw_json FROM database_clients WHERE run_id=? ORDER BY position", (run_id,)),
+            "schedule": _raw_rows(repository, "SELECT raw_json FROM database_schedule WHERE run_id=? ORDER BY position", (run_id,)),
+        }
+        checks["database_order_and_projection"] = _same_projection(
+            "client_database.json", db_actual,
+            {"lastUpdated": db_source["lastUpdated"], "clients": db_source["clients"], "schedule": db_source["schedule"]},
+        )
+        if not checks["database_order_and_projection"]:
+            mismatches.append("database order/projection mismatch")
 
-    settings_source = _parse_json(snapshot.value("api/settings"), "api/settings")
-    settings_row = repository.rows(
-        "SELECT tunnel_port, auto_restart_tunnel, auto_telegram, auto_open_browser FROM public_settings WHERE run_id=?",
-        (run_id,),
-    )[0]
-    settings_actual = {
-        key: value for key, value in zip(PUBLIC_SETTINGS_FIELDS, settings_row) if value is not None
-    }
-    for key in ("auto_restart_tunnel", "auto_telegram", "auto_open_browser"):
-        if key in settings_actual:
-            settings_actual[key] = bool(settings_actual[key])
-    checks["settings_redacted_projection"] = settings_actual == settings_source
-    if not checks["settings_redacted_projection"]:
-        mismatches.append("settings public projection mismatch")
+    if "api/settings" in available:
+        settings_source = _parse_json(snapshot.value("api/settings"), "api/settings")
+        settings_row = repository.rows(
+            "SELECT tunnel_port, auto_restart_tunnel, auto_telegram, auto_open_browser FROM public_settings WHERE run_id=?",
+            (run_id,),
+        )[0]
+        settings_actual = {
+            key: value for key, value in zip(PUBLIC_SETTINGS_FIELDS, settings_row) if value is not None
+        }
+        for key in ("auto_restart_tunnel", "auto_telegram", "auto_open_browser"):
+            if key in settings_actual:
+                settings_actual[key] = bool(settings_actual[key])
+        checks["settings_redacted_projection"] = settings_actual == settings_source
+        if not checks["settings_redacted_projection"]:
+            mismatches.append("settings public projection mismatch")
 
-    cycle_source = _parse_json(snapshot.value("api/cycle/status"), "api/cycle/status")
-    state_row = repository.rows("SELECT today, state_json FROM cycle_state WHERE run_id=?", (run_id,))[0]
-    checks["cycle_state_projection"] = (
-        state_row[0] == cycle_source["state"]["today"]
-        and _same_projection("api/cycle/status", json.loads(state_row[1]), cycle_source["state"])
-    )
-    if not checks["cycle_state_projection"]:
-        mismatches.append("cycle state projection mismatch")
-    actual_slots = repository.rows(
-        "SELECT slot_key, result FROM cycle_slot_state WHERE run_id=? ORDER BY position", (run_id,)
-    )
-    expected_slots = list(cycle_source["state"]["done"].items())
-    checks["cycle_slot_ledger"] = actual_slots == expected_slots
-    if not checks["cycle_slot_ledger"]:
-        mismatches.append("cycle slot ledger mismatch")
-    checks["manual_overrides"] = _raw_rows(
-        repository,
-        "SELECT raw_json FROM manual_overrides WHERE run_id=? ORDER BY position",
-        (run_id,),
-    ) == cycle_source["manual_overrides"]
-    if not checks["manual_overrides"]:
-        mismatches.append("manual overrides mismatch")
-
-    ai_source = _parse_json(snapshot.value("api/ai_fix/status"), "api/ai_fix/status")
-    ai_ok = True
-    for key, status in (("pending", "pending"), ("recent_done", "done"), ("recent_failed", "failed")):
-        actual = _raw_rows(
+    if "api/cycle/status" in available:
+        cycle_source = _parse_json(snapshot.value("api/cycle/status"), "api/cycle/status")
+        state_row = repository.rows("SELECT today, state_json FROM cycle_state WHERE run_id=?", (run_id,))[0]
+        checks["cycle_state_projection"] = (
+            state_row[0] == cycle_source["state"]["today"]
+            and _same_projection("api/cycle/status", json.loads(state_row[1]), cycle_source["state"])
+        )
+        if not checks["cycle_state_projection"]:
+            mismatches.append("cycle state projection mismatch")
+        actual_slots = repository.rows(
+            "SELECT slot_key, result FROM cycle_slot_state WHERE run_id=? ORDER BY position", (run_id,)
+        )
+        expected_slots = list(cycle_source["state"]["done"].items())
+        checks["cycle_slot_ledger"] = actual_slots == expected_slots
+        if not checks["cycle_slot_ledger"]:
+            mismatches.append("cycle slot ledger mismatch")
+        checks["manual_overrides"] = _raw_rows(
             repository,
-            "SELECT raw_json FROM ai_fix_requests WHERE run_id=? AND lifecycle_status=? ORDER BY position",
-            (run_id, status),
-        )
-        if actual != ai_source[key]:
-            ai_ok = False
-    checks["ai_fix_rows_and_order"] = ai_ok
-    if not ai_ok:
-        mismatches.append("AI-fix rows/order mismatch")
+            "SELECT raw_json FROM manual_overrides WHERE run_id=? ORDER BY position",
+            (run_id,),
+        ) == cycle_source["manual_overrides"]
+        if not checks["manual_overrides"]:
+            mismatches.append("manual overrides mismatch")
 
-    backup_source = _parse_json(snapshot.value("api/cycle/backup"), "api/cycle/backup")
-    checks["backup_metadata_and_order"] = _raw_rows(
-        repository,
-        "SELECT raw_json FROM backup_metadata WHERE run_id=? ORDER BY position",
-        (run_id,),
-    ) == backup_source["backups"]
-    if not checks["backup_metadata_and_order"]:
-        mismatches.append("backup metadata/order mismatch")
+    if "api/ai_fix/status" in available:
+        ai_source = _parse_json(snapshot.value("api/ai_fix/status"), "api/ai_fix/status")
+        ai_ok = True
+        for key, status in (("pending", "pending"), ("recent_done", "done"), ("recent_failed", "failed")):
+            actual = _raw_rows(
+                repository,
+                "SELECT raw_json FROM ai_fix_requests WHERE run_id=? AND lifecycle_status=? ORDER BY position",
+                (run_id, status),
+            )
+            if actual != ai_source[key]:
+                ai_ok = False
+        checks["ai_fix_rows_and_order"] = ai_ok
+        if not ai_ok:
+            mismatches.append("AI-fix rows/order mismatch")
 
-    for endpoint in ("api/status", "api/sync_status"):
-        actual = repository.rows(
-            "SELECT payload_json FROM source_observations WHERE run_id=? AND endpoint=?",
-            (run_id, endpoint),
-        )[0][0]
-        checks[endpoint + "_observation"] = _same_projection(
-            endpoint, json.loads(actual), _parse_json(snapshot.value(endpoint), endpoint)
-        )
-        if not checks[endpoint + "_observation"]:
-            mismatches.append(endpoint + " observation mismatch")
+    if "api/cycle/backup" in available:
+        backup_source = _parse_json(snapshot.value("api/cycle/backup"), "api/cycle/backup")
+        checks["backup_metadata_and_order"] = _raw_rows(
+            repository,
+            "SELECT raw_json FROM backup_metadata WHERE run_id=? ORDER BY position",
+            (run_id,),
+        ) == backup_source["backups"]
+        if not checks["backup_metadata_and_order"]:
+            mismatches.append("backup metadata/order mismatch")
 
-    for endpoint, stream in LOG_STREAMS.items():
-        rows = repository.rows(
-            "SELECT raw_line FROM audit_events WHERE run_id=? AND stream=? ORDER BY stream_seq",
-            (run_id, stream),
-        )
-        checks[stream + "_raw_bytes"] = b"".join(row[0] for row in rows) == snapshot.value(endpoint).body
-        if not checks[stream + "_raw_bytes"]:
-            mismatches.append(stream + " raw bytes mismatch")
+    if {"api/status", "api/sync_status"} <= available:
+        for endpoint in ("api/status", "api/sync_status"):
+            actual = repository.rows(
+                "SELECT payload_json FROM source_observations WHERE run_id=? AND endpoint=?",
+                (run_id, endpoint),
+            )[0][0]
+            checks[endpoint + "_observation"] = _same_projection(
+                endpoint, json.loads(actual), _parse_json(snapshot.value(endpoint), endpoint)
+            )
+            if not checks[endpoint + "_observation"]:
+                mismatches.append(endpoint + " observation mismatch")
+
+    if set(LOG_STREAMS) <= available:
+        for endpoint, stream in LOG_STREAMS.items():
+            rows = repository.rows(
+                "SELECT raw_line FROM audit_events WHERE run_id=? AND stream=? ORDER BY stream_seq",
+                (run_id, stream),
+            )
+            checks[stream + "_raw_bytes"] = b"".join(row[0] for row in rows) == snapshot.value(endpoint).body
+            if not checks[stream + "_raw_bytes"]:
+                mismatches.append(stream + " raw bytes mismatch")
     checks["source_hashes"] = not any(
         mismatch.startswith("source hash mismatch") for mismatch in mismatches
     )
@@ -585,7 +613,7 @@ def shadow_verify(repository, run_id, snapshot):
     )
     if not checks["no_settings_secret_columns"]:
         mismatches.append("settings secret column present")
-    return {"ok": not mismatches, "checks": checks, "mismatches": mismatches}
+    return {"ok": not mismatches, "source_set": snapshot.source_set, "checks": checks, "mismatches": mismatches}
 
 
 def import_candidate(snapshot, candidate_path):
@@ -594,19 +622,28 @@ def import_candidate(snapshot, candidate_path):
     run_id = uuid.uuid4().hex
     source_hash = _source_hash(snapshot)
     started_at = datetime.now(timezone.utc).isoformat()
+    available = set(snapshot.source_order)
     try:
         with repository.transaction():
             repository.begin_import(run_id, snapshot.snapshot_id, source_hash, started_at)
-            for position, endpoint in enumerate(SOURCE_ORDER):
+            for position, endpoint in enumerate(snapshot.source_order):
                 repository.add_source_snapshot(run_id, position, snapshot.value(endpoint))
-            _map_master(repository, run_id, snapshot)
-            _map_database(repository, run_id, snapshot)
-            _map_settings(repository, run_id, snapshot)
-            _map_cycle(repository, run_id, snapshot)
-            _map_logs(repository, run_id, snapshot)
-            _map_ai_status(repository, run_id, snapshot)
-            _map_backups(repository, run_id, snapshot)
-            _map_observations(repository, run_id, snapshot)
+            if "api/master" in available:
+                _map_master(repository, run_id, snapshot)
+            if "client_database.json" in available:
+                _map_database(repository, run_id, snapshot)
+            if "api/settings" in available:
+                _map_settings(repository, run_id, snapshot)
+            if "api/cycle/status" in available:
+                _map_cycle(repository, run_id, snapshot)
+            if set(LOG_STREAMS) <= available:
+                _map_logs(repository, run_id, snapshot)
+            if "api/ai_fix/status" in available:
+                _map_ai_status(repository, run_id, snapshot)
+            if "api/cycle/backup" in available:
+                _map_backups(repository, run_id, snapshot)
+            if {"api/status", "api/sync_status"} <= available:
+                _map_observations(repository, run_id, snapshot)
             report = shadow_verify(repository, run_id, snapshot)
             status = "verified" if report["ok"] else "failed"
             repository.finish_import(
@@ -615,6 +652,6 @@ def import_candidate(snapshot, candidate_path):
                 None if report["ok"] else "shadow_mismatch",
             )
         return ImportReceipt(str(candidate), run_id, snapshot.snapshot_id,
-                             source_hash, status, report)
+                             source_hash, status, report, snapshot.source_set)
     finally:
         repository.close()

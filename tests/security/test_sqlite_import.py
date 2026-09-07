@@ -17,8 +17,11 @@ from services.sqlite_import import (  # noqa: E402
     AiToolHttpSource,
     FidelityError,
     SOURCE_ORDER,
+    SOURCE_SET_FULL,
+    SOURCE_SET_WAVE1,
     SourceValue,
     UnstableSnapshotError,
+    WAVE1_RUNTIME_SOURCE_ORDER,
     _canonical_bytes,
     capture_stable_snapshot,
     import_candidate,
@@ -111,6 +114,12 @@ def fixture_values():
     }
 
 
+HTTP_ONLY_SOURCE_ORDER = tuple(
+    endpoint for endpoint in SOURCE_ORDER
+    if endpoint not in WAVE1_RUNTIME_SOURCE_ORDER
+)
+
+
 class FakeSource:
     def __init__(self, values, mutate_after=None):
         self.values = values
@@ -124,6 +133,58 @@ class FakeSource:
             payload = json.loads(value.body.decode("utf-8"))
             payload["clients"][0]["name"] = "changed"
             return source_value(endpoint, payload)
+        return value
+
+
+class Wave1MutatingSource(FakeSource):
+    def __init__(self, values, endpoint):
+        super().__init__(values)
+        self.endpoint = endpoint
+        self.changed = False
+
+    def fetch(self, endpoint):
+        value = super().fetch(endpoint)
+        if not self.changed and len(self.calls) > len(WAVE1_RUNTIME_SOURCE_ORDER):
+            if endpoint == self.endpoint:
+                payload = json.loads(value.body.decode("utf-8"))
+                if endpoint == "api/master":
+                    payload["clients"][0]["name"] += "-changed"
+                elif endpoint == "client_database.json":
+                    payload["clients"][0]["name"] += "-changed"
+                else:
+                    payload["tunnel_port"] += 1
+                self.values[endpoint] = source_value(endpoint, payload, value.content_type)
+                self.changed = True
+                return self.values[endpoint]
+        return value
+
+
+class Wave1HttpOnlyChangingSource(FakeSource):
+    def __init__(self, values, endpoint):
+        super().__init__(values)
+        self.endpoint = endpoint
+        self.changed = False
+
+    def fetch(self, endpoint):
+        value = super().fetch(endpoint)
+        if not self.changed and len(self.calls) == len(WAVE1_RUNTIME_SOURCE_ORDER):
+            if self.endpoint in (
+                "cache/activity_history.jsonl",
+                "cache/change_log.jsonl",
+                "cache/action.log",
+            ):
+                replace_bytes(
+                    self.values,
+                    self.endpoint,
+                    lambda body: body + b"mutation\n",
+                )
+            else:
+                replace_json(
+                    self.values,
+                    self.endpoint,
+                    lambda payload: payload.update({"mutation": True}),
+                )
+            self.changed = True
         return value
 
 
@@ -142,6 +203,13 @@ def replace_json(values, endpoint, mutate):
     payload = json.loads(values[endpoint].body.decode("utf-8"))
     mutate(payload)
     values[endpoint] = source_value(endpoint, payload, values[endpoint].content_type)
+
+
+def replace_bytes(values, endpoint, mutate):
+    value = values[endpoint]
+    values[endpoint] = source_value(
+        endpoint, mutate(value.body), value.content_type
+    )
 
 
 class SQLiteImportTests(unittest.TestCase):
@@ -169,6 +237,100 @@ class SQLiteImportTests(unittest.TestCase):
         self.assertEqual(tuple(fetched), SOURCE_ORDER)
         with self.assertRaises(Exception):
             source.fetch("cache/not-allowlisted.txt")
+
+    def test_wave1_snapshot_fetches_only_three_sources(self):
+        source = FakeSource(fixture_values())
+        snapshot = capture_stable_snapshot(
+            source, source_order=WAVE1_RUNTIME_SOURCE_ORDER, source_set=SOURCE_SET_WAVE1
+        )
+        self.assertEqual(source.calls, list(WAVE1_RUNTIME_SOURCE_ORDER) * 2)
+        self.assertEqual(tuple(snapshot.values), WAVE1_RUNTIME_SOURCE_ORDER)
+        self.assertEqual(snapshot.source_order, WAVE1_RUNTIME_SOURCE_ORDER)
+        self.assertEqual(snapshot.source_set, SOURCE_SET_WAVE1)
+        self.assertNotIn("api/cycle/status", source.calls)
+        self.assertNotIn("api/ai_fix/status", source.calls)
+
+    def test_wave1_import_reconstructs_three_domains_and_stores_three_sources(self):
+        snapshot = capture_stable_snapshot(
+            FakeSource(fixture_values()),
+            source_order=WAVE1_RUNTIME_SOURCE_ORDER,
+            source_set=SOURCE_SET_WAVE1,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            receipt = import_candidate(snapshot, Path(directory) / "candidate.sqlite3")
+            self.assertEqual(receipt.status, "verified")
+            self.assertEqual(receipt.source_set, SOURCE_SET_WAVE1)
+            self.assertEqual(receipt.checks["source_set"], SOURCE_SET_WAVE1)
+            self.assertEqual(receipt.checks["checks"]["source_set"], SOURCE_SET_WAVE1)
+            repository = SQLiteCandidateRepository.open_existing(receipt.candidate_path)
+            self.assertEqual(
+                repository.rows(
+                    "SELECT endpoint FROM source_snapshots WHERE run_id=? ORDER BY position",
+                    (receipt.run_id,),
+                ),
+                [(endpoint,) for endpoint in WAVE1_RUNTIME_SOURCE_ORDER],
+            )
+            for table, count in (("master_clients", 2), ("database_clients", 2), ("public_settings", 1)):
+                self.assertEqual(
+                    repository.rows(
+                        "SELECT COUNT(*) FROM " + table + " WHERE run_id=?",
+                        (receipt.run_id,),
+                    )[0][0],
+                    count,
+                )
+            checks_json = repository.rows(
+                "SELECT checks_json FROM import_runs WHERE run_id=?", (receipt.run_id,)
+            )[0][0]
+            self.assertEqual(json.loads(checks_json)["source_set"], SOURCE_SET_WAVE1)
+            self.assertEqual(
+                repository.rows(
+                    "SELECT COUNT(*) FROM cycle_state WHERE run_id=?", (receipt.run_id,)
+                )[0][0],
+                0,
+            )
+            repository.close()
+
+    def test_wave1_source_changes_fail_stability_for_each_runtime_source(self):
+        for endpoint in WAVE1_RUNTIME_SOURCE_ORDER:
+            with self.subTest(endpoint=endpoint), self.assertRaises(UnstableSnapshotError):
+                capture_stable_snapshot(
+                    Wave1MutatingSource(fixture_values(), endpoint),
+                    max_passes=2,
+                    source_order=WAVE1_RUNTIME_SOURCE_ORDER,
+                    source_set=SOURCE_SET_WAVE1,
+                )
+
+    def test_each_http_only_change_does_not_affect_wave1_stability(self):
+        for endpoint in HTTP_ONLY_SOURCE_ORDER:
+            with self.subTest(endpoint=endpoint):
+                source = Wave1HttpOnlyChangingSource(fixture_values(), endpoint)
+                snapshot = capture_stable_snapshot(
+                    source,
+                    max_passes=2,
+                    source_order=WAVE1_RUNTIME_SOURCE_ORDER,
+                    source_set=SOURCE_SET_WAVE1,
+                )
+                self.assertTrue(source.changed)
+                self.assertEqual(snapshot.source_set, SOURCE_SET_WAVE1)
+                self.assertEqual(source.calls, list(WAVE1_RUNTIME_SOURCE_ORDER) * 2)
+
+    def test_runtime_publishes_wave1_and_rejects_non_wave1_manifest(self):
+        from services.sqlite_runtime import GROUP_MASTER_DATABASE, SQLiteRuntimeCoordinator
+
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = SQLiteRuntimeCoordinator(
+                runtime_dir=directory,
+                read_enabled=True,
+                group_enabled={GROUP_MASTER_DATABASE: True},
+                background_refresh=False,
+                source_factory=lambda: FakeSource(fixture_values()),
+            )
+            self.assertTrue(runtime.refresh_now(GROUP_MASTER_DATABASE))
+            state = runtime.state()
+            self.assertEqual(state["current"]["source_set"], SOURCE_SET_WAVE1)
+            self.assertTrue(runtime._eligible(state, GROUP_MASTER_DATABASE))
+            state["current"]["source_set"] = SOURCE_SET_FULL
+            self.assertFalse(runtime._eligible(state, GROUP_MASTER_DATABASE))
 
     def _assert_rejected(self, mutate):
         values = fixture_values()

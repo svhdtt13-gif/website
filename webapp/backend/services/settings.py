@@ -65,10 +65,10 @@ def _decode_object(body):
     return value
 
 
-def get_settings():
+def get_settings(timeout=20):
     """GET api/settings and return only the shared public allowlist."""
     try:
-        body, status, _content_type = ai_tool.get("api/settings")
+        body, status, _content_type = ai_tool.get("api/settings", timeout=timeout)
     except UpstreamError as error:
         _safe_upstream_error(error.status)
 
@@ -122,12 +122,20 @@ def _project_success(body, status, content_type):
     )
 
 
-def update_settings(body, content_type="application/json"):
+def update_settings(body, content_type="application/json", before_upstream_write=None):
     """Validate safe partial settings, write once, then redact the response."""
     request_body = _prepare_update(body, content_type)
+    expected_observation = {
+        "endpoint": "api/settings",
+        "fields": json.loads(request_body.decode("utf-8")),
+    }
     with _SETTINGS_WRITE_LOCK:
         try:
-            result = ai_tool.post("api/settings", request_body, "application/json")
+            if before_upstream_write is None:
+                result = ai_tool.post("api/settings", request_body, "application/json")
+                return _project_success(*result)
+            with before_upstream_write(expected_observation):
+                result = ai_tool.post("api/settings", request_body, "application/json")
+                return _project_success(*result)
         except UpstreamError as error:
             _safe_upstream_error(error.status)
-        return _project_success(*result)

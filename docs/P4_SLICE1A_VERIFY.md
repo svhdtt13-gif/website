@@ -19,11 +19,15 @@ as operational write targets.
 ## Implemented proof
 
 - Schema version and checksum are persisted in `schema_meta`.
+- Actual schema identity is derived from `sqlite_master` plus table columns,
+  indexes and foreign keys; metadata alone is not trusted.
 - `WAL`, foreign keys and SQLite integrity checks are required at open/create.
 - Operational path guard rejects arbitrary paths and P3 generation paths.
 - SQLite authorizer rejects `ATTACH` and `DETACH` on the operational connection.
 - Explicit transaction primitive uses `BEGIN IMMEDIATE` and rolls back on error.
+- Each claimed job persists its exact `lease_name` alongside `owner_id`.
 - Job claim and lease heartbeat update their related rows atomically.
+- Heartbeat is scoped to the exact `(owner_id, lease_name)` binding.
 - Online backup writes a sidecar manifest containing schema identity, size and
   SHA-256.
 - Restore verifies the manifest and integrity-checks a temporary copy before
@@ -41,17 +45,26 @@ python tests\security\test_operational_sqlite.py
 python -m py_compile webapp\backend\repositories\operational_sqlite.py tests\security\test_operational_sqlite.py
 ```
 
-Result on branch `p4-slice1a-operational-runtime`:
+Result after the blocker fix on branch `p4-slice1a-operational-runtime`:
 
 ```text
-........
-Ran 8 tests in 3.936s
+..........
+Ran 10 tests in 4.932s
 OK
 ```
 
+The 10 tests include:
+
+- same-owner, different-lease heartbeat isolation;
+- schema tamper with unchanged `schema_meta`, failing closed;
+- P3 hash and `st_mtime_ns` preservation through backup/restore;
+- path, `ATTACH`, WAL/FK/integrity, transaction, active-lease and corrupt-backup checks.
+
+The implementation blocker fix was committed at `f6b7cd032f8a7d75a190078ba116c2300236198c`.
+
 ## Boundary evidence
 
-The implementation diff adds only:
+The implementation diff remains limited to:
 
 - `webapp/backend/repositories/operational_sqlite.py`
 - `tests/security/test_operational_sqlite.py`
@@ -59,8 +72,8 @@ The implementation diff adds only:
 
 No `app.py`, `config.py`, `services/sqlite_runtime.py`, scheduler, AutoCycle,
 remote I/O, WebSocket, route handler, or write endpoint was changed. Because
-there is no Flask/control-path import or wiring in this slice, the existing
-route behavior remains the baseline behavior.
+there is no Flask/control-path import or wiring in this slice, existing route
+behavior remains the baseline behavior.
 
 ## Not claimed by this slice
 

@@ -30,6 +30,8 @@ def main():
     store = read(os.path.join("js", "store.js"))
     main_js = read(os.path.join("js", "main.js"))
     views = read(os.path.join("js", "views.js"))
+    context = read(os.path.join("js", "profile_context.js"))
+    policy = read(os.path.join("js", "runtime_policy.js"))
 
     expected_endpoints = {
         "cycle": "/up/api/cycle/status",
@@ -50,7 +52,7 @@ def main():
           and "credentials: 'same-origin'" in api)
     check("frontend has one read-only fetch helper", api.count("fetch(path") == 1)
 
-    source = "\n".join((index, api, store, main_js, views))
+    source = "\n".join((index, api, store, main_js, views, context, policy))
     check("U1 frontend has no remote-live selector", "remote_live" not in source)
     check("U1 frontend has no write request methods", not any(
         token in source for token in ("method: 'POST'", "method: 'PUT'",
@@ -63,14 +65,18 @@ def main():
         check(f"{panel} panel is present", f'data-panel="{panel}"' in index)
     for label in ("Auto Sync", "AI fix", "Public settings", "Cycle Backups"):
         check(f"{label} label is present", label in index)
-    for context_id in ("contextHost", "contextProfile", "contextAccount", "contextIdentity", "contextAuthority", "contextScope"):
-        check(f"{context_id} context field is present", f'id="{context_id}"' in index)
-    check("context is sourced from a future profile-aware read field",
-          "profile_context" in views and "READ ONLY / FAIL CLOSED" in index)
-    check("mixed profile context fails closed", "CONTEXT CONFLICT / FAIL CLOSED" in views
-          and "Conflicting host/profile context" in views)
-    check("cycle stop intent remains visible", "cycle_stopped" not in source
-          and "Cycle stop intent" in views and "STOP REQUESTED" in views)
+    for scope_id in ("scopeCycle", "scopeSync", "scopeAiFix", "scopeBackups", "scopeSettings"):
+        check(f"{scope_id} provenance field is present", f'id="{scope_id}"' in index)
+    check("context is resolved per panel source", "panelContext" in views
+          and "PANEL_SOURCES" in views and "sourceKeys" in context)
+    check("missing context never borrows another panel", "UNSCOPED READ" in context
+          and "PROFILE-SCOPED READ" in context)
+    check("mixed profile context fails closed", "CONTEXT CONFLICT / FAIL CLOSED" in context
+          and "Data suppressed" in context)
+    check("cycle stop is separate from sync read permission", "cycleStopRequested" in policy
+          and "syncReadAllowed" in policy
+          and "Cycle stop effect" in views
+          and "Read-only observation/reconciliation" in views)
     check("failed reads clear stale panel data", "Promise.allSettled" in store
           and "store[key] = null" in store)
     check("golden db.html boundary is visible", "tools/db.html" in index)

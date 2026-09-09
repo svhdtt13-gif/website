@@ -63,10 +63,16 @@ def main():
         check(f"{panel} panel is present", f'data-panel="{panel}"' in index)
     for label in ("Auto Sync", "AI fix", "Public settings", "Cycle Backups"):
         check(f"{label} label is present", label in index)
-    for context_id in ("contextHost", "contextProfile", "contextAccount", "contextIdentity", "contextAuthority"):
+    for context_id in ("contextHost", "contextProfile", "contextAccount", "contextIdentity", "contextAuthority", "contextScope"):
         check(f"{context_id} context field is present", f'id="{context_id}"' in index)
     check("context is sourced from a future profile-aware read field",
           "profile_context" in views and "READ ONLY / FAIL CLOSED" in index)
+    check("mixed profile context fails closed", "CONTEXT CONFLICT / FAIL CLOSED" in views
+          and "Conflicting host/profile context" in views)
+    check("cycle stop intent remains visible", "cycle_stopped" not in source
+          and "Cycle stop intent" in views and "STOP REQUESTED" in views)
+    check("failed reads clear stale panel data", "Promise.allSettled" in store
+          and "store[key] = null" in store)
     check("golden db.html boundary is visible", "tools/db.html" in index)
     check("refresh loop is bounded to ten seconds", "setInterval" in main_js and "10000" in main_js)
 

@@ -40,15 +40,21 @@ def _read_only_connection(path: Path) -> sqlite3.Connection:
 def _validate_meta(connection: sqlite3.Connection) -> None:
     try:
         meta = dict(connection.execute("SELECT key, value FROM schema_meta"))
+        integrity = connection.execute("PRAGMA integrity_check").fetchone()[0]
     except sqlite3.Error as error:
         raise ProfileManagerUnavailable("portable profile store unavailable") from error
-    if meta.get("store_kind") != STORE_KIND or meta.get("schema_version") != str(SCHEMA_VERSION):
+    if (
+        meta.get("store_kind") != STORE_KIND
+        or meta.get("schema_version") != str(SCHEMA_VERSION)
+        or integrity != "ok"
+    ):
         raise ProfileManagerUnavailable("portable profile store unavailable")
 
 
 def _safe_reference(value: object) -> str:
-    if type(value) is not str or not value.strip() or any(
-        marker in value.lower() for marker in ("password", "token", "cookie", "session", "secret")
+    if type(value) is not str or not value.strip() or "://" in value or any(
+        marker in value.lower()
+        for marker in ("password", "token", "cookie", "session", "secret")
     ):
         raise ProfileManagerUnavailable("portable profile store unavailable")
     return value
@@ -90,9 +96,15 @@ def _read_model(path: Path) -> dict[str, object]:
 
     binding_by_profile: dict[str, dict[str, object]] = {}
     active_bindings: list[dict[str, object]] = []
+    active_profiles: set[str] = set()
+    active_hosts: set[str] = set()
     for row in bindings:
         current = _binding(row)
         if row["state"] == "ACTIVE":
+            if row["profile_id"] in active_profiles or row["host_id"] in active_hosts:
+                raise ProfileManagerUnavailable("portable profile store unavailable")
+            active_profiles.add(row["profile_id"])
+            active_hosts.add(row["host_id"])
             active_bindings.append(current)
         previous = binding_by_profile.get(row["profile_id"])
         if previous is None or (

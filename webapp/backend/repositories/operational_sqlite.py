@@ -444,6 +444,7 @@ class OperationalSQLiteRepository:
     def backup_to(self, backup_path=None):
         """Create a verified SQLite backup and sidecar manifest."""
         self.connection.commit()
+        self._validate_schema()
         checkpoint = self.connection.execute(
             "PRAGMA wal_checkpoint(TRUNCATE)"
         ).fetchone()
@@ -508,8 +509,8 @@ class OperationalSQLiteRepository:
         temporary = operational_path(runtime_dir).with_suffix(".restore.tmp")
         temporary.parent.mkdir(parents=True, exist_ok=True)
         try:
-            if not _integrity_ok(source):
-                raise OperationalIntegrityError("backup integrity check failed")
+            source_repository = cls(source, runtime_dir)
+            source_repository._validate_schema()
             try:
                 temporary.unlink()
             except FileNotFoundError:
@@ -522,12 +523,12 @@ class OperationalSQLiteRepository:
         finally:
             source.close()
         try:
-            restored = sqlite3.connect(str(temporary), isolation_level=None)
+            candidate = cls._connect(temporary)
             try:
-                if not _integrity_ok(restored):
-                    raise OperationalIntegrityError("restored database integrity failed")
+                candidate_repository = cls(candidate, runtime_dir)
+                candidate_repository._validate_schema()
             finally:
-                restored.close()
+                candidate.close()
             os.replace(temporary, operational_path(runtime_dir))
         finally:
             try:

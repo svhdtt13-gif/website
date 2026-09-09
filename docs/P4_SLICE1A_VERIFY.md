@@ -28,6 +28,10 @@ as operational write targets.
 - Each claimed job persists its exact `lease_name` alongside `owner_id`.
 - Job claim and lease heartbeat update their related rows atomically.
 - Heartbeat is scoped to the exact `(owner_id, lease_name)` binding.
+- `backup_to()` validates the live source schema and integrity before checkpoint
+  or copying it.
+- Restore validates manifest, hash, integrity and actual schema on the source
+  backup, then validates the copied candidate before `os.replace()`.
 - Online backup writes a sidecar manifest containing schema identity, size and
   SHA-256.
 - Restore verifies the manifest and integrity-checks a temporary copy before
@@ -45,22 +49,28 @@ python tests\security\test_operational_sqlite.py
 python -m py_compile webapp\backend\repositories\operational_sqlite.py tests\security\test_operational_sqlite.py
 ```
 
-Result after the blocker fix on branch `p4-slice1a-operational-runtime`:
+Result after the restore-preflight fix on branch `p4-slice1a-operational-runtime`:
 
 ```text
-..........
-Ran 10 tests in 4.932s
+............
+Ran 12 tests in <runtime-dependent>.
 OK
 ```
 
-The 10 tests include:
+The 12 tests include:
 
 - same-owner, different-lease heartbeat isolation;
 - schema tamper with unchanged `schema_meta`, failing closed;
+- invalid live source rejected before backup output is written;
+- hash-valid, integrity-valid but schema-invalid restore rejected without
+  replacing the current operational database;
 - P3 hash and `st_mtime_ns` preservation through backup/restore;
 - path, `ATTACH`, WAL/FK/integrity, transaction, active-lease and corrupt-backup checks.
 
-The implementation blocker fix was committed at `f6b7cd032f8a7d75a190078ba116c2300236198c`.
+The earlier implementation blocker fix was committed at
+`f6b7cd032f8a7d75a190078ba116c2300236198c`. The restore-preflight fix is in
+commit `4f5399dbe6991d40dadbad2aefde7c3facfd496f` plus the regression commit
+following it.
 
 ## Boundary evidence
 

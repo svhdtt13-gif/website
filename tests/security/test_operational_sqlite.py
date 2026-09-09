@@ -6,7 +6,6 @@ from pathlib import Path
 import sqlite3
 import sys
 import tempfile
-import time
 import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -40,7 +39,10 @@ class OperationalSQLiteTests(unittest.TestCase):
         )
         self.assertEqual(self.repository.rows("PRAGMA foreign_keys")[0][0], 1)
         self.assertEqual(self.repository.rows("PRAGMA integrity_check")[0][0], "ok")
-        schema = dict(self.repository.rows("SELECT key, value FROM schema_meta"))
+        schema = {
+            row[0]: row[1]
+            for row in self.repository.rows("SELECT key, value FROM schema_meta")
+        }
         self.assertEqual(schema["schema_version"], str(SCHEMA_VERSION))
         self.assertEqual(schema["schema_checksum"], SCHEMA_CHECKSUM)
         tables = {
@@ -113,8 +115,14 @@ class OperationalSQLiteTests(unittest.TestCase):
         lease = self.repository.rows(
             "SELECT owner_id, heartbeat_at, expires_at FROM leases WHERE lease_name='remote_io'"
         )[0]
-        self.assertEqual(tuple(job), ("claimed", "owner-a", 1, "2026-09-09T10:05:00+00:00"))
-        self.assertEqual(tuple(lease), ("owner-a", "2026-09-09T10:00:01+00:00", "2026-09-09T10:05:00+00:00"))
+        self.assertEqual(
+            tuple(job),
+            ("claimed", "owner-a", 1, "2026-09-09T10:05:00+00:00"),
+        )
+        self.assertEqual(
+            tuple(lease),
+            ("owner-a", "2026-09-09T10:00:01+00:00", "2026-09-09T10:05:00+00:00"),
+        )
         self.assertTrue(
             self.repository.heartbeat_lease(
                 "remote_io", "owner-a", "2026-09-09T10:01:00+00:00",
@@ -142,12 +150,10 @@ class OperationalSQLiteTests(unittest.TestCase):
                 now="2026-09-09T10:00:01+00:00",
             )
         )
-        self.assertEqual(
-            self.repository.rows(
-                "SELECT owner_id, attempt FROM jobs WHERE job_id='job-2'"
-            )[0],
-            ("owner-a", 1),
-        )
+        row = self.repository.rows(
+            "SELECT owner_id, attempt FROM jobs WHERE job_id='job-2'"
+        )[0]
+        self.assertEqual(tuple(row), ("owner-a", 1))
 
     def test_backup_restore_preserves_p3_hash_and_mtime(self):
         p3 = self.runtime / "sqlite" / "f2e2bd.sqlite3"

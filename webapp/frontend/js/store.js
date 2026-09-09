@@ -1,16 +1,27 @@
-// Kho state + điều phối tải dữ liệu (không đụng DOM).
-import { getJSON, ENDPOINTS } from './api.js';
-export const store = { cycle: null, sync: null, master: null, ai: null };
+import { ENDPOINTS, getJSON } from './api.js';
+
+export const store = {
+  cycle: null,
+  cycleSimple: null,
+  sync: null,
+  general: null,
+  aiFix: null,
+  backups: null,
+  settings: null,
+  errors: {},
+  refreshedAt: null,
+};
+
 export async function refreshStore() {
-  const [cycle, sync, master, ai] = await Promise.all([
-    getJSON(ENDPOINTS.cycle),
-    getJSON(ENDPOINTS.sync),
-    getJSON(ENDPOINTS.master),
-    getJSON(ENDPOINTS.aiFix),
-  ]);
-  store.cycle = cycle;
-  store.sync = sync;
-  store.master = master;
-  store.ai = ai;
+  const entries = Object.entries(ENDPOINTS);
+  const results = await Promise.allSettled(entries.map(([, endpoint]) => getJSON(endpoint)));
+  const errors = {};
+  entries.forEach(([key], index) => {
+    const result = results[index];
+    if (result.status === 'fulfilled') store[key] = result.value;
+    else errors[key] = result.reason instanceof Error ? result.reason.message : 'Unavailable';
+  });
+  store.errors = errors;
+  store.refreshedAt = new Date().toISOString();
   return store;
 }

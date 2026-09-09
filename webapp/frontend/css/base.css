@@ -1,7 +1,21 @@
-:root{--bg:#0b1220;--card:#111a2e;--text:#e5e9f0;--sub:#8b93a7;--good:#22c55e;--bad:#ef4444;--warn:#f59e0b;}
-*{box-sizing:border-box;}
-body{font-family:'Inter','Segoe UI',system-ui,sans-serif;background:var(--bg);color:var(--text);margin:0;padding:24px;}
-header h1{margin:0 0 4px;font-size:1.4rem;}
-header small{color:var(--sub);font-weight:400;}
-footer{margin-top:16px;color:var(--sub);font-size:.8rem;}
-@media (max-width:640px){body{padding:12px;}}
+:root{
+  --bg:#08111f;
+  --surface:#0e1a2d;
+  --card:#12223a;
+  --card-strong:#172b47;
+  --line:rgba(148,163,184,.16);
+  --text:#edf5ff;
+  --muted:#91a3b8;
+  --cyan:#45d5e8;
+  --green:#48d597;
+  --amber:#f6b94d;
+  --violet:#b39aff;
+  --red:#ff7777;
+}
+*{box-sizing:border-box}
+html{min-width:320px;background:var(--bg)}
+body{margin:0;background:radial-gradient(circle at 85% 0%,rgba(69,213,232,.1),transparent 30rem),var(--bg);color:var(--text);font-family:Inter,ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif;line-height:1.45}
+button,input{font:inherit}
+code{color:var(--cyan);font-family:"SFMono-Regular",Consolas,monospace}
+.app-shell{max-width:1420px;margin:0 auto;padding:34px 28px 24px}
+@media(max-width:720px){.app-shell{padding:22px 14px 18px}}

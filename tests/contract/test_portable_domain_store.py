@@ -213,6 +213,63 @@ class ShadowImporterTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_import_reconciles_deleted_rows_without_touching_profile_b(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = PortableDomainStore.create(Path(directory) / "portable.sqlite3")
+            try:
+                for profile, host, account in (
+                    ("profile-a", "host-a", "account-a"),
+                    ("profile-b", "host-b", "account-b"),
+                ):
+                    import_shadow(
+                        store,
+                        GoldenSnapshot(
+                            clients=({"client": "keep", "name": profile}, {"client": "remove", "name": "stale"}),
+                            schedules=({"id": "keep", "group": profile, "open": "04:00", "close": "08:00"},
+                                       {"id": "remove", "group": "stale", "open": "08:00", "close": "12:00"}),
+                            policies=({"id": "keep", "key": "keep", "value": profile},
+                                      {"id": "remove", "key": "remove", "value": "stale"}),
+                        ),
+                        LegacyBinding(host, profile, account, "binding-" + profile), NOW,
+                    )
+                import_shadow(
+                    store,
+                    GoldenSnapshot(
+                        clients=({"client": "keep", "name": "updated"},),
+                        schedules=({"id": "keep", "group": "profile-a", "open": "05:00", "close": "09:00"},),
+                        policies=({"id": "keep", "key": "keep", "value": "updated"},),
+                    ),
+                    LegacyBinding("host-a", "profile-a", "account-a", "binding-profile-a"), NOW,
+                )
+                self.assertEqual([row["client_id"] for row in store.list_clients("profile-a")], ["keep"])
+                self.assertEqual([row["schedule_id"] for row in store.list_schedules("profile-a")], ["keep"])
+                self.assertEqual([row["policy_id"] for row in store.list_policies("profile-a")], ["keep"])
+                self.assertEqual([row["client_id"] for row in store.list_clients("profile-b")], ["keep", "remove"])
+                self.assertEqual([row["schedule_id"] for row in store.list_schedules("profile-b")], ["keep", "remove"])
+                self.assertEqual([row["policy_id"] for row in store.list_policies("profile-b")], ["keep", "remove"])
+            finally:
+                store.close()
+
+    def test_invalid_snapshot_rolls_back_host_binding_and_domain_rows(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = PortableDomainStore.create(Path(directory) / "portable.sqlite3")
+            try:
+                invalid = GoldenSnapshot(
+                    clients=({"client": "valid", "name": "valid"}, {"name": "missing-id"}),
+                    schedules=({"id": "schedule", "group": "A", "open": "04:00", "close": "08:00"},),
+                )
+                with self.assertRaises(ShadowImportError):
+                    import_shadow(
+                        store, invalid,
+                        LegacyBinding("host-a", "profile-a", "account-a", "binding-a"), NOW,
+                    )
+                for table in ("hosts", "remote_profiles", "host_profile_bindings", "profile_clients",
+                              "profile_schedules", "profile_policies", "profile_control_intents",
+                              "profile_observations", "profile_audit_events"):
+                    self.assertEqual(store.connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0], 0, table)
+            finally:
+                store.close()
+
     def test_resume_clears_only_legacy_stop_intent(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

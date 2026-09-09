@@ -100,42 +100,56 @@ def import_shadow(store: PortableDomainStore, snapshot: GoldenSnapshot,
     binding.validate()
     if not now.strip():
         raise ShadowImportError("now is required")
-    store.ensure_host(binding.host_id, binding.host_id, "legacy-explicit-binding", now)
-    store.ensure_profile(binding.profile_id, binding.profile_id, binding.account_ref, "VERIFIED", now)
-    store.ensure_binding(binding.binding_id, binding.host_id, binding.profile_id,
-                         binding.account_ref, binding.binding_generation, "ACTIVE", now)
+    with store.transaction():
+        store.ensure_host(binding.host_id, binding.host_id, "legacy-explicit-binding", now)
+        store.ensure_profile(binding.profile_id, binding.profile_id, binding.account_ref, "VERIFIED", now)
+        store.ensure_binding(binding.binding_id, binding.host_id, binding.profile_id,
+                             binding.account_ref, binding.binding_generation, "ACTIVE", now)
 
-    for position, client in enumerate(snapshot.clients):
-        client_id = str(_value(client, "client", "client_id", "id", default="")).strip()
-        if not client_id:
-            raise ShadowImportError("client without explicit client id")
-        store.upsert_client(
-            binding.profile_id, client_id, str(_value(client, "name", "display_name", default=client_id)),
-            str(_value(client, "group", "group_name", default="none")),
-            str(_value(client, "status", default="unknown")), "legacy-shadow-import",
-        )
-    for position, schedule in enumerate(snapshot.schedules):
-        schedule_id = str(_value(schedule, "schedule_id", "id", default=f"schedule-{position}"))
-        store.upsert_schedule(
-            binding.profile_id, schedule_id,
-            str(_value(schedule, "group", "group_name", default="none")),
-            str(_value(schedule, "open", "open_time", default="")),
-            str(_value(schedule, "close", "close_time", default="")),
-            bool(_value(schedule, "enabled", default=True)),
-        )
-    for position, policy in enumerate(snapshot.policies):
-        key = str(_value(policy, "key", "policy_key", default=f"policy-{position}"))
-        store.upsert_policy(binding.profile_id, str(_value(policy, "policy_id", "id", default=key)),
-                            key, str(_value(policy, "value", "policy_value", default="")))
-    if snapshot.cycle_stopped:
-        store.upsert_cycle_stopped(binding.profile_id, "legacy-cycle-stopped", "REQUESTED", now,
-                                   "legacy:cycle_stopped.flag", "shadow import of explicit profile binding")
-    else:
-        store.clear_legacy_cycle_stopped(binding.profile_id, now)
-    store.upsert_observation(binding.profile_id, f"shadow-{now}", now, "legacy-shadow-import",
-                             "import_source", "ai-tool-golden")
-    store.upsert_audit_event(binding.profile_id, f"shadow-{now}", now, "shadow_import",
-                             "importer", "read-only legacy shadow import", "legacy-shadow-import")
+        client_ids: set[str] = set()
+        for client in snapshot.clients:
+            client_id = str(_value(client, "client", "client_id", "id", default="")).strip()
+            if not client_id:
+                raise ShadowImportError("client without explicit client id")
+            client_ids.add(client_id)
+            store.upsert_client(
+                binding.profile_id, client_id, str(_value(client, "name", "display_name", default=client_id)),
+                str(_value(client, "group", "group_name", default="none")),
+                str(_value(client, "status", default="unknown")), "legacy-shadow-import",
+            )
+        store.reconcile_clients(binding.profile_id, client_ids)
+
+        schedule_ids: set[str] = set()
+        for position, schedule in enumerate(snapshot.schedules):
+            schedule_id = str(_value(schedule, "schedule_id", "id", default=f"schedule-{position}"))
+            schedule_ids.add(schedule_id)
+            store.upsert_schedule(
+                binding.profile_id, schedule_id,
+                str(_value(schedule, "group", "group_name", default="none")),
+                str(_value(schedule, "open", "open_time", default="")),
+                str(_value(schedule, "close", "close_time", default="")),
+                bool(_value(schedule, "enabled", default=True)),
+            )
+        store.reconcile_schedules(binding.profile_id, schedule_ids)
+
+        policy_ids: set[str] = set()
+        for position, policy in enumerate(snapshot.policies):
+            key = str(_value(policy, "key", "policy_key", default=f"policy-{position}"))
+            policy_id = str(_value(policy, "policy_id", "id", default=key))
+            policy_ids.add(policy_id)
+            store.upsert_policy(binding.profile_id, policy_id, key,
+                                str(_value(policy, "value", "policy_value", default="")))
+        store.reconcile_policies(binding.profile_id, policy_ids)
+
+        if snapshot.cycle_stopped:
+            store.upsert_cycle_stopped(binding.profile_id, "legacy-cycle-stopped", "REQUESTED", now,
+                                       "legacy:cycle_stopped.flag", "shadow import of explicit profile binding")
+        else:
+            store.clear_legacy_cycle_stopped(binding.profile_id, now)
+        store.upsert_observation(binding.profile_id, f"shadow-{now}", now, "legacy-shadow-import",
+                                 "import_source", "ai-tool-golden")
+        store.upsert_audit_event(binding.profile_id, f"shadow-{now}", now, "shadow_import",
+                                 "importer", "read-only legacy shadow import", "legacy-shadow-import")
     return {"profile_id": binding.profile_id, "clients": len(snapshot.clients),
             "schedules": len(snapshot.schedules), "policies": len(snapshot.policies),
             "cycle_stopped": int(snapshot.cycle_stopped)}

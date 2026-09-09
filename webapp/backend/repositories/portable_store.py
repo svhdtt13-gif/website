@@ -178,6 +178,7 @@ class PortableDomainStore:
     def __init__(self, connection: sqlite3.Connection, path: Path):
         self.connection = connection
         self.path = path
+        self._transaction_depth = 0
 
     @classmethod
     def create(cls, path: Path | str) -> "PortableDomainStore":
@@ -259,11 +260,18 @@ class PortableDomainStore:
 
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:
+        outer = self._transaction_depth == 0
+        self._transaction_depth += 1
         try:
-            with self.connection:
+            if outer:
+                with self.connection:
+                    yield self.connection
+            else:
                 yield self.connection
         except sqlite3.IntegrityError as exc:
             raise BindingError(str(exc)) from exc
+        finally:
+            self._transaction_depth -= 1
 
     def close(self) -> None:
         self.connection.close()
@@ -404,6 +412,9 @@ class PortableDomainStore:
         )
         return [dict(row) for row in rows]
 
+    def reconcile_clients(self, profile_id: str, client_ids: set[str]) -> None:
+        self._delete_unlisted("profile_clients", "client_id", profile_id, client_ids)
+
     def upsert_schedule(self, profile_id: str, schedule_id: str, group_name: str,
                         open_time: str, close_time: str, enabled: bool) -> None:
         values = [_profile_id(profile_id), _required(schedule_id, "schedule_id"),
@@ -424,6 +435,9 @@ class PortableDomainStore:
             "FROM profile_schedules WHERE profile_id=? ORDER BY schedule_id", (profile_id,)
         )]
 
+    def reconcile_schedules(self, profile_id: str, schedule_ids: set[str]) -> None:
+        self._delete_unlisted("profile_schedules", "schedule_id", profile_id, schedule_ids)
+
     def upsert_policy(self, profile_id: str, policy_id: str, policy_key: str,
                       policy_value: str) -> None:
         values = [_profile_id(profile_id), _required(policy_id, "policy_id"),
@@ -442,6 +456,22 @@ class PortableDomainStore:
             "SELECT policy_id, policy_key, policy_value FROM profile_policies "
             "WHERE profile_id=? ORDER BY policy_id", (profile_id,)
         )]
+
+    def reconcile_policies(self, profile_id: str, policy_ids: set[str]) -> None:
+        self._delete_unlisted("profile_policies", "policy_id", profile_id, policy_ids)
+
+    def _delete_unlisted(self, table: str, key_column: str, profile_id: str,
+                         keep_ids: set[str]) -> None:
+        profile_id = _profile_id(profile_id)
+        keep_ids = {_required(value, key_column) for value in keep_ids}
+        query = f"DELETE FROM {table} WHERE profile_id=?"
+        values: list[str] = [profile_id]
+        if keep_ids:
+            placeholders = ", ".join("?" for _ in keep_ids)
+            query += f" AND {key_column} NOT IN ({placeholders})"
+            values.extend(sorted(keep_ids))
+        with self.transaction():
+            self.connection.execute(query, values)
 
     def upsert_cycle_stopped(self, profile_id: str, intent_id: str, state: str,
                              requested_at: str, source_ref: str, reason: str) -> None:

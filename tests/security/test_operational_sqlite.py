@@ -248,8 +248,11 @@ class OperationalSQLiteTests(unittest.TestCase):
         self.repository.close()
         before = hashlib.sha256(operational_path(self.runtime).read_bytes()).hexdigest()
 
-        with sqlite3.connect(backup) as candidate:
+        candidate = sqlite3.connect(backup)
+        try:
             candidate.execute("ALTER TABLE jobs ADD COLUMN tampered TEXT")
+        finally:
+            candidate.close()
         metadata = json.loads(manifest.read_text(encoding="utf-8"))
         metadata["size"] = backup.stat().st_size
         metadata["sha256"] = hashlib.sha256(backup.read_bytes()).hexdigest()

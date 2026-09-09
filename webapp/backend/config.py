@@ -25,6 +25,12 @@ SQLITE_FRESHNESS_SECONDS = int(os.environ.get("SQLITE_FRESHNESS_SECONDS", "60"))
 SQLITE_REFRESH_TIMEOUT_SECONDS = int(os.environ.get("SQLITE_REFRESH_TIMEOUT_SECONDS", "15"))
 SQLITE_MUTEX_NAME = "Local\\WebsiteSQLiteGenerationMutex"
 
+# The profile manager reads this store directly in SQLite read-only mode.
+PORTABLE_STORE_PATH = Path(os.environ.get(
+    "PORTABLE_STORE_PATH",
+    str(Path(__file__).resolve().parent / ".runtime" / "portable" / "portable_domain.sqlite3"),
+))
+
 # Chi cac endpoint GET nay duoc proxy (read-only). Moi thu khac -> 403.
 READ_ONLY_ALLOWLIST = {
     "api/cycle/status",

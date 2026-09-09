@@ -1,0 +1,12 @@
+.profile-manager-panel{margin-top:14px;background:linear-gradient(120deg,rgba(179,154,255,.09),rgba(69,213,232,.06))}
+.profile-manager-toolbar{display:flex;justify-content:space-between;gap:18px;align-items:flex-end;margin:14px 0 12px}
+.profile-manager-toolbar label{display:flex;flex-direction:column;gap:6px;color:var(--muted);font-size:.7rem;font-weight:700;letter-spacing:.08em;text-transform:uppercase}
+.profile-manager-toolbar select{min-width:260px;padding:9px 10px;border:1px solid rgba(148,163,184,.25);border-radius:8px;background:var(--card);color:var(--text)}
+.profile-manager-toolbar select:focus{outline:2px solid rgba(69,213,232,.5);outline-offset:2px}
+.profile-manager-status{margin:0;color:var(--muted);font-size:.82rem}
+.profile-runtime-owner{color:var(--cyan);font-family:"SFMono-Regular",Consolas,monospace;font-size:.75rem}
+.profile-controls{display:flex;gap:8px;flex-wrap:wrap;margin-top:14px}
+.profile-controls button{padding:8px 10px;border:1px solid rgba(148,163,184,.2);border-radius:8px;background:rgba(148,163,184,.08);color:var(--muted);font-size:.75rem}
+.profile-controls button:disabled{cursor:not-allowed;opacity:.62}
+.profile-manager-table{margin-top:14px}
+@media(max-width:680px){.profile-manager-toolbar{align-items:stretch;flex-direction:column}.profile-manager-toolbar select{min-width:0;width:100%}}

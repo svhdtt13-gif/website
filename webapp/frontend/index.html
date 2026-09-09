@@ -7,6 +7,7 @@
 <title>AutoGhostStory - U1 Read-only Operator Dashboard</title>
 <link rel="stylesheet" href="css/base.css" />
 <link rel="stylesheet" href="css/components.css" />
+<link rel="stylesheet" href="css/profile_manager.css" />
 </head>
 <body>
 <div class="app-shell">
@@ -36,6 +37,40 @@
       <div><dt>Settings panel</dt><dd id="scopeSettings">UNSCOPED READ</dd></div>
       <div><dt>Control authority</dt><dd id="contextAuthority">READ ONLY / FAIL CLOSED</dd></div>
     </dl>
+  </section>
+
+  <section id="profileManager" class="panel profile-manager-panel" aria-label="Remote Profile Manager foundation">
+    <div class="panel-heading">
+      <div>
+        <p class="panel-kicker">Remote Profile Manager / foundation</p>
+        <h2>Profiles and bindings</h2>
+      </div>
+      <span class="health health-readonly">READ ONLY</span>
+    </div>
+    <p class="panel-provenance">VIEWED PROFILE IS BROWSER-LOCAL / RUNTIME OWNER REMAINS LEGACY AUTHORITY</p>
+    <div class="profile-manager-toolbar">
+      <label for="profileViewSelect">Viewed profile (local view only)
+        <select id="profileViewSelect" aria-label="Viewed profile">
+          <option value="">Loading profiles...</option>
+        </select>
+      </label>
+      <div>Active runtime owner<br /><strong id="profileRuntimeOwner" class="profile-runtime-owner">UNOBSERVED / LEGACY AUTHORITY</strong></div>
+    </div>
+    <p id="profileManagerStatus" class="profile-manager-status">Reading portable profile state.</p>
+    <div id="profileManagerBody"></div>
+    <div class="table-wrap profile-manager-table">
+      <table>
+        <thead>
+          <tr><th>Profile</th><th>ID</th><th>Status</th><th>Bound host</th><th>Binding state</th></tr>
+        </thead>
+        <tbody id="profileManagerBodyRows"><tr><td colspan="5" class="empty-cell">Loading profile metadata...</td></tr></tbody>
+      </table>
+    </div>
+    <div class="profile-controls" aria-label="Deferred profile controls">
+      <button type="button" disabled>Activate profile (deferred)</button>
+      <button type="button" disabled>Switch runtime account (deferred)</button>
+      <button type="button" disabled>Bind host (deferred)</button>
+    </div>
   </section>
 
   <div id="connectionBanner" class="banner" role="status" hidden></div>
@@ -147,7 +182,7 @@
         <span class="health health-readonly">READ ONLY</span>
       </div>
       <div class="boundary-copy">
-        <p>This dashboard does not start or stop workers, select remote clients, write settings, or mutate backups.</p>
+        <p>This dashboard does not start or stop workers, select remote clients, write settings, mutate backups, or switch profiles.</p>
         <p>Operator edits remain on the original <code>tools/db.html</code>. The legacy public Cloudflare <code>/db</code> surface is not touched by U1.</p>
       </div>
     </section>
@@ -155,9 +190,10 @@
 
   <footer class="site-footer">
     <span>U1 read-only operator dashboard</span>
-    <span id="footerState">No write controls are exposed.</span>
+    <span id="footerState">No runtime control is exposed.</span>
   </footer>
 </div>
 <script type="module" src="js/main.js"></script>
+<script type="module" src="js/profile_manager.js"></script>
 </body>
 </html>

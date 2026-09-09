@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """Static contract checks for the U1 frontend safety boundary."""
 import os
-import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 FRONTEND = os.path.join(ROOT, "webapp", "frontend")
@@ -58,9 +57,11 @@ def main():
         token in source for token in ("method: 'POST'", "method: 'PUT'",
                                       "method: 'PATCH'", "method: 'DELETE'")
     ))
-    check("U1 index exposes no form controls", not any(
-        token in index.lower() for token in ("<button", "<form", "<input", "<select")
-    ))
+    check("profile manager exposes only a local viewed-profile selector",
+          '<select id="profileViewSelect"' in index and "<form" not in index
+          and "<input" not in index)
+    check("profile manager runtime controls are disabled", "disabled>" in index
+          and "Switch runtime account" in index)
     for panel in ("cycle", "sync", "aiFix", "settings", "backups"):
         check(f"{panel} panel is present", f'data-panel="{panel}"' in index)
         check(f"{panel} panel renders provenance", "data-panel-provenance" in index)
@@ -92,4 +93,4 @@ def main():
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    raise SystemExit(main())

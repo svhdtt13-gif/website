@@ -14,6 +14,7 @@ Slice 11 them dedicated guarded DELETE api/cycle/backup/<name>.
 Bundle 1 them guarded settings Telegram test va browser open actions.
 Bundle 2 chi mo guarded AI-fix creation; sync/answers/watcher remain deferred.
 Phase 3 adds guarded SQLite generation reads; enablement remains disabled by default.
+Remote Profile Manager foundation adds read-only portable profile state only.
 """
 import hmac
 import pathlib
@@ -27,6 +28,7 @@ from services import backup as backup_service
 from services import cycle as cycle_service
 from services import log as log_service
 from services import master as master_service
+from services import profile_manager as profile_manager_service
 from services import remote_live as remote_live_service
 from services import settings as settings_service
 from services import settings_actions as settings_actions_service
@@ -178,6 +180,21 @@ def create_app(runtime=None):
             body, status, ctype = backup_service.delete_cycle_backup(canonical_name)
         except UpstreamError as e:
             return Response(e.body, status=e.status, content_type="application/json")
+        return Response(body, status=status, content_type=ctype)
+
+    @app.route(
+        "/up/api/profile_manager",
+        methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    )
+    def profile_manager():
+        """Read-only profile state; no method reaches a runtime control path."""
+        if request.method != "GET":
+            return jsonify({"error": "profile manager is read-only"}), 403
+        if request.query_string:
+            return jsonify({"error": "profile manager does not accept query parameters"}), 400
+        body, status, ctype = profile_manager_service.get_profile_manager(
+            config.PORTABLE_STORE_PATH
+        )
         return Response(body, status=status, content_type=ctype)
 
     @app.route("/up/<path:subpath>", methods=["GET", "POST", "PUT", "PATCH", "DELETE"])

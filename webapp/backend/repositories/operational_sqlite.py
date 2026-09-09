@@ -21,6 +21,11 @@ OPERATIONAL_DIRNAME = "operational"
 BACKUP_DIRNAME = "backups"
 
 SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS schema_meta (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS jobs (
   job_id TEXT PRIMARY KEY,
   kind TEXT NOT NULL,

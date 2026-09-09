@@ -6,6 +6,8 @@ const PANEL_IDS = {
   backups: 'backupBody',
 };
 
+const MISSING_CONTEXT = 'Not exposed by current read contract';
+
 function valueOrDash(value) {
   if (value === undefined || value === null || value === '') return '-';
   return String(value);
@@ -77,42 +79,78 @@ function setPanel(name, state, message) {
   if (note && message) note.textContent = message;
 }
 
-function contextValue(context, ...names) {
+function readContextField(context, names) {
   for (const name of names) {
     if (context[name] !== undefined && context[name] !== null && context[name] !== '') return context[name];
   }
-  return 'Not exposed by current read contract';
+  return null;
 }
 
-function contextAuthority(context) {
-  for (const name of ['control_authority', 'controlAuthority']) {
-    if (context[name] !== undefined && context[name] !== null && context[name] !== '') return context[name];
-  }
-  return 'READ ONLY / FAIL CLOSED';
+function contextInfo(state) {
+  const sources = [state.general, state.cycle, state.sync, state.aiFix, state.backups, state.settings]
+    .map((data) => data?.profile_context || data?.context)
+    .filter((context) => context && typeof context === 'object');
+  const context = sources[0] || {};
+  const fields = {
+    host: ['host_id', 'hostId'],
+    profile: ['profile_id', 'profileId'],
+    identity: ['verified_identity', 'verifiedIdentity', 'identity_ref'],
+    binding: ['active_binding_id', 'binding_id', 'binding_generation'],
+  };
+  const inconsistent = sources.some((candidate) => Object.values(fields).some((names) => {
+    const first = readContextField(context, names);
+    const other = readContextField(candidate, names);
+    return first !== null && other !== null && String(first) !== String(other);
+  }));
+  const identity = readContextField(context, fields.identity);
+  const hasVerifiedIdentity = identity !== null && !['UNVERIFIED', 'unverified', 'unknown'].includes(String(identity));
+  const hasBinding = readContextField(context, fields.binding) !== null
+    || readContextField(context, ['binding_state', 'bindingState']) === 'ACTIVE';
+  const complete = sources.length > 0 && !inconsistent
+    && readContextField(context, fields.host) !== null
+    && readContextField(context, fields.profile) !== null
+    && hasVerifiedIdentity && hasBinding;
+  return { context, inconsistent, complete };
+}
+
+function contextValue(context, names) {
+  return valueOrDash(readContextField(context, names) || MISSING_CONTEXT);
+}
+
+function scopeLabel(info) {
+  if (info.inconsistent) return 'CONTEXT CONFLICT / FAIL CLOSED';
+  return info.complete ? 'PROFILE-SCOPED READ' : 'UNSCOPED LEGACY HOST READ';
+}
+
+function scopeMessage(info) {
+  if (info.inconsistent) return 'Conflicting host/profile context across read sources. Panel data is suppressed.';
+  if (!info.complete) return 'Legacy host read only; profile binding is unresolved. Control remains fail-closed.';
+  return 'Profile-scoped read; U1 remains read-only.';
 }
 
 function renderContext(state) {
-  const context = state.general?.profile_context || state.general?.context
-    || state.cycle?.profile_context || {};
+  const info = contextInfo(state);
+  const context = info.context;
   const values = {
-    contextHost: contextValue(context, 'host_id', 'hostId'),
-    contextProfile: contextValue(context, 'profile_id', 'profileId'),
-    contextAccount: contextValue(context, 'remote_account', 'remoteAccount', 'account_ref'),
-    contextIdentity: contextValue(context, 'verified_identity', 'verifiedIdentity', 'identity_ref') === 'Not exposed by current read contract'
-      ? 'UNVERIFIED'
-      : contextValue(context, 'verified_identity', 'verifiedIdentity', 'identity_ref'),
-    contextAuthority: contextAuthority(context),
+    contextHost: contextValue(context, ['host_id', 'hostId']),
+    contextProfile: contextValue(context, ['profile_id', 'profileId']),
+    contextAccount: contextValue(context, ['remote_account', 'remoteAccount', 'account_ref']),
+    contextIdentity: info.complete ? contextValue(context, ['verified_identity', 'verifiedIdentity', 'identity_ref']) : 'UNVERIFIED',
+    contextAuthority: info.complete ? `READ ONLY U1 / ${contextValue(context, ['control_authority', 'controlAuthority'])}` : 'READ ONLY / FAIL CLOSED',
+    contextScope: scopeLabel(info),
   };
   Object.entries(values).forEach(([id, value]) => {
     const target = document.getElementById(id);
     if (target) target.textContent = valueOrDash(value);
   });
+  return info;
 }
 
-function renderCards(state) {
+function renderCards(state, info) {
   const cycle = state.cycle || {};
   const simple = state.cycleSimple || {};
   const running = simple.running ?? cycle.cycle_running;
+  const stopped = cycle.stop_flag === true || simple.stopped === true;
   const sync = state.sync || {};
   const watcher = (state.aiFix || {}).watcher || {};
   const general = state.general || {};
@@ -124,29 +162,36 @@ function renderCards(state) {
   const aiMeta = document.getElementById('cardAiMeta');
   const clientsCard = document.getElementById('cardClients');
   const clientsMeta = document.getElementById('cardClientsMeta');
-  if (cycleCard) cycleCard.textContent = running ? 'RUNNING' : 'OFFLINE';
-  if (cycleMeta) cycleMeta.textContent = running ? `PID ${valueOrDash(cycle.cycle_pid)}` : 'No active cycle';
-  if (syncCard) syncCard.textContent = sync.continuous_running ? 'RUNNING' : 'STOPPED';
-  if (syncMeta) syncMeta.textContent = sync.continuous_running ? `Every ${formatDuration(sync.interval_sec)}` : 'No active worker';
-  if (aiCard) aiCard.textContent = watcher.auto ? 'WATCHING' : `${((state.aiFix || {}).pending || []).length} PENDING`;
-  if (aiMeta) aiMeta.textContent = watcher.last_action ? `Last: ${watcher.last_action}` : 'Queue read-only';
+  if (cycleCard) cycleCard.textContent = state.errors.cycle || state.errors.cycleSimple ? 'UNAVAILABLE' : running ? 'RUNNING' : stopped ? 'STOPPED' : 'OFFLINE';
+  if (cycleMeta) cycleMeta.textContent = running ? `PID ${valueOrDash(cycle.cycle_pid)}` : `${scopeLabel(info)} / ${stopped ? 'stop intent' : 'No active cycle'}`;
+  if (syncCard) syncCard.textContent = state.errors.sync ? 'UNAVAILABLE' : sync.continuous_running ? 'RUNNING' : 'STOPPED';
+  if (syncMeta) syncMeta.textContent = sync.continuous_running ? `Every ${formatDuration(sync.interval_sec)}` : scopeLabel(info);
+  if (aiCard) aiCard.textContent = state.errors.aiFix ? 'UNAVAILABLE' : watcher.auto ? 'WATCHING' : `${((state.aiFix || {}).pending || []).length} PENDING`;
+  if (aiMeta) aiMeta.textContent = watcher.last_action ? `Last: ${watcher.last_action}` : scopeLabel(info);
   if (clientsCard) clientsCard.textContent = valueOrDash(general.clients ?? sync.total_clients);
-  if (clientsMeta) clientsMeta.textContent = general.lastUpdated ? `Updated ${general.lastUpdated}` : 'Client count';
+  if (clientsMeta) clientsMeta.textContent = scopeLabel(info);
 }
 
-function renderCycle(state) {
+function renderCycle(state, info) {
   const data = state.cycle;
   const simple = state.cycleSimple;
+  if (info.inconsistent) {
+    setPanel('cycle', 'error', scopeMessage(info));
+    renderDetails(PANEL_IDS.cycle, []);
+    return;
+  }
   if (!data || !simple) {
     setPanel('cycle', 'error', `Cycle read unavailable: ${state.errors.cycle || state.errors.cycleSimple || 'missing source'}`);
     renderDetails(PANEL_IDS.cycle, []);
     return;
   }
   const running = simple.running ?? data.cycle_running;
+  const stopped = data.stop_flag === true || simple.stopped === true;
   const disabled = Array.isArray(data.alwaysrun_disabled) ? data.alwaysrun_disabled.join(', ') : '-';
   const logs = Array.isArray(data.last_log) ? data.last_log[data.last_log.length - 1] : data.last_log;
   renderDetails(PANEL_IDS.cycle, [
-    ['Status', running ? 'Running' : 'Offline'],
+    ['Status', running ? 'Running' : stopped ? 'STOPPED BY INTENT' : 'Offline'],
+    ['Cycle stop intent', stopped ? 'STOP REQUESTED' : 'NOT STOPPED'],
     ['Cycle PID', data.cycle_pid],
     ['Sync PID', data.sync_pid],
     ['360Auto', data['360auto']],
@@ -158,11 +203,16 @@ function renderCycle(state) {
     ['Today', data.state && data.state.today],
     ['Last cycle log', logs],
   ]);
-  setPanel('cycle', 'ok', 'Live read from the golden cycle status contract.');
+  setPanel('cycle', 'ok', `Live read from the golden cycle status contract. ${scopeMessage(info)}`);
 }
 
-function renderSync(state) {
+function renderSync(state, info) {
   const data = state.sync;
+  if (info.inconsistent) {
+    setPanel('sync', 'error', scopeMessage(info));
+    renderDetails(PANEL_IDS.sync, []);
+    return;
+  }
   if (!data) {
     setPanel('sync', 'error', `Auto Sync read unavailable: ${state.errors.sync || 'missing source'}`);
     renderDetails(PANEL_IDS.sync, []);
@@ -178,11 +228,16 @@ function renderSync(state) {
     ['Clients', data.total_clients],
     ['Source', data.source],
   ]);
-  setPanel('sync', 'ok', 'Status only. Start/stop controls are intentionally absent.');
+  setPanel('sync', 'ok', `Status only. Start/stop controls are intentionally absent. ${scopeMessage(info)}`);
 }
 
-function renderAiFix(state) {
+function renderAiFix(state, info) {
   const data = state.aiFix;
+  if (info.inconsistent) {
+    setPanel('aiFix', 'error', scopeMessage(info));
+    renderDetails(PANEL_IDS.aiFix, []);
+    return;
+  }
   if (!data) {
     setPanel('aiFix', 'error', `AI-fix read unavailable: ${state.errors.aiFix || 'missing source'}`);
     renderDetails(PANEL_IDS.aiFix, []);
@@ -205,11 +260,16 @@ function renderAiFix(state) {
     ['Watcher PID', watcher.pid],
     ['Models', Array.isArray(data.models) ? data.models.join(', ') : '-'],
   ]);
-  setPanel('aiFix', 'ok', 'Queue and watcher metadata only. Queue actions are intentionally absent.');
+  setPanel('aiFix', 'ok', `Queue and watcher metadata only. Queue actions are intentionally absent. ${scopeMessage(info)}`);
 }
 
-function renderSettings(state) {
+function renderSettings(state, info) {
   const data = state.settings;
+  if (info.inconsistent) {
+    setPanel('settings', 'error', scopeMessage(info));
+    renderDetails(PANEL_IDS.settings, []);
+    return;
+  }
   if (!data) {
     setPanel('settings', 'error', `Public settings unavailable: ${state.errors.settings || 'missing source'}`);
     renderDetails(PANEL_IDS.settings, []);
@@ -221,20 +281,20 @@ function renderSettings(state) {
     ['Auto Telegram', boolLabel(data.auto_telegram)],
     ['Auto open browser', boolLabel(data.auto_open_browser)],
   ]);
-  setPanel('settings', 'ok', 'Redacted public projection. No settings write is available.');
+  setPanel('settings', 'ok', `Redacted public projection. No settings write is available. ${scopeMessage(info)}`);
 }
 
-function renderBackups(state) {
+function renderBackups(state, info) {
   const target = document.getElementById(PANEL_IDS.backups);
   if (!target) return;
-  if (!state.backups) {
-    setPanel('backups', 'error', `Backup list unavailable: ${state.errors.backups || 'missing source'}`);
+  if (info.inconsistent || !state.backups) {
+    setPanel('backups', 'error', info.inconsistent ? scopeMessage(info) : `Backup list unavailable: ${state.errors.backups || 'missing source'}`);
     target.replaceChildren();
     const row = document.createElement('tr');
     const cell = document.createElement('td');
     cell.colSpan = 6;
     cell.className = 'empty-cell error-text';
-    cell.textContent = 'Unable to read backup metadata.';
+    cell.textContent = info.inconsistent ? 'Conflicting profile context; backup data suppressed.' : 'Unable to read backup metadata.';
     row.appendChild(cell);
     target.appendChild(row);
     return;
@@ -260,7 +320,7 @@ function renderBackups(state) {
     row.appendChild(cell);
     target.appendChild(row);
   }
-  setPanel('backups', 'ok', `${backups.length} backup${backups.length === 1 ? '' : 's'} read from the golden metadata endpoint.`);
+  setPanel('backups', 'ok', `${backups.length} backup${backups.length === 1 ? '' : 's'} read from the golden metadata endpoint. ${scopeMessage(info)}`);
 }
 
 export function showBanner(message) {
@@ -271,13 +331,13 @@ export function showBanner(message) {
 }
 
 export function render(state) {
-  renderContext(state);
-  renderCards(state);
-  renderCycle(state);
-  renderSync(state);
-  renderAiFix(state);
-  renderSettings(state);
-  renderBackups(state);
+  const info = renderContext(state);
+  renderCards(state, info);
+  renderCycle(state, info);
+  renderSync(state, info);
+  renderAiFix(state, info);
+  renderSettings(state, info);
+  renderBackups(state, info);
   const refreshed = document.getElementById('lastRefresh');
   if (refreshed && state.refreshedAt) refreshed.textContent = `Last refresh ${formatTime(state.refreshedAt)}`;
 }

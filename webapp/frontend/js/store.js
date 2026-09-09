@@ -19,7 +19,10 @@ export async function refreshStore() {
   entries.forEach(([key], index) => {
     const result = results[index];
     if (result.status === 'fulfilled') store[key] = result.value;
-    else errors[key] = result.reason instanceof Error ? result.reason.message : 'Unavailable';
+    else {
+      store[key] = null;
+      errors[key] = result.reason instanceof Error ? result.reason.message : 'Unavailable';
+    }
   });
   store.errors = errors;
   store.refreshedAt = new Date().toISOString();

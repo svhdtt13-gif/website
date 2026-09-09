@@ -10,14 +10,17 @@ A future profile-aware read response may expose `profile_context` with these fie
 - `profile_id`
 - `remote_account` or `account_ref`
 - `verified_identity` or `identity_ref`
+- `active_binding_id`, `binding_id` or `binding_generation`
+- `binding_state`
 - `control_authority`
 
-Until the backend exposes that field, U1 displays host/profile/account as unresolved and displays `READ ONLY / FAIL CLOSED` for authority. It does not invent a default host, account, room or session.
+Until the backend exposes that field, U1 displays host/profile/account as unresolved, displays identity as `UNVERIFIED`, and displays `READ ONLY / FAIL CLOSED` for authority. It does not invent a default host, account, room or session.
 
 ## Safety Rules
 
 - A viewed profile is not a mutation target.
 - Missing host, profile, binding or identity data cannot enable control.
+- Conflicting context values across read sources suppress the affected dashboard data.
 - A profile context is not a credential or session store.
 - U1 does not call `remote_live`, select clients, switch profiles or send commands.
 - Future controls must require matching `host_id + profile_id + verified_identity + active binding lease`.

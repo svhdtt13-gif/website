@@ -15,6 +15,7 @@ from repositories.operational_sqlite import (  # noqa: E402
     OPERATIONAL_FILENAME,
     OperationalIntegrityError,
     OperationalPathError,
+    OperationalSchemaError,
     OperationalSQLiteRepository,
     SCHEMA_VERSION,
     SCHEMA_CHECKSUM,
@@ -57,6 +58,14 @@ class OperationalSQLiteTests(unittest.TestCase):
                 "manual_overrides", "worker_events",
             }.issubset(tables)
         )
+        schema_sql = " ".join(
+            row[0] or ""
+            for row in self.repository.rows(
+                "SELECT sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'"
+            )
+        ).lower()
+        for forbidden in ("password", "token", "secret", "credential"):
+            self.assertNotIn(forbidden, schema_sql)
 
     def test_only_dedicated_operational_path_is_openable(self):
         p3 = self.runtime / "sqlite" / "verified.sqlite3"
@@ -110,14 +119,14 @@ class OperationalSQLiteTests(unittest.TestCase):
             )
         )
         job = self.repository.rows(
-            "SELECT status, owner_id, attempt, lease_until FROM jobs WHERE job_id='job-1'"
+            "SELECT status, owner_id, lease_name, attempt, lease_until FROM jobs WHERE job_id='job-1'"
         )[0]
         lease = self.repository.rows(
             "SELECT owner_id, heartbeat_at, expires_at FROM leases WHERE lease_name='remote_io'"
         )[0]
         self.assertEqual(
             tuple(job),
-            ("claimed", "owner-a", 1, "2026-09-09T10:05:00+00:00"),
+            ("claimed", "owner-a", "remote_io", 1, "2026-09-09T10:05:00+00:00"),
         )
         self.assertEqual(
             tuple(lease),
@@ -136,6 +145,38 @@ class OperationalSQLiteTests(unittest.TestCase):
             "2026-09-09T10:10:00+00:00",
         )
 
+    def test_same_owner_different_leases_have_heartbeat_isolation(self):
+        self.repository.insert_job("job-a", "test", "{}", "test", "idem-a")
+        self.repository.insert_job("job-b", "test", "{}", "test", "idem-b")
+        self.assertTrue(
+            self.repository.claim_job(
+                "job-a", "owner-a", "lease-a", "2026-09-09T10:05:00+00:00",
+                now="2026-09-09T10:00:00+00:00",
+            )
+        )
+        self.assertTrue(
+            self.repository.claim_job(
+                "job-b", "owner-a", "lease-b", "2026-09-09T10:06:00+00:00",
+                now="2026-09-09T10:00:01+00:00",
+            )
+        )
+        self.assertTrue(
+            self.repository.heartbeat_lease(
+                "lease-a", "owner-a", "2026-09-09T10:01:00+00:00",
+                "2026-09-09T10:10:00+00:00",
+            )
+        )
+        rows = self.repository.rows(
+            "SELECT job_id, lease_name, lease_until FROM jobs ORDER BY job_id"
+        )
+        self.assertEqual(
+            [tuple(row) for row in rows],
+            [
+                ("job-a", "lease-a", "2026-09-09T10:10:00+00:00"),
+                ("job-b", "lease-b", "2026-09-09T10:06:00+00:00"),
+            ],
+        )
+
     def test_active_lease_blocks_other_owner_without_partial_claim(self):
         self.repository.insert_job("job-2", "test", "{}", "test", "idem-2")
         self.assertTrue(
@@ -151,9 +192,18 @@ class OperationalSQLiteTests(unittest.TestCase):
             )
         )
         row = self.repository.rows(
-            "SELECT owner_id, attempt FROM jobs WHERE job_id='job-2'"
+            "SELECT owner_id, lease_name, attempt FROM jobs WHERE job_id='job-2'"
         )[0]
-        self.assertEqual(tuple(row), ("owner-a", 1))
+        self.assertEqual(tuple(row), ("owner-a", "scheduler", 1))
+
+    def test_schema_tamper_fails_closed_even_with_metadata_unchanged(self):
+        with self.repository.transaction():
+            self.repository.connection.execute(
+                "ALTER TABLE jobs ADD COLUMN tampered TEXT"
+            )
+        self.repository.close()
+        with self.assertRaises(OperationalSchemaError):
+            OperationalSQLiteRepository.open(self.runtime)
 
     def test_backup_restore_preserves_p3_hash_and_mtime(self):
         p3 = self.runtime / "sqlite" / "f2e2bd.sqlite3"

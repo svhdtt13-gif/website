@@ -37,6 +37,7 @@ CREATE TABLE IF NOT EXISTS jobs (
     ('queued','claimed','running','dispatched','succeeded','failed','cancelled','unknown')),
   attempt INTEGER NOT NULL DEFAULT 0,
   owner_id TEXT,
+  lease_name TEXT,
   created_at TEXT NOT NULL,
   claimed_at TEXT,
   started_at TEXT,
@@ -49,7 +50,7 @@ CREATE TABLE IF NOT EXISTS jobs (
 );
 
 CREATE INDEX IF NOT EXISTS jobs_status_idx ON jobs(status, created_at);
-CREATE INDEX IF NOT EXISTS jobs_owner_idx ON jobs(owner_id, lease_until);
+CREATE INDEX IF NOT EXISTS jobs_owner_idx ON jobs(owner_id, lease_name, lease_until);
 
 CREATE TABLE IF NOT EXISTS leases (
   lease_name TEXT PRIMARY KEY,
@@ -178,6 +179,76 @@ def _deny_cross_database(action, _arg1, _arg2, _db_name, _source):
     return sqlite3.SQLITE_OK
 
 
+def _pragma_rows(connection, pragma, table_name):
+    escaped = table_name.replace("'", "''")
+    return connection.execute(
+        "PRAGMA " + pragma + "('" + escaped + "')"
+    ).fetchall()
+
+
+def _schema_identity(connection):
+    """Canonicalize actual SQLite objects, columns, indexes and foreign keys."""
+    objects = []
+    rows = connection.execute(
+        """SELECT type, name, tbl_name, sql
+           FROM sqlite_master
+           WHERE name NOT LIKE 'sqlite_%'
+           ORDER BY type, name"""
+    ).fetchall()
+    for object_type, name, table_name, sql in rows:
+        item = {
+            "type": object_type,
+            "name": name,
+            "table": table_name,
+            "sql": " ".join((sql or "").split()).lower(),
+        }
+        if object_type == "table":
+            item["columns"] = [
+                tuple(row)
+                for row in _pragma_rows(connection, "table_info", name)
+            ]
+            item["foreign_keys"] = [
+                tuple(row)
+                for row in _pragma_rows(connection, "foreign_key_list", name)
+            ]
+            item["indexes"] = [
+                {
+                    "name": row[1],
+                    "unique": row[2],
+                    "origin": row[3],
+                    "partial": row[4],
+                    "columns": [
+                        tuple(index_row)
+                        for index_row in _pragma_rows(
+                            connection, "index_info", row[1]
+                        )
+                    ],
+                }
+                for row in _pragma_rows(connection, "index_list", name)
+                if not row[1].startswith("sqlite_")
+            ]
+        elif object_type == "index":
+            item["columns"] = [
+                tuple(row)
+                for row in _pragma_rows(connection, "index_info", name)
+            ]
+        objects.append(item)
+    return json.dumps(objects, sort_keys=True, separators=(",", ":"))
+
+
+def _expected_schema_identity():
+    connection = sqlite3.connect(":memory:")
+    try:
+        connection.executescript(SCHEMA_SQL)
+        connection.execute("PRAGMA foreign_keys = ON")
+        return _schema_identity(connection)
+    finally:
+        connection.close()
+
+
+EXPECTED_SCHEMA_IDENTITY = _expected_schema_identity()
+
+
 def _integrity_ok(connection):
     result = connection.execute("PRAGMA integrity_check").fetchone()
     if not result or result[0] != "ok":
@@ -281,6 +352,8 @@ class OperationalSQLiteRepository:
             raise OperationalSchemaError("unsupported operational schema version")
         if values.get("schema_checksum") != SCHEMA_CHECKSUM:
             raise OperationalSchemaError("operational schema checksum mismatch")
+        if _schema_identity(self.connection) != EXPECTED_SCHEMA_IDENTITY:
+            raise OperationalSchemaError("actual operational schema does not match expected schema")
         if not _integrity_ok(self.connection):
             raise OperationalIntegrityError("operational SQLite integrity check failed")
 
@@ -314,7 +387,7 @@ class OperationalSQLiteRepository:
             )
 
     def claim_job(self, job_id, owner_id, lease_name, lease_until, now=None):
-        """Atomically claim one queued job and its lease, or return False."""
+        """Atomically claim one queued job and its exact lease, or return False."""
         now = now or _utc_now()
         with self.transaction():
             job = self.connection.execute(
@@ -341,17 +414,17 @@ class OperationalSQLiteRepository:
                 (lease_name, owner_id, now, now, lease_until),
             )
             updated = self.connection.execute(
-                """UPDATE jobs SET status='claimed', owner_id=?, claimed_at=?,
-                   lease_until=?, attempt=attempt + 1
+                """UPDATE jobs SET status='claimed', owner_id=?, lease_name=?,
+                   claimed_at=?, lease_until=?, attempt=attempt + 1
                    WHERE job_id=? AND status='queued'""",
-                (owner_id, now, lease_until, job_id),
+                (owner_id, lease_name, now, lease_until, job_id),
             ).rowcount
             if updated != 1:
                 raise OperationalTransactionError("job claim lost its transaction fence")
         return True
 
     def heartbeat_lease(self, lease_name, owner_id, heartbeat_at, expires_at):
-        """Atomically extend a lease and all jobs owned by that lease owner."""
+        """Atomically extend one lease and only jobs bound to that lease."""
         with self.transaction():
             updated = self.connection.execute(
                 """UPDATE leases SET heartbeat_at=?, expires_at=?
@@ -362,8 +435,9 @@ class OperationalSQLiteRepository:
                 return False
             self.connection.execute(
                 """UPDATE jobs SET lease_until=?
-                   WHERE owner_id=? AND status IN ('claimed', 'running')""",
-                (expires_at, owner_id),
+                   WHERE owner_id=? AND lease_name=?
+                   AND status IN ('claimed', 'running')""",
+                (expires_at, owner_id, lease_name),
             )
         return True
 

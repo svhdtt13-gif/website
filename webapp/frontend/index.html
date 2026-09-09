@@ -22,6 +22,21 @@
     </div>
   </header>
 
+  <section class="context-strip" aria-label="Current host and remote profile context">
+    <div class="context-heading">
+      <p class="panel-kicker">Current profile context</p>
+      <h2>Host / remote binding</h2>
+      <p class="context-note">Context is read-only. Missing identity or binding data fails closed.</p>
+    </div>
+    <dl id="contextDetails" class="context-grid">
+      <div><dt>Host</dt><dd id="contextHost">Not exposed by current read contract</dd></div>
+      <div><dt>Remote profile</dt><dd id="contextProfile">Not exposed by current read contract</dd></div>
+      <div><dt>Remote account</dt><dd id="contextAccount">Not exposed by current read contract</dd></div>
+      <div><dt>Verified identity</dt><dd id="contextIdentity">UNVERIFIED</dd></div>
+      <div><dt>Control authority</dt><dd id="contextAuthority">READ ONLY / FAIL CLOSED</dd></div>
+    </dl>
+  </section>
+
   <div id="connectionBanner" class="banner" role="status" hidden></div>
 
   <main>

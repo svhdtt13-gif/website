@@ -63,6 +63,10 @@ def main():
         check(f"{panel} panel is present", f'data-panel="{panel}"' in index)
     for label in ("Auto Sync", "AI fix", "Public settings", "Cycle Backups"):
         check(f"{label} label is present", label in index)
+    for context_id in ("contextHost", "contextProfile", "contextAccount", "contextIdentity", "contextAuthority"):
+        check(f"{context_id} context field is present", f'id="{context_id}"' in index)
+    check("context is sourced from a future profile-aware read field",
+          "profile_context" in views and "READ ONLY / FAIL CLOSED" in index)
     check("golden db.html boundary is visible", "tools/db.html" in index)
     check("refresh loop is bounded to ten seconds", "setInterval" in main_js and "10000" in main_js)
 

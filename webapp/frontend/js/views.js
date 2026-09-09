@@ -77,6 +77,29 @@ function setPanel(name, state, message) {
   if (note && message) note.textContent = message;
 }
 
+function contextValue(context, ...names) {
+  for (const name of names) {
+    if (context[name] !== undefined && context[name] !== null && context[name] !== '') return context[name];
+  }
+  return 'Not exposed by current read contract';
+}
+
+function renderContext(state) {
+  const context = state.general?.profile_context || state.general?.context
+    || state.cycle?.profile_context || {};
+  const values = {
+    contextHost: contextValue(context, 'host_id', 'hostId'),
+    contextProfile: contextValue(context, 'profile_id', 'profileId'),
+    contextAccount: contextValue(context, 'remote_account', 'remoteAccount', 'account_ref'),
+    contextIdentity: contextValue(context, 'verified_identity', 'verifiedIdentity', 'identity_ref'),
+    contextAuthority: contextValue(context, 'control_authority', 'controlAuthority') || 'READ ONLY / FAIL CLOSED',
+  };
+  Object.entries(values).forEach(([id, value]) => {
+    const target = document.getElementById(id);
+    if (target) target.textContent = valueOrDash(value);
+  });
+}
+
 function renderCards(state) {
   const cycle = state.cycle || {};
   const simple = state.cycleSimple || {};
@@ -239,6 +262,7 @@ export function showBanner(message) {
 }
 
 export function render(state) {
+  renderContext(state);
   renderCards(state);
   renderCycle(state);
   renderSync(state);

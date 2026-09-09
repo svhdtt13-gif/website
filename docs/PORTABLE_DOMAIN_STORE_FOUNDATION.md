@@ -10,7 +10,7 @@ any ai-tool runtime source of truth.
 
 The foundation contains:
 
-- deterministic schema creation and schema metadata at version 1;
+- deterministic schema creation and schema metadata at version 2;
 - `hosts`, `remote_profiles`, and explicit `host_profile_bindings`;
 - profile-owned clients, schedules, policies, control intents, observations and audit events;
 - a read-only shadow importer with an explicit `host_id + profile_id + account_ref` binding;

@@ -142,10 +142,13 @@ class PortableDomainStoreTests(unittest.TestCase):
     def test_binding_account_mismatch_and_active_host_conflict_are_rejected(self):
         self.seed("profile-a", "host-a", "account-a")
         self.store.add_profile("profile-b", "profile-b", "account-b", "VERIFIED", NOW)
+        self.store.add_host("host-b", "host-b", "explicit-test-origin", NOW)
         with self.assertRaises(BindingError):
             self.store.bind_profile("wrong-account", "host-a", "profile-b", "account-a", 2, "OFFLINE", NOW)
         with self.assertRaises(BindingError):
             self.store.bind_profile("second-active", "host-a", "profile-b", "account-b", 2, "ACTIVE", NOW)
+        with self.assertRaises(BindingError):
+            self.store.bind_profile("profile-active-twice", "host-b", "profile-a", "account-a", 2, "ACTIVE", NOW)
 
     def test_backup_manifest_and_reopen_preserve_data(self):
         self.seed("profile-a", "host-a", "account-a")
@@ -181,6 +184,57 @@ class ShadowImporterTests(unittest.TestCase):
                 self.assertEqual(result["clients"], 1)
                 self.assertEqual(store.list_control_intents("profile-a")[0]["intent_type"], "cycle_stopped")
                 self.assertEqual(hashlib.sha256((root / "client_database.json").read_bytes()).hexdigest(), before)
+            finally:
+                store.close()
+
+    def test_empty_stop_flag_file_is_still_a_stop_authority(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "cycle_stopped.flag").touch()
+            snapshot = FileSystemGoldenSource(root, master_data="missing-master.json").snapshot()
+            self.assertTrue(snapshot.cycle_stopped)
+
+    def test_import_same_profile_is_idempotent_and_updates_only_that_profile(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "portable.sqlite3"
+            store = PortableDomainStore.create(path)
+            try:
+                import_shadow(
+                    store,
+                    GoldenSnapshot(clients=({"client": "shared", "name": "old"},)),
+                    LegacyBinding("host-a", "profile-a", "account-a", "binding-a"), NOW,
+                )
+                import_shadow(
+                    store,
+                    GoldenSnapshot(clients=({"client": "shared", "name": "new"},)),
+                    LegacyBinding("host-a", "profile-a", "account-a", "binding-a"), NOW,
+                )
+                self.assertEqual(store.list_clients("profile-a")[0]["display_name"], "new")
+            finally:
+                store.close()
+
+    def test_resume_clears_only_legacy_stop_intent(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            flag_a = root / "cycle_stopped.flag"
+            flag_a.touch()
+            store = PortableDomainStore.create(root / "portable.sqlite3")
+            try:
+                binding_a = LegacyBinding("host-a", "profile-a", "account-a", "binding-a")
+                import_shadow(store, FileSystemGoldenSource(root, master_data="missing.json").snapshot(), binding_a, NOW)
+                store.upsert_cycle_stopped("profile-a", "future-user-stop", "REQUESTED", NOW,
+                                           "user:manual", "future user intent")
+                root_b = root / "b"
+                root_b.mkdir()
+                (root_b / "cycle_stopped.flag").touch()
+                binding_b = LegacyBinding("host-b", "profile-b", "account-b", "binding-b")
+                import_shadow(store, FileSystemGoldenSource(root_b, master_data="missing.json").snapshot(), binding_b, NOW)
+                flag_a.unlink()
+                import_shadow(store, FileSystemGoldenSource(root, master_data="missing.json").snapshot(), binding_a, NOW)
+                intents = {row["intent_id"]: row["state"] for row in store.list_control_intents("profile-a")}
+                self.assertEqual(intents["legacy-cycle-stopped"], "CLEARED")
+                self.assertEqual(intents["future-user-stop"], "REQUESTED")
+                self.assertEqual(store.list_control_intents("profile-b")[0]["state"], "REQUESTED")
             finally:
                 store.close()
 

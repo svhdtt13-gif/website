@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Iterator
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 STORE_KIND = "portable_domain_store"
 DB_FILENAME = "portable_domain.sqlite3"
 
@@ -54,6 +54,9 @@ CREATE TABLE IF NOT EXISTS host_profile_bindings (
 
 CREATE UNIQUE INDEX IF NOT EXISTS one_active_binding_per_host
     ON host_profile_bindings(host_id) WHERE state = 'ACTIVE';
+
+CREATE UNIQUE INDEX IF NOT EXISTS one_active_host_per_profile
+    ON host_profile_bindings(profile_id) WHERE state = 'ACTIVE';
 
 CREATE TABLE IF NOT EXISTS profile_clients (
     profile_id TEXT NOT NULL REFERENCES remote_profiles(profile_id),
@@ -120,7 +123,11 @@ CREATE TABLE IF NOT EXISTS profile_audit_events (
 SCHEMA_CHECKSUM = hashlib.sha256(
     " ".join(line.strip() for line in SCHEMA_SQL.splitlines() if line.strip()).encode()
 ).hexdigest()
-MIGRATIONS = {1: SCHEMA_SQL}
+MIGRATIONS = {
+    1: SCHEMA_SQL,
+    2: "CREATE UNIQUE INDEX IF NOT EXISTS one_active_host_per_profile "
+       "ON host_profile_bindings(profile_id) WHERE state = 'ACTIVE';",
+}
 
 
 class PortableStoreError(ValueError):
@@ -214,7 +221,7 @@ class PortableDomainStore:
             raise SchemaError("portable schema version is newer than this code")
         for target in range(current + 1, SCHEMA_VERSION + 1):
             with self.transaction():
-                self.connection.executescript(SCHEMA_SQL)
+                self.connection.executescript(MIGRATIONS[target])
                 self.connection.execute(
                     "INSERT OR REPLACE INTO schema_meta(key, value) VALUES ('store_kind', ?)",
                     (STORE_KIND,),
@@ -272,6 +279,24 @@ class PortableDomainStore:
                 (host_id, display_name, origin_ref, now, now),
             )
 
+    def ensure_host(self, host_id: str, display_name: str, origin_ref: str, now: str) -> None:
+        host_id, display_name, origin_ref, now = (
+            _required(host_id, "host_id"), _required(display_name, "display_name"),
+            _safe_reference(origin_ref, "origin_ref"), _required(now, "now")
+        )
+        existing = self.connection.execute(
+            "SELECT origin_ref FROM hosts WHERE host_id=?", (host_id,)
+        ).fetchone()
+        if existing is None:
+            return self.add_host(host_id, display_name, origin_ref, now)
+        if existing[0] != origin_ref:
+            raise BindingError("host origin_ref does not match existing host")
+        with self.transaction():
+            self.connection.execute(
+                "UPDATE hosts SET display_name=?, updated_at=? WHERE host_id=?",
+                (display_name, now, host_id),
+            )
+
     def add_profile(self, profile_id: str, display_name: str, account_ref: str,
                     status: str, now: str) -> None:
         profile_id, display_name, account_ref, status, now = (
@@ -285,6 +310,26 @@ class PortableDomainStore:
             self.connection.execute(
                 "INSERT INTO remote_profiles VALUES (?, ?, ?, ?, ?, ?)",
                 (profile_id, display_name, account_ref, status, now, now),
+            )
+
+    def ensure_profile(self, profile_id: str, display_name: str, account_ref: str,
+                       status: str, now: str) -> None:
+        profile_id, display_name, account_ref, status, now = (
+            _profile_id(profile_id), _required(display_name, "display_name"),
+            _safe_reference(account_ref, "account_ref"), _required(status, "status"),
+            _required(now, "now")
+        )
+        existing = self.connection.execute(
+            "SELECT account_ref FROM remote_profiles WHERE profile_id=?", (profile_id,)
+        ).fetchone()
+        if existing is None:
+            return self.add_profile(profile_id, display_name, account_ref, status, now)
+        if existing[0] != account_ref:
+            raise BindingError("profile account_ref does not match existing profile")
+        with self.transaction():
+            self.connection.execute(
+                "UPDATE remote_profiles SET display_name=?, status=?, updated_at=? WHERE profile_id=?",
+                (display_name, status, now, profile_id),
             )
 
     def bind_profile(self, binding_id: str, host_id: str, profile_id: str,
@@ -307,6 +352,33 @@ class PortableDomainStore:
             self.connection.execute(
                 "INSERT INTO host_profile_bindings VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (binding_id, host_id, profile_id, binding_generation, state, now, now),
+            )
+
+    def ensure_binding(self, binding_id: str, host_id: str, profile_id: str,
+                       account_ref: str, binding_generation: int, state: str, now: str) -> None:
+        binding_id, host_id, profile_id, account_ref, state, now = (
+            _required(binding_id, "binding_id"), _required(host_id, "host_id"),
+            _profile_id(profile_id), _safe_reference(account_ref, "account_ref"),
+            _required(state, "state"), _required(now, "now")
+        )
+        existing = self.connection.execute(
+            "SELECT host_id, profile_id, binding_generation, state "
+            "FROM host_profile_bindings WHERE binding_id=?", (binding_id,)
+        ).fetchone()
+        if existing is None:
+            return self.bind_profile(binding_id, host_id, profile_id, account_ref,
+                                     binding_generation, state, now)
+        if tuple(existing) != (host_id, profile_id, binding_generation, state):
+            raise BindingError("binding does not match existing explicit mapping")
+        profile = self.connection.execute(
+            "SELECT account_ref FROM remote_profiles WHERE profile_id=?", (profile_id,)
+        ).fetchone()
+        if profile is None or profile[0] != account_ref:
+            raise BindingError("binding account_ref does not match profile")
+        with self.transaction():
+            self.connection.execute(
+                "UPDATE host_profile_bindings SET updated_at=? WHERE binding_id=?",
+                (now, binding_id),
             )
 
     def upsert_client(self, profile_id: str, client_id: str, display_name: str,
@@ -401,6 +473,20 @@ class PortableDomainStore:
         with self.transaction():
             self.connection.execute("INSERT INTO profile_observations VALUES (?, ?, ?, ?, ?, ?)", values)
 
+    def upsert_observation(self, profile_id: str, observation_id: str, observed_at: str,
+                           source_ref: str, observation_key: str, observation_value: str) -> None:
+        values = [_profile_id(profile_id), _required(observation_id, "observation_id"),
+                  _required(observed_at, "observed_at"), _safe_reference(source_ref, "source_ref"),
+                  _required(observation_key, "observation_key"), _safe_reference(observation_value, "observation_value")]
+        with self.transaction():
+            self.connection.execute(
+                "INSERT INTO profile_observations VALUES (?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(profile_id, observation_id) DO UPDATE SET observed_at=excluded.observed_at, "
+                "source_ref=excluded.source_ref, observation_key=excluded.observation_key, "
+                "observation_value=excluded.observation_value",
+                values,
+            )
+
     def list_observations(self, profile_id: str) -> list[dict[str, object]]:
         profile_id = _profile_id(profile_id)
         return [dict(row) for row in self.connection.execute(
@@ -416,6 +502,33 @@ class PortableDomainStore:
                   _safe_reference(source_ref, "source_ref")]
         with self.transaction():
             self.connection.execute("INSERT INTO profile_audit_events VALUES (?, ?, ?, ?, ?, ?, ?)", values)
+
+    def upsert_audit_event(self, profile_id: str, event_id: str, occurred_at: str,
+                           event_type: str, actor_ref: str, summary: str, source_ref: str) -> None:
+        values = [_profile_id(profile_id), _required(event_id, "event_id"),
+                  _required(occurred_at, "occurred_at"), _required(event_type, "event_type"),
+                  _safe_reference(actor_ref, "actor_ref"), _required(summary, "summary"),
+                  _safe_reference(source_ref, "source_ref")]
+        with self.transaction():
+            self.connection.execute(
+                "INSERT INTO profile_audit_events VALUES (?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(profile_id, event_id) DO UPDATE SET occurred_at=excluded.occurred_at, "
+                "event_type=excluded.event_type, actor_ref=excluded.actor_ref, summary=excluded.summary, "
+                "source_ref=excluded.source_ref",
+                values,
+            )
+
+    def clear_legacy_cycle_stopped(self, profile_id: str, requested_at: str) -> bool:
+        profile_id = _profile_id(profile_id)
+        requested_at = _required(requested_at, "requested_at")
+        with self.transaction():
+            cursor = self.connection.execute(
+                "UPDATE profile_control_intents SET state='CLEARED', requested_at=? "
+                "WHERE profile_id=? AND intent_id='legacy-cycle-stopped' "
+                "AND intent_type='cycle_stopped' AND source_ref='legacy:cycle_stopped.flag'",
+                (requested_at, profile_id),
+            )
+        return cursor.rowcount == 1
 
     def list_audit_events(self, profile_id: str) -> list[dict[str, object]]:
         profile_id = _profile_id(profile_id)

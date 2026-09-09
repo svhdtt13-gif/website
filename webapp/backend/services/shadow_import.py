@@ -82,9 +82,9 @@ class FileSystemGoldenSource:
         if not isinstance(clients, list) or not isinstance(schedules, list) or not isinstance(policies, list):
             raise ShadowImportError("legacy domain collections must be arrays")
         flag_path = self._path(self.cycle_flag)
-        flag = flag_path.read_text(encoding="utf-8").strip().lower() if flag_path.is_file() else ""
+        flag = flag_path.is_file()
         return GoldenSnapshot(tuple(clients), tuple(schedules), tuple(policies),
-                             flag in {"1", "true", "yes", "stop", "stopped"})
+                             flag)
 
 
 def _value(item: Mapping[str, Any], *keys: str, default: Any = "") -> Any:
@@ -100,10 +100,10 @@ def import_shadow(store: PortableDomainStore, snapshot: GoldenSnapshot,
     binding.validate()
     if not now.strip():
         raise ShadowImportError("now is required")
-    store.add_host(binding.host_id, binding.host_id, "legacy-explicit-binding", now)
-    store.add_profile(binding.profile_id, binding.profile_id, binding.account_ref, "VERIFIED", now)
-    store.bind_profile(binding.binding_id, binding.host_id, binding.profile_id,
-                       binding.account_ref, binding.binding_generation, "ACTIVE", now)
+    store.ensure_host(binding.host_id, binding.host_id, "legacy-explicit-binding", now)
+    store.ensure_profile(binding.profile_id, binding.profile_id, binding.account_ref, "VERIFIED", now)
+    store.ensure_binding(binding.binding_id, binding.host_id, binding.profile_id,
+                         binding.account_ref, binding.binding_generation, "ACTIVE", now)
 
     for position, client in enumerate(snapshot.clients):
         client_id = str(_value(client, "client", "client_id", "id", default="")).strip()
@@ -130,10 +130,12 @@ def import_shadow(store: PortableDomainStore, snapshot: GoldenSnapshot,
     if snapshot.cycle_stopped:
         store.upsert_cycle_stopped(binding.profile_id, "legacy-cycle-stopped", "REQUESTED", now,
                                    "legacy:cycle_stopped.flag", "shadow import of explicit profile binding")
-    store.add_observation(binding.profile_id, f"shadow-{now}", now, "legacy-shadow-import",
-                          "import_source", "ai-tool-golden")
-    store.add_audit_event(binding.profile_id, f"shadow-{now}", now, "shadow_import",
-                          "importer", "read-only legacy shadow import", "legacy-shadow-import")
+    else:
+        store.clear_legacy_cycle_stopped(binding.profile_id, now)
+    store.upsert_observation(binding.profile_id, f"shadow-{now}", now, "legacy-shadow-import",
+                             "import_source", "ai-tool-golden")
+    store.upsert_audit_event(binding.profile_id, f"shadow-{now}", now, "shadow_import",
+                             "importer", "read-only legacy shadow import", "legacy-shadow-import")
     return {"profile_id": binding.profile_id, "clients": len(snapshot.clients),
             "schedules": len(snapshot.schedules), "policies": len(snapshot.policies),
             "cycle_stopped": int(snapshot.cycle_stopped)}

@@ -60,7 +60,9 @@
     <div id="profileManagerBody"></div>
     <div class="table-wrap profile-manager-table">
       <table>
-        <thead><tr><th>Profile</th><th>ID</th><th>Status</th><th>Bound host</th><th>Binding state</th></tr></thead>
+        <thead>
+          <tr><th>Profile</th><th>ID</th><th>Status</th><th>Bound host</th><th>Binding state</th></tr>
+        </thead>
         <tbody id="profileManagerBodyRows"><tr><td colspan="5" class="empty-cell">Loading profile metadata...</td></tr></tbody>
       </table>
     </div>
@@ -75,31 +77,123 @@
 
   <main>
     <section class="overview-grid" aria-label="Operator overview">
-      <article class="metric-card accent-cyan"><span class="metric-label">Cycle</span><strong id="cardCycle">Loading</strong><span id="cardCycleMeta" class="metric-meta">Reading cycle status</span></article>
-      <article class="metric-card accent-amber"><span class="metric-label">Auto Sync</span><strong id="cardSync">Loading</strong><span id="cardSyncMeta" class="metric-meta">Reading worker status</span></article>
-      <article class="metric-card accent-violet"><span class="metric-label">AI fix</span><strong id="cardAi">Loading</strong><span id="cardAiMeta" class="metric-meta">Reading watcher queue</span></article>
-      <article class="metric-card accent-green"><span class="metric-label">Clients</span><strong id="cardClients">-</strong><span id="cardClientsMeta" class="metric-meta">Waiting for data</span></article>
+      <article class="metric-card accent-cyan">
+        <span class="metric-label">Cycle</span>
+        <strong id="cardCycle">Loading</strong>
+        <span id="cardCycleMeta" class="metric-meta">Reading cycle status</span>
+      </article>
+      <article class="metric-card accent-amber">
+        <span class="metric-label">Auto Sync</span>
+        <strong id="cardSync">Loading</strong>
+        <span id="cardSyncMeta" class="metric-meta">Reading worker status</span>
+      </article>
+      <article class="metric-card accent-violet">
+        <span class="metric-label">AI fix</span>
+        <strong id="cardAi">Loading</strong>
+        <span id="cardAiMeta" class="metric-meta">Reading watcher queue</span>
+      </article>
+      <article class="metric-card accent-green">
+        <span class="metric-label">Clients</span>
+        <strong id="cardClients">-</strong>
+        <span id="cardClientsMeta" class="metric-meta">Waiting for data</span>
+      </article>
     </section>
 
     <section class="dashboard-grid" aria-label="Live read-only status">
-      <article class="panel" data-panel="cycle"><div class="panel-heading"><div><p class="panel-kicker">Cycle / Process</p><h2>Cycle status</h2></div><span data-panel-health class="health health-loading">Loading</span></div><p data-panel-provenance class="panel-provenance">UNSCOPED READ</p><p data-panel-message class="panel-message">Reading the golden cycle contract.</p><div id="cycleDetails" class="detail-grid"></div></article>
-      <article class="panel" data-panel="sync"><div class="panel-heading"><div><p class="panel-kicker">Worker telemetry</p><h2>Auto Sync</h2></div><span data-panel-health class="health health-loading">Loading</span></div><p data-panel-provenance class="panel-provenance">UNSCOPED READ</p><p data-panel-message class="panel-message">Reading the sync contract.</p><div id="syncDetails" class="detail-grid"></div></article>
-      <article class="panel" data-panel="aiFix"><div class="panel-heading"><div><p class="panel-kicker">Queue telemetry</p><h2>AI fix</h2></div><span data-panel-health class="health health-loading">Loading</span></div><p data-panel-provenance class="panel-provenance">UNSCOPED READ</p><p data-panel-message class="panel-message">Reading watcher and queue status.</p><div id="aiDetails" class="detail-grid"></div></article>
-      <article class="panel" data-panel="settings"><div class="panel-heading"><div><p class="panel-kicker">Safe projection</p><h2>Public settings</h2></div><span data-panel-health class="health health-loading">Loading</span></div><p data-panel-provenance class="panel-provenance">UNSCOPED READ</p><p data-panel-message class="panel-message">Only the backend-approved public fields are shown.</p><div id="settingsDetails" class="detail-grid"></div></article>
+      <article class="panel" data-panel="cycle">
+        <div class="panel-heading">
+          <div>
+            <p class="panel-kicker">Cycle / Process</p>
+            <h2>Cycle status</h2>
+          </div>
+          <span data-panel-health class="health health-loading">Loading</span>
+        </div>
+        <p data-panel-provenance class="panel-provenance">UNSCOPED READ</p>
+        <p data-panel-message class="panel-message">Reading the golden cycle contract.</p>
+        <div id="cycleDetails" class="detail-grid"></div>
+      </article>
+
+      <article class="panel" data-panel="sync">
+        <div class="panel-heading">
+          <div>
+            <p class="panel-kicker">Worker telemetry</p>
+            <h2>Auto Sync</h2>
+          </div>
+          <span data-panel-health class="health health-loading">Loading</span>
+        </div>
+        <p data-panel-provenance class="panel-provenance">UNSCOPED READ</p>
+        <p data-panel-message class="panel-message">Reading the sync contract.</p>
+        <div id="syncDetails" class="detail-grid"></div>
+      </article>
+
+      <article class="panel" data-panel="aiFix">
+        <div class="panel-heading">
+          <div>
+            <p class="panel-kicker">Queue telemetry</p>
+            <h2>AI fix</h2>
+          </div>
+          <span data-panel-health class="health health-loading">Loading</span>
+        </div>
+        <p data-panel-provenance class="panel-provenance">UNSCOPED READ</p>
+        <p data-panel-message class="panel-message">Reading watcher and queue status.</p>
+        <div id="aiDetails" class="detail-grid"></div>
+      </article>
+
+      <article class="panel" data-panel="settings">
+        <div class="panel-heading">
+          <div>
+            <p class="panel-kicker">Safe projection</p>
+            <h2>Public settings</h2>
+          </div>
+          <span data-panel-health class="health health-loading">Loading</span>
+        </div>
+        <p data-panel-provenance class="panel-provenance">UNSCOPED READ</p>
+        <p data-panel-message class="panel-message">Only the backend-approved public fields are shown.</p>
+        <div id="settingsDetails" class="detail-grid"></div>
+      </article>
     </section>
 
     <section class="panel backup-panel" data-panel="backups">
-      <div class="panel-heading"><div><p class="panel-kicker">Golden metadata</p><h2>Cycle Backups</h2></div><span data-panel-health class="health health-loading">Loading</span></div>
-      <p data-panel-provenance class="panel-provenance">UNSCOPED READ</p><p data-panel-message class="panel-message">Read-only list. Create, delete and restore remain on db.html.</p>
-      <div class="table-wrap"><table><thead><tr><th>Name</th><th>Label</th><th>Created</th><th>Size</th><th>Files</th><th>Scripts</th></tr></thead><tbody id="backupBody"><tr><td colspan="6" class="empty-cell">Loading backup metadata...</td></tr></tbody></table></div>
+      <div class="panel-heading">
+        <div>
+          <p class="panel-kicker">Golden metadata</p>
+          <h2>Cycle Backups</h2>
+        </div>
+        <span data-panel-health class="health health-loading">Loading</span>
+      </div>
+      <p data-panel-provenance class="panel-provenance">UNSCOPED READ</p>
+      <p data-panel-message class="panel-message">Read-only list. Create, delete and restore remain on db.html.</p>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th>Name</th><th>Label</th><th>Created</th><th>Size</th><th>Files</th><th>Scripts</th></tr>
+          </thead>
+          <tbody id="backupBody"><tr><td colspan="6" class="empty-cell">Loading backup metadata...</td></tr></tbody>
+        </table>
+      </div>
     </section>
 
-    <section class="panel boundary-panel"><div class="panel-heading"><div><p class="panel-kicker">Safety boundary</p><h2>Golden fallback remains active</h2></div><span class="health health-readonly">READ ONLY</span></div><div class="boundary-copy"><p>This dashboard does not start or stop workers, select remote clients, write settings, mutate backups, or switch profiles.</p><p>Operator edits remain on the original <code>tools/db.html</code>. The legacy public Cloudflare <code>/db</code> surface is not touched by U1.</p></div></section>
-+  </main>
-+
-+  <footer class="site-footer"><span>U1 read-only operator dashboard</span><span id="footerState">No runtime control is exposed.</span></footer>
-+</div>
-+<script type="module" src="js/main.js"></script>
-+<script type="module" src="js/profile_manager.js"></script>
-+</body>
-+</html>
+    <section class="panel boundary-panel">
+      <div class="panel-heading">
+        <div>
+          <p class="panel-kicker">Safety boundary</p>
+          <h2>Golden fallback remains active</h2>
+        </div>
+        <span class="health health-readonly">READ ONLY</span>
+      </div>
+      <div class="boundary-copy">
+        <p>This dashboard does not start or stop workers, select remote clients, write settings, mutate backups, or switch profiles.</p>
+        <p>Operator edits remain on the original <code>tools/db.html</code>. The legacy public Cloudflare <code>/db</code> surface is not touched by U1.</p>
+      </div>
+    </section>
+  </main>
+
+  <footer class="site-footer">
+    <span>U1 read-only operator dashboard</span>
+    <span id="footerState">No runtime control is exposed.</span>
+  </footer>
+</div>
+<script type="module" src="js/main.js"></script>
+<script type="module" src="js/profile_manager.js"></script>
+</body>
+</html>

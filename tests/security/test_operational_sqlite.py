@@ -205,6 +205,17 @@ class OperationalSQLiteTests(unittest.TestCase):
         with self.assertRaises(OperationalSchemaError):
             OperationalSQLiteRepository.open(self.runtime)
 
+    def test_backup_rejects_invalid_source_before_writing(self):
+        with self.repository.transaction():
+            self.repository.connection.execute(
+                "ALTER TABLE jobs ADD COLUMN tampered TEXT"
+            )
+        destination = backup_directory(self.runtime) / "invalid-source.sqlite3"
+        with self.assertRaises(OperationalSchemaError):
+            self.repository.backup_to(destination)
+        self.assertFalse(destination.exists())
+        self.assertFalse(destination.with_suffix(".manifest.json").exists())
+
     def test_backup_restore_preserves_p3_hash_and_mtime(self):
         p3 = self.runtime / "sqlite" / "f2e2bd.sqlite3"
         p3.parent.mkdir(parents=True)
@@ -227,6 +238,39 @@ class OperationalSQLiteTests(unittest.TestCase):
         self.assertEqual(job_ids, ["job-3"])
         self.assertEqual(hashlib.sha256(p3.read_bytes()).hexdigest(), p3_hash)
         self.assertEqual(p3.stat().st_mtime_ns, p3_mtime)
+
+    def test_restore_rejects_valid_but_wrong_schema_without_replacing(self):
+        backup, manifest = self.repository.backup_to(
+            backup_directory(self.runtime) / "wrong-schema.sqlite3"
+        )
+        self.repository.insert_job("keep-current", "test", "{}", "test", "idem-current")
+        self.repository.connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        self.repository.close()
+        before = hashlib.sha256(operational_path(self.runtime).read_bytes()).hexdigest()
+
+        with sqlite3.connect(backup) as candidate:
+            candidate.execute("ALTER TABLE jobs ADD COLUMN tampered TEXT")
+        metadata = json.loads(manifest.read_text(encoding="utf-8"))
+        metadata["size"] = backup.stat().st_size
+        metadata["sha256"] = hashlib.sha256(backup.read_bytes()).hexdigest()
+        manifest.write_text(
+            json.dumps(metadata, sort_keys=True, separators=(",", ":")) + "\n",
+            encoding="utf-8",
+        )
+
+        with self.assertRaises(OperationalSchemaError):
+            OperationalSQLiteRepository.restore_from(self.runtime, backup)
+        self.assertEqual(
+            hashlib.sha256(operational_path(self.runtime).read_bytes()).hexdigest(),
+            before,
+        )
+        self.repository = OperationalSQLiteRepository.open(self.runtime)
+        self.assertEqual(
+            self.repository.rows(
+                "SELECT job_id FROM jobs WHERE job_id='keep-current'"
+            )[0][0],
+            "keep-current",
+        )
 
     def test_corrupt_backup_is_rejected_before_restore(self):
         backup, _manifest = self.repository.backup_to(

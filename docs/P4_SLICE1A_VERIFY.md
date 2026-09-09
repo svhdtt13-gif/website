@@ -53,7 +53,16 @@ Result after the restore-preflight fix on branch `p4-slice1a-operational-runtime
 
 ```text
 ............
-Ran 12 tests in <runtime-dependent>.
+Ran 12 tests in 6.046s
+OK
+```
+
+`py_compile` passed for both edited Python files. The Phase 3 importer regression
+also passed independently:
+
+```text
+................
+Ran 16 tests in 5.455s
 OK
 ```
 
@@ -67,10 +76,10 @@ The 12 tests include:
 - P3 hash and `st_mtime_ns` preservation through backup/restore;
 - path, `ATTACH`, WAL/FK/integrity, transaction, active-lease and corrupt-backup checks.
 
-The earlier implementation blocker fix was committed at
-`f6b7cd032f8a7d75a190078ba116c2300236198c`. The restore-preflight fix is in
-commit `4f5399dbe6991d40dadbad2aefde7c3facfd496f` plus the regression commit
-following it.
+The restore-preflight fix is covered by commits `4f5399dbe6991d40dadbad2aefde7c3facfd496f`,
+`e49bd8fc2a5621c204ebcff40ddba644f74c49a9`, `48b5429794c4ffed4fd60f9e62acef1ebd5b31d9`,
+`60047cc794b138bd9afa0068d1df9eac9c55b86c`, `c3dbbfb0e4906a31094edc525e4177ff2b75cd11`
+and `d572b0f9f20e0362238f5c05de1bf6205543ae6e`.
 
 ## Boundary evidence
 

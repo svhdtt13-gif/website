@@ -49,6 +49,8 @@ READ_HANDLERS = {
     "api/cycle/backup": backup_service.get_cycle_backups,
     "api/master": master_service.get_api_master,
     "api/remote_live": remote_live_service.get_remote_live,
+    "clients_master.json": master_service.get_master,
+    "client_database.json": master_service.get_database,
     "api/settings": settings_service.get_settings,
 }
 

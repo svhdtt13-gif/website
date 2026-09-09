@@ -63,15 +63,20 @@ def main():
     ))
     for panel in ("cycle", "sync", "aiFix", "settings", "backups"):
         check(f"{panel} panel is present", f'data-panel="{panel}"' in index)
+        check(f"{panel} panel renders provenance", "data-panel-provenance" in index)
     for label in ("Auto Sync", "AI fix", "Public settings", "Cycle Backups"):
         check(f"{label} label is present", label in index)
     for scope_id in ("scopeCycle", "scopeSync", "scopeAiFix", "scopeBackups", "scopeSettings"):
         check(f"{scope_id} provenance field is present", f'id="{scope_id}"' in index)
     check("context is resolved per panel source", "panelContext" in views
           and "PANEL_SOURCES" in views and "sourceKeys" in context)
+    check("account participates in completeness and conflict checks",
+          "account" in context and "const keys = ['hostId', 'profileId', 'account'" in context)
+    check("provenance includes host/profile/account/identity", "provenanceText" in views
+          and "account=${valueOrDash(context.account)}" in views)
     check("missing context never borrows another panel", "UNSCOPED READ" in context
           and "PROFILE-SCOPED READ" in context)
-    check("mixed profile context fails closed", "CONTEXT CONFLICT / FAIL CLOSED" in context
+    check("mixed profile or account context fails closed", "CONTEXT CONFLICT / FAIL CLOSED" in context
           and "Data suppressed" in context)
     check("cycle stop is separate from sync read permission", "cycleStopRequested" in policy
           and "syncReadAllowed" in policy

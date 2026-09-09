@@ -86,15 +86,15 @@ Hashes identify the audited local inputs. No secret values are included.
 |---|---:|---|
 | `tools/db.html` | 103983 | `bacfc33d00fb7babe38bd1fa4361f52c52a8fb85ed008f8f08847438f3fb8de4` |
 | `WebAppControl/flask/app_public.py` | 75284 | `7a8b9e0e28942ea74ead8a19a292b83aed0810e983448b14e01cf493ef8232b1` |
-| `start_public_web.ps1` | 3005 | `b4ad1f6a550b4e8f0a73edc564d861bd6b64d7cd7933f606952c5d5e59ccf8d` |
-| `tools/start_onboot.ps1` | 17732 | `c6fe5d58f9b3471bd7e7a5f9e5beefb8bff4af069c50b5865f1ce3a27913e21e` |
+| `start_public_web.ps1` | 3767 | `430d3874c82d7e92000413182a4e228d56cb46e01009a197a6027eabdfa4ff5e` |
+| `tools/start_onboot.ps1` | 22327 | `08379295e597aff33bbc1088e8cf1ea35c5472d9417a2b658e84b76edf98873b` |
 | `tools/AutoCycle.ps1` | 49584 | `ed4065694849cffe00bd52f5645fc95a4fa02170b994b62000227db316498b13` |
 | `continuous_sync_remote.ps1` | 19485 | `532329c3a82e6ba9c465a93db02e0660fd970b49276feb8c8d51393d4ad91bea` |
 | `tools/clients_master.json` | 9714 | `6b0ad5a5a9064b1e471ec459c070d6141754c04bacf9ba239bd9ac45b381abbe` |
 | `tools/client_database.json` | 11925 | `b8d6ca9fe6639c9402ad0067e36b3d6a31131f6b60f5f98efc9e52542136292` |
 | `tools/cache/cycle_state.json` | 198 | `2187e99f7a53e2744989f9b0a3146618d8cbe3b1509cd9cd852a75ea5305e6f9` |
 | `tools/cache/manual_override.json` | 2173 | `0e414f54f4aa9cd6aa5d798daf605d1981e1d28ce6e105cd57c9a770f6c265d7` |
-| `tools/cache/public_url.txt` | 72 | `not recorded as a source fingerprint because the URL is ephemeral` |
+| `tools/cache/public_url.txt` | 69 | `not recorded as a source fingerprint because the URL is ephemeral` |
 
 Settings keys observed: `telegram_bot_token`, `telegram_chat_id`,
 `default_browser`, `cloudflared_path`, `tunnel_port`,

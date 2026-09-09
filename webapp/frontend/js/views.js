@@ -75,16 +75,24 @@ function panelRoot(name) {
   return document.querySelector(`[data-panel="${name}"]`);
 }
 
-function setPanel(name, state, message) {
+function provenanceText(info) {
+  if (!info.context) return info.scope;
+  const context = info.context;
+  return `${info.scope} | host=${valueOrDash(context.hostId)} | profile=${valueOrDash(context.profileId)} | account=${valueOrDash(context.account)} | identity=${valueOrDash(context.identity)}`;
+}
+
+function setPanel(name, state, message, context) {
   const root = panelRoot(name);
   if (!root) return;
   root.dataset.state = state;
   const health = root.querySelector('[data-panel-health]');
+  const provenance = root.querySelector('[data-panel-provenance]');
   const note = root.querySelector('[data-panel-message]');
   if (health) {
     health.textContent = state === 'ok' ? 'LIVE' : state === 'error' ? 'UNAVAILABLE' : 'LOADING';
     health.className = `health health-${state}`;
   }
+  if (provenance) provenance.textContent = provenanceText(context || { scope: 'UNSCOPED READ', context: null });
   if (note && message) note.textContent = message;
 }
 
@@ -102,7 +110,7 @@ function renderScopeSummary(state) {
   ];
   panels.forEach(([id, panel]) => {
     const target = document.getElementById(id);
-    if (target) target.textContent = scopeFor(state, panel).scope;
+    if (target) target.textContent = provenanceText(scopeFor(state, panel));
   });
   const authority = document.getElementById('contextAuthority');
   if (authority) authority.textContent = 'READ ONLY / FAIL CLOSED';
@@ -116,9 +124,9 @@ function renderCards(state) {
   const sync = state.sync || {};
   const watcher = (state.aiFix || {}).watcher || {};
   const general = state.general || {};
-  const cycleScope = scopeFor(state, 'cycle').scope;
-  const syncScope = scopeFor(state, 'sync').scope;
-  const aiScope = scopeFor(state, 'aiFix').scope;
+  const cycleScope = provenanceText(scopeFor(state, 'cycle'));
+  const syncScope = provenanceText(scopeFor(state, 'sync'));
+  const aiScope = provenanceText(scopeFor(state, 'aiFix'));
   const cycleCard = document.getElementById('cardCycle');
   const cycleMeta = document.getElementById('cardCycleMeta');
   const syncCard = document.getElementById('cardSync');
@@ -142,12 +150,12 @@ function renderCycle(state) {
   const simple = state.cycleSimple;
   const context = scopeFor(state, 'cycle');
   if (context.suppress) {
-    setPanel('cycle', 'error', context.message);
+    setPanel('cycle', 'error', context.message, context);
     renderDetails(PANEL_IDS.cycle, []);
     return;
   }
   if (!data || !simple) {
-    setPanel('cycle', 'error', `Cycle read unavailable: ${state.errors.cycle || state.errors.cycleSimple || 'missing source'}`);
+    setPanel('cycle', 'error', `Cycle read unavailable: ${state.errors.cycle || state.errors.cycleSimple || 'missing source'}`, context);
     renderDetails(PANEL_IDS.cycle, []);
     return;
   }
@@ -169,19 +177,19 @@ function renderCycle(state) {
     ['Today', data.state && data.state.today],
     ['Last cycle log', logs],
   ]);
-  setPanel('cycle', 'ok', `Live read only. ${context.scope}. ${context.message}`);
+  setPanel('cycle', 'ok', `Live read only. ${context.scope}. ${context.message}`, context);
 }
 
 function renderSync(state) {
   const data = state.sync;
   const context = scopeFor(state, 'sync');
   if (context.suppress) {
-    setPanel('sync', 'error', context.message);
+    setPanel('sync', 'error', context.message, context);
     renderDetails(PANEL_IDS.sync, []);
     return;
   }
   if (!syncReadAllowed(data)) {
-    setPanel('sync', 'error', `Auto Sync read unavailable: ${state.errors.sync || 'missing source'}`);
+    setPanel('sync', 'error', `Auto Sync read unavailable: ${state.errors.sync || 'missing source'}`, context);
     renderDetails(PANEL_IDS.sync, []);
     return;
   }
@@ -196,19 +204,19 @@ function renderSync(state) {
     ['Source', data.source],
     ['Cycle stop effect', 'Read-only sync remains allowed'],
   ]);
-  setPanel('sync', 'ok', `Read-only observation/reconciliation. ${context.scope}. ${context.message}`);
+  setPanel('sync', 'ok', `Read-only observation/reconciliation. ${context.scope}. ${context.message}`, context);
 }
 
 function renderAiFix(state) {
   const data = state.aiFix;
   const context = scopeFor(state, 'aiFix');
   if (context.suppress) {
-    setPanel('aiFix', 'error', context.message);
+    setPanel('aiFix', 'error', context.message, context);
     renderDetails(PANEL_IDS.aiFix, []);
     return;
   }
   if (!data) {
-    setPanel('aiFix', 'error', `AI-fix read unavailable: ${state.errors.aiFix || 'missing source'}`);
+    setPanel('aiFix', 'error', `AI-fix read unavailable: ${state.errors.aiFix || 'missing source'}`, context);
     renderDetails(PANEL_IDS.aiFix, []);
     return;
   }
@@ -229,19 +237,19 @@ function renderAiFix(state) {
     ['Watcher PID', watcher.pid],
     ['Models', Array.isArray(data.models) ? data.models.join(', ') : '-'],
   ]);
-  setPanel('aiFix', 'ok', `Queue and watcher metadata only. ${context.scope}. ${context.message}`);
+  setPanel('aiFix', 'ok', `Queue and watcher metadata only. ${context.scope}. ${context.message}`, context);
 }
 
 function renderSettings(state) {
   const data = state.settings;
   const context = scopeFor(state, 'settings');
   if (context.suppress) {
-    setPanel('settings', 'error', context.message);
+    setPanel('settings', 'error', context.message, context);
     renderDetails(PANEL_IDS.settings, []);
     return;
   }
   if (!data) {
-    setPanel('settings', 'error', `Public settings unavailable: ${state.errors.settings || 'missing source'}`);
+    setPanel('settings', 'error', `Public settings unavailable: ${state.errors.settings || 'missing source'}`, context);
     renderDetails(PANEL_IDS.settings, []);
     return;
   }
@@ -251,7 +259,7 @@ function renderSettings(state) {
     ['Auto Telegram', boolLabel(data.auto_telegram)],
     ['Auto open browser', boolLabel(data.auto_open_browser)],
   ]);
-  setPanel('settings', 'ok', `Redacted public projection. ${context.scope}. ${context.message}`);
+  setPanel('settings', 'ok', `Redacted public projection. ${context.scope}. ${context.message}`, context);
 }
 
 function renderBackups(state) {
@@ -259,7 +267,7 @@ function renderBackups(state) {
   const context = scopeFor(state, 'backups');
   if (!target) return;
   if (context.suppress || !state.backups) {
-    setPanel('backups', 'error', context.suppress ? context.message : `Backup list unavailable: ${state.errors.backups || 'missing source'}`);
+    setPanel('backups', 'error', context.suppress ? context.message : `Backup list unavailable: ${state.errors.backups || 'missing source'}`, context);
     target.replaceChildren();
     const row = document.createElement('tr');
     const cell = document.createElement('td');
@@ -291,7 +299,7 @@ function renderBackups(state) {
     row.appendChild(cell);
     target.appendChild(row);
   }
-  setPanel('backups', 'ok', `${backups.length} backup${backups.length === 1 ? '' : 's'} read-only. ${context.scope}. ${context.message}`);
+  setPanel('backups', 'ok', `${backups.length} backup${backups.length === 1 ? '' : 's'} read-only. ${context.scope}. ${context.message}`, context);
 }
 
 export function showBanner(message) {

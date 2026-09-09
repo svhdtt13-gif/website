@@ -26,13 +26,13 @@ function extractContext(data) {
   const bound = values.binding !== null || values.bindingState === 'ACTIVE';
   return {
     present: true,
-    complete: Boolean(values.hostId && values.profileId && verified && bound),
+    complete: Boolean(values.hostId && values.profileId && values.account && verified && bound),
     values,
   };
 }
 
 function conflicts(contexts) {
-  const keys = ['hostId', 'profileId', 'identity', 'binding'];
+  const keys = ['hostId', 'profileId', 'account', 'identity', 'binding'];
   return contexts.some((left, leftIndex) => contexts.slice(leftIndex + 1).some((right) => keys.some((key) => (
     left.values[key] !== null && right.values[key] !== null
       && String(left.values[key]) !== String(right.values[key])
@@ -45,7 +45,7 @@ export function panelContext(state, sourceKeys) {
     return {
       scope: 'CONTEXT CONFLICT / FAIL CLOSED',
       suppress: true,
-      message: 'Conflicting host/profile context across this panel sources. Data suppressed.',
+      message: 'Conflicting host/profile/account context across this panel sources. Data suppressed.',
       context: null,
     };
   }
@@ -53,14 +53,14 @@ export function panelContext(state, sourceKeys) {
     return {
       scope: 'UNSCOPED READ',
       suppress: false,
-      message: 'This panel has no complete host/profile proof. It is read-only and not scoped to another panel.',
+      message: 'This panel has no complete host/profile/account proof. It is read-only and not scoped to another panel.',
       context: null,
     };
   }
   return {
     scope: 'PROFILE-SCOPED READ',
     suppress: false,
-    message: 'This panel has matching host/profile/identity/binding proof. U1 remains read-only.',
+    message: 'This panel has matching host/profile/account/identity/binding proof. U1 remains read-only.',
     context: contexts[0].values,
   };
 }

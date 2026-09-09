@@ -23,7 +23,8 @@ h1{margin:0;font-size:clamp(1.8rem,4vw,3.3rem);letter-spacing:-.04em;line-height
 .panel-heading{display:flex;justify-content:space-between;align-items:flex-start;gap:14px}
 .panel-kicker{color:var(--muted);font-size:.66rem;letter-spacing:.13em}
 h2{margin:0;font-size:1.12rem;letter-spacing:-.02em}
-.panel-message{min-height:1.4em;margin:12px 0 16px;color:var(--muted);font-size:.82rem}
+.panel-provenance{margin:12px 0 0;overflow:hidden;color:var(--cyan);font-family:"SFMono-Regular",Consolas,monospace;font-size:.68rem;text-overflow:ellipsis;white-space:nowrap}
+.panel-message{min-height:1.4em;margin:6px 0 16px;color:var(--muted);font-size:.82rem}
 .health{font-size:.61rem;padding:5px 8px}.health-ok{color:var(--green);border-color:rgba(72,213,151,.35);background:rgba(72,213,151,.08)}.health-error{color:var(--red);border-color:rgba(255,119,119,.35);background:rgba(255,119,119,.08)}.health-loading{color:var(--amber);border-color:rgba(246,185,77,.35);background:rgba(246,185,77,.08)}.health-readonly{color:var(--cyan);border-color:rgba(69,213,232,.35);background:rgba(69,213,232,.08)}
 .detail-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}
 .detail-item{min-width:0;padding:10px 11px;border:1px solid rgba(148,163,184,.1);border-radius:9px;background:rgba(8,17,31,.45)}

@@ -314,30 +314,40 @@ Status: `FIXTURE` for current response shapes; `DESIGN` for migration plan.
 
 The first implementation group is read/status only:
 
-- `GET /api/status`
-- `GET /api/sync_status`
-- `GET /api/cycle_status`
-- `GET /api/cycle/status`
-- `GET /api/ai_fix/status`
+- Public website: `GET /up/api/status`
+- Public website: `GET /up/api/sync_status`
+- Public website: `GET /up/api/cycle_status`
+- Public website: `GET /up/api/cycle/status`
+- Public website: `GET /up/api/ai_fix/status`
 
-`GET /api/remote_live` is intentionally excluded because the current handler opens a remote read path. All POST/PUT/PATCH/DELETE routes are excluded from the first group.
+The namespace mapping is explicit:
+
+```text
+public website /up/<subpath> -> internal handler key <subpath> -> upstream fixture source /<subpath>
+public website /up/api/status -> api/status -> upstream /api/status
+```
+
+The public `/up/` prefix is part of the website dispatch contract. The internal handler key is the `READ_HANDLERS` subpath (for example `api/status`); it is not itself the public URL.
+
+`GET /up/api/remote_live` is intentionally excluded because the current handler opens a remote read path. All POST/PUT/PATCH/DELETE routes are excluded from the first group.
 
 ### Captured API fixtures
 
-Captured from `http://127.0.0.1:8080` with authenticated GET requests on 2026-09-09 15:06 local time. No mutation request was made.
+Captured from both the public website and the upstream/internal fixture source with authenticated GET requests on 2026-09-09 15:06 local time. No mutation request was made. All five public routes and their upstream counterparts returned `200 application/json` with matching top-level keys.
 
-| Route | Status | Required top-level shape |
-|---|---:|---|
-| `/api/status` | 200 | `clients`, `lastUpdated`, `time` |
-| `/api/sync_status` | 200 | `continuous_running`, `continuous_pid`, `interval_sec`, `status_interval_sec`, `last_sync`, `extraction_method`, `total_clients`, `source` |
-| `/api/cycle_status` | 200 | `running`, `status`, `stopped`, `cycle_paused`, `alwaysrun_paused`, `alwaysrun_disabled` |
-| `/api/cycle/status` | 200 | `checked_at`, `cycle_running`, `cycle_pid`, `sync_running`, `sync_pid`, `360auto`, `qnyh`, `cycle_paused`, `alwaysrun_paused`, `alwaysrun_disabled`, `stop_flag`, `last_log`, `state`, `manual_overrides` |
-| `/api/ai_fix/status` | 200 | `watcher`, `models`, `pending`, `recent_done`, `recent_failed` |
+| Public website route | Internal handler key | Upstream fixture source | Status | Required top-level shape |
+|---|---|---|---:|---|
+| `/up/api/status` | `api/status` | `/api/status` | 200/200 | `clients`, `lastUpdated`, `time` |
+| `/up/api/sync_status` | `api/sync_status` | `/api/sync_status` | 200/200 | `continuous_running`, `continuous_pid`, `interval_sec`, `status_interval_sec`, `last_sync`, `extraction_method`, `total_clients`, `source` |
+| `/up/api/cycle_status` | `api/cycle_status` | `/api/cycle_status` | 200/200 | `running`, `status`, `stopped`, `cycle_paused`, `alwaysrun_paused`, `alwaysrun_disabled` |
+| `/up/api/cycle/status` | `api/cycle/status` | `/api/cycle/status` | 200/200 | `checked_at`, `cycle_running`, `cycle_pid`, `sync_running`, `sync_pid`, `360auto`, `qnyh`, `cycle_paused`, `alwaysrun_paused`, `alwaysrun_disabled`, `stop_flag`, `last_log`, `state`, `manual_overrides` |
+| `/up/api/ai_fix/status` | `api/ai_fix/status` | `/api/ai_fix/status` | 200/200 | `watcher`, `models`, `pending`, `recent_done`, `recent_failed` |
 
 Fixture assertions for the first implementation PR:
 
-- authentication and status code remain unchanged;
-- required keys and JSON types remain unchanged;
+- public `/up/...` authentication and status code remain unchanged;
+- public route maps to the intended internal handler key and upstream `/api/...` fixture source;
+- required keys and JSON types remain unchanged across public and upstream responses;
 - no new write or remote side effect is introduced;
 - dynamic PID/time/log values are compared by type and invariant, not literal value;
 - no P3 generation path, token, password or secret field appears in the response.
@@ -347,7 +357,7 @@ Fixture assertions for the first implementation PR:
 - First group is guarded by a route-group adapter switch, defaulting to the current implementation until parity evidence exists.
 - Rollback disables the adapter, leaves all write/control routes untouched, and restores the original handler path without changing the HTTP contract.
 - If the adapter has a lease/read failure, it returns the existing error shape and does not spawn a worker or call a remote script.
-- Rollback evidence includes route-by-route fixture diff, process command-line check, remote WebSocket event count, and P3 generation hash/mtime stability.
+- Rollback evidence includes public `/up/...` versus upstream `/api/...` route mapping, route-by-route fixture diff, process command-line check, remote WebSocket event count, and P3 generation hash/mtime stability.
 
 `IMPLEMENTATION_REQUIRED`:
 
@@ -358,4 +368,4 @@ Fixture assertions for the first implementation PR:
 
 ## Review conclusion
 
-All six design-gate evidence groups are now concretely specified and supported by current read-only route fixtures where applicable. The implementation-required checks are explicit acceptance gates, not claimed as already passed. P4 implementation remains **NO-GO** until a reviewer approves this pack and the coder produces the listed runtime evidence during implementation.
+All six design-gate evidence groups are now concretely specified and supported by current read-only route fixtures where applicable. The implementation-required checks are explicit acceptance gates, not claimed as passed. P4 implementation remains **NO-GO** until a reviewer approves this pack and the coder produces the listed runtime evidence during implementation.

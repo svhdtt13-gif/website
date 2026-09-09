@@ -1,3 +1,6 @@
+import { panelContext } from './profile_context.js';
+import { cycleControlBlocked, cycleStopRequested, syncReadAllowed } from './runtime_policy.js';
+
 const PANEL_IDS = {
   cycle: 'cycleDetails',
   sync: 'syncDetails',
@@ -6,7 +9,13 @@ const PANEL_IDS = {
   backups: 'backupBody',
 };
 
-const MISSING_CONTEXT = 'Not exposed by current read contract';
+const PANEL_SOURCES = {
+  cycle: ['cycle', 'cycleSimple'],
+  sync: ['sync'],
+  aiFix: ['aiFix'],
+  settings: ['settings'],
+  backups: ['backups'],
+};
 
 function valueOrDash(value) {
   if (value === undefined || value === null || value === '') return '-';
@@ -79,81 +88,37 @@ function setPanel(name, state, message) {
   if (note && message) note.textContent = message;
 }
 
-function readContextField(context, names) {
-  for (const name of names) {
-    if (context[name] !== undefined && context[name] !== null && context[name] !== '') return context[name];
-  }
-  return null;
+function scopeFor(state, panel) {
+  return panelContext(state, PANEL_SOURCES[panel]);
 }
 
-function contextInfo(state) {
-  const sources = [state.general, state.cycle, state.sync, state.aiFix, state.backups, state.settings]
-    .map((data) => data?.profile_context || data?.context)
-    .filter((context) => context && typeof context === 'object');
-  const context = sources[0] || {};
-  const fields = {
-    host: ['host_id', 'hostId'],
-    profile: ['profile_id', 'profileId'],
-    identity: ['verified_identity', 'verifiedIdentity', 'identity_ref'],
-    binding: ['active_binding_id', 'binding_id', 'binding_generation'],
-  };
-  const inconsistent = sources.some((candidate) => Object.values(fields).some((names) => {
-    const first = readContextField(context, names);
-    const other = readContextField(candidate, names);
-    return first !== null && other !== null && String(first) !== String(other);
-  }));
-  const identity = readContextField(context, fields.identity);
-  const hasVerifiedIdentity = identity !== null && !['UNVERIFIED', 'unverified', 'unknown'].includes(String(identity));
-  const hasBinding = readContextField(context, fields.binding) !== null
-    || readContextField(context, ['binding_state', 'bindingState']) === 'ACTIVE';
-  const complete = sources.length > 0 && !inconsistent
-    && readContextField(context, fields.host) !== null
-    && readContextField(context, fields.profile) !== null
-    && hasVerifiedIdentity && hasBinding;
-  return { context, inconsistent, complete };
-}
-
-function contextValue(context, names) {
-  return valueOrDash(readContextField(context, names) || MISSING_CONTEXT);
-}
-
-function scopeLabel(info) {
-  if (info.inconsistent) return 'CONTEXT CONFLICT / FAIL CLOSED';
-  return info.complete ? 'PROFILE-SCOPED READ' : 'UNSCOPED LEGACY HOST READ';
-}
-
-function scopeMessage(info) {
-  if (info.inconsistent) return 'Conflicting host/profile context across read sources. Panel data is suppressed.';
-  if (!info.complete) return 'Legacy host read only; profile binding is unresolved. Control remains fail-closed.';
-  return 'Profile-scoped read; U1 remains read-only.';
-}
-
-function renderContext(state) {
-  const info = contextInfo(state);
-  const context = info.context;
-  const values = {
-    contextHost: contextValue(context, ['host_id', 'hostId']),
-    contextProfile: contextValue(context, ['profile_id', 'profileId']),
-    contextAccount: contextValue(context, ['remote_account', 'remoteAccount', 'account_ref']),
-    contextIdentity: info.complete ? contextValue(context, ['verified_identity', 'verifiedIdentity', 'identity_ref']) : 'UNVERIFIED',
-    contextAuthority: info.complete ? `READ ONLY U1 / ${contextValue(context, ['control_authority', 'controlAuthority'])}` : 'READ ONLY / FAIL CLOSED',
-    contextScope: scopeLabel(info),
-  };
-  Object.entries(values).forEach(([id, value]) => {
+function renderScopeSummary(state) {
+  const panels = [
+    ['scopeCycle', 'cycle'],
+    ['scopeSync', 'sync'],
+    ['scopeAiFix', 'aiFix'],
+    ['scopeBackups', 'backups'],
+    ['scopeSettings', 'settings'],
+  ];
+  panels.forEach(([id, panel]) => {
     const target = document.getElementById(id);
-    if (target) target.textContent = valueOrDash(value);
+    if (target) target.textContent = scopeFor(state, panel).scope;
   });
-  return info;
+  const authority = document.getElementById('contextAuthority');
+  if (authority) authority.textContent = 'READ ONLY / FAIL CLOSED';
 }
 
-function renderCards(state, info) {
+function renderCards(state) {
   const cycle = state.cycle || {};
   const simple = state.cycleSimple || {};
   const running = simple.running ?? cycle.cycle_running;
-  const stopped = cycle.stop_flag === true || simple.stopped === true;
+  const stopped = cycleStopRequested(cycle, simple);
   const sync = state.sync || {};
   const watcher = (state.aiFix || {}).watcher || {};
   const general = state.general || {};
+  const cycleScope = scopeFor(state, 'cycle').scope;
+  const syncScope = scopeFor(state, 'sync').scope;
+  const aiScope = scopeFor(state, 'aiFix').scope;
   const cycleCard = document.getElementById('cardCycle');
   const cycleMeta = document.getElementById('cardCycleMeta');
   const syncCard = document.getElementById('cardSync');
@@ -163,20 +128,21 @@ function renderCards(state, info) {
   const clientsCard = document.getElementById('cardClients');
   const clientsMeta = document.getElementById('cardClientsMeta');
   if (cycleCard) cycleCard.textContent = state.errors.cycle || state.errors.cycleSimple ? 'UNAVAILABLE' : running ? 'RUNNING' : stopped ? 'STOPPED' : 'OFFLINE';
-  if (cycleMeta) cycleMeta.textContent = running ? `PID ${valueOrDash(cycle.cycle_pid)}` : `${scopeLabel(info)} / ${stopped ? 'stop intent' : 'No active cycle'}`;
-  if (syncCard) syncCard.textContent = state.errors.sync ? 'UNAVAILABLE' : sync.continuous_running ? 'RUNNING' : 'STOPPED';
-  if (syncMeta) syncMeta.textContent = sync.continuous_running ? `Every ${formatDuration(sync.interval_sec)}` : scopeLabel(info);
+  if (cycleMeta) cycleMeta.textContent = running ? `PID ${valueOrDash(cycle.cycle_pid)} / ${cycleScope}` : `${cycleScope} / ${stopped ? 'stop intent' : 'No active cycle'}`;
+  if (syncCard) syncCard.textContent = syncReadAllowed(state.sync) ? sync.continuous_running ? 'RUNNING' : 'STOPPED' : 'UNAVAILABLE';
+  if (syncMeta) syncMeta.textContent = sync.continuous_running ? `Every ${formatDuration(sync.interval_sec)} / ${syncScope}` : syncScope;
   if (aiCard) aiCard.textContent = state.errors.aiFix ? 'UNAVAILABLE' : watcher.auto ? 'WATCHING' : `${((state.aiFix || {}).pending || []).length} PENDING`;
-  if (aiMeta) aiMeta.textContent = watcher.last_action ? `Last: ${watcher.last_action}` : scopeLabel(info);
+  if (aiMeta) aiMeta.textContent = `${aiScope} / queue read-only`;
   if (clientsCard) clientsCard.textContent = valueOrDash(general.clients ?? sync.total_clients);
-  if (clientsMeta) clientsMeta.textContent = scopeLabel(info);
+  if (clientsMeta) clientsMeta.textContent = 'General endpoint count; not a profile selector';
 }
 
-function renderCycle(state, info) {
+function renderCycle(state) {
   const data = state.cycle;
   const simple = state.cycleSimple;
-  if (info.inconsistent) {
-    setPanel('cycle', 'error', scopeMessage(info));
+  const context = scopeFor(state, 'cycle');
+  if (context.suppress) {
+    setPanel('cycle', 'error', context.message);
     renderDetails(PANEL_IDS.cycle, []);
     return;
   }
@@ -186,7 +152,7 @@ function renderCycle(state, info) {
     return;
   }
   const running = simple.running ?? data.cycle_running;
-  const stopped = data.stop_flag === true || simple.stopped === true;
+  const stopped = cycleControlBlocked(data, simple);
   const disabled = Array.isArray(data.alwaysrun_disabled) ? data.alwaysrun_disabled.join(', ') : '-';
   const logs = Array.isArray(data.last_log) ? data.last_log[data.last_log.length - 1] : data.last_log;
   renderDetails(PANEL_IDS.cycle, [
@@ -203,17 +169,18 @@ function renderCycle(state, info) {
     ['Today', data.state && data.state.today],
     ['Last cycle log', logs],
   ]);
-  setPanel('cycle', 'ok', `Live read from the golden cycle status contract. ${scopeMessage(info)}`);
+  setPanel('cycle', 'ok', `Live read only. ${context.scope}. ${context.message}`);
 }
 
-function renderSync(state, info) {
+function renderSync(state) {
   const data = state.sync;
-  if (info.inconsistent) {
-    setPanel('sync', 'error', scopeMessage(info));
+  const context = scopeFor(state, 'sync');
+  if (context.suppress) {
+    setPanel('sync', 'error', context.message);
     renderDetails(PANEL_IDS.sync, []);
     return;
   }
-  if (!data) {
+  if (!syncReadAllowed(data)) {
     setPanel('sync', 'error', `Auto Sync read unavailable: ${state.errors.sync || 'missing source'}`);
     renderDetails(PANEL_IDS.sync, []);
     return;
@@ -227,14 +194,16 @@ function renderSync(state, info) {
     ['Extraction method', data.extraction_method],
     ['Clients', data.total_clients],
     ['Source', data.source],
+    ['Cycle stop effect', 'Read-only sync remains allowed'],
   ]);
-  setPanel('sync', 'ok', `Status only. Start/stop controls are intentionally absent. ${scopeMessage(info)}`);
+  setPanel('sync', 'ok', `Read-only observation/reconciliation. ${context.scope}. ${context.message}`);
 }
 
-function renderAiFix(state, info) {
+function renderAiFix(state) {
   const data = state.aiFix;
-  if (info.inconsistent) {
-    setPanel('aiFix', 'error', scopeMessage(info));
+  const context = scopeFor(state, 'aiFix');
+  if (context.suppress) {
+    setPanel('aiFix', 'error', context.message);
     renderDetails(PANEL_IDS.aiFix, []);
     return;
   }
@@ -260,13 +229,14 @@ function renderAiFix(state, info) {
     ['Watcher PID', watcher.pid],
     ['Models', Array.isArray(data.models) ? data.models.join(', ') : '-'],
   ]);
-  setPanel('aiFix', 'ok', `Queue and watcher metadata only. Queue actions are intentionally absent. ${scopeMessage(info)}`);
+  setPanel('aiFix', 'ok', `Queue and watcher metadata only. ${context.scope}. ${context.message}`);
 }
 
-function renderSettings(state, info) {
+function renderSettings(state) {
   const data = state.settings;
-  if (info.inconsistent) {
-    setPanel('settings', 'error', scopeMessage(info));
+  const context = scopeFor(state, 'settings');
+  if (context.suppress) {
+    setPanel('settings', 'error', context.message);
     renderDetails(PANEL_IDS.settings, []);
     return;
   }
@@ -281,20 +251,21 @@ function renderSettings(state, info) {
     ['Auto Telegram', boolLabel(data.auto_telegram)],
     ['Auto open browser', boolLabel(data.auto_open_browser)],
   ]);
-  setPanel('settings', 'ok', `Redacted public projection. No settings write is available. ${scopeMessage(info)}`);
+  setPanel('settings', 'ok', `Redacted public projection. ${context.scope}. ${context.message}`);
 }
 
-function renderBackups(state, info) {
+function renderBackups(state) {
   const target = document.getElementById(PANEL_IDS.backups);
+  const context = scopeFor(state, 'backups');
   if (!target) return;
-  if (info.inconsistent || !state.backups) {
-    setPanel('backups', 'error', info.inconsistent ? scopeMessage(info) : `Backup list unavailable: ${state.errors.backups || 'missing source'}`);
+  if (context.suppress || !state.backups) {
+    setPanel('backups', 'error', context.suppress ? context.message : `Backup list unavailable: ${state.errors.backups || 'missing source'}`);
     target.replaceChildren();
     const row = document.createElement('tr');
     const cell = document.createElement('td');
     cell.colSpan = 6;
     cell.className = 'empty-cell error-text';
-    cell.textContent = info.inconsistent ? 'Conflicting profile context; backup data suppressed.' : 'Unable to read backup metadata.';
+    cell.textContent = context.suppress ? 'Conflicting profile context; backup data suppressed.' : 'Unable to read backup metadata.';
     row.appendChild(cell);
     target.appendChild(row);
     return;
@@ -320,7 +291,7 @@ function renderBackups(state, info) {
     row.appendChild(cell);
     target.appendChild(row);
   }
-  setPanel('backups', 'ok', `${backups.length} backup${backups.length === 1 ? '' : 's'} read from the golden metadata endpoint. ${scopeMessage(info)}`);
+  setPanel('backups', 'ok', `${backups.length} backup${backups.length === 1 ? '' : 's'} read-only. ${context.scope}. ${context.message}`);
 }
 
 export function showBanner(message) {
@@ -331,13 +302,13 @@ export function showBanner(message) {
 }
 
 export function render(state) {
-  const info = renderContext(state);
-  renderCards(state, info);
-  renderCycle(state, info);
-  renderSync(state, info);
-  renderAiFix(state, info);
-  renderSettings(state, info);
-  renderBackups(state, info);
+  renderScopeSummary(state);
+  renderCards(state);
+  renderCycle(state);
+  renderSync(state);
+  renderAiFix(state);
+  renderSettings(state);
+  renderBackups(state);
   const refreshed = document.getElementById('lastRefresh');
   if (refreshed && state.refreshedAt) refreshed.textContent = `Last refresh ${formatTime(state.refreshedAt)}`;
 }

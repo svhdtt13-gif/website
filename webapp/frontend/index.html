@@ -22,19 +22,19 @@
     </div>
   </header>
 
-  <section class="context-strip" aria-label="Current host and remote profile context">
+  <section class="context-strip" aria-label="Per-panel host and remote profile context">
     <div class="context-heading">
-      <p class="panel-kicker">Current profile context</p>
-      <h2>Host / remote binding</h2>
-      <p class="context-note">Context is read-only. Missing identity or binding data fails closed.</p>
+      <p class="panel-kicker">Per-panel profile context</p>
+      <h2>Host / remote provenance</h2>
+      <p class="context-note">A panel never inherits scope from another endpoint. Missing proof stays unscoped; conflicts fail closed.</p>
     </div>
     <dl id="contextDetails" class="context-grid">
-      <div><dt>Host</dt><dd id="contextHost">Not exposed by current read contract</dd></div>
-      <div><dt>Remote profile</dt><dd id="contextProfile">Not exposed by current read contract</dd></div>
-      <div><dt>Remote account</dt><dd id="contextAccount">Not exposed by current read contract</dd></div>
-      <div><dt>Verified identity</dt><dd id="contextIdentity">UNVERIFIED</dd></div>
+      <div><dt>Cycle panel</dt><dd id="scopeCycle">UNSCOPED READ</dd></div>
+      <div><dt>Sync panel</dt><dd id="scopeSync">UNSCOPED READ</dd></div>
+      <div><dt>AI-fix panel</dt><dd id="scopeAiFix">UNSCOPED READ</dd></div>
+      <div><dt>Backup panel</dt><dd id="scopeBackups">UNSCOPED READ</dd></div>
+      <div><dt>Settings panel</dt><dd id="scopeSettings">UNSCOPED READ</dd></div>
       <div><dt>Control authority</dt><dd id="contextAuthority">READ ONLY / FAIL CLOSED</dd></div>
-      <div><dt>Scope</dt><dd id="contextScope">UNSCOPED LEGACY HOST READ</dd></div>
     </dl>
   </section>
 

@@ -263,6 +263,8 @@ class OperationalSQLiteTests(unittest.TestCase):
 
         with self.assertRaises(OperationalSchemaError):
             OperationalSQLiteRepository.restore_from(self.runtime, backup)
+        backup.unlink()
+        manifest.unlink()
         self.assertEqual(
             hashlib.sha256(operational_path(self.runtime).read_bytes()).hexdigest(),
             before,

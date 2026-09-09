@@ -37,9 +37,17 @@ function renderError(message) {
   const status = document.getElementById('profileManagerStatus');
   const body = document.getElementById('profileManagerBody');
   const tableBody = document.getElementById('profileManagerBodyRows');
+  const select = document.getElementById('profileViewSelect');
+  const owner = document.getElementById('profileRuntimeOwner');
   if (status) status.textContent = message;
   if (body) body.replaceChildren();
   if (tableBody) tableBody.replaceChildren();
+  if (select) {
+    select.replaceChildren(new Option('Profile data unavailable', ''));
+    select.value = '';
+    select.disabled = true;
+  }
+  if (owner) owner.textContent = 'UNOBSERVED / LEGACY AUTHORITY';
 }
 
 function render(data) {
@@ -50,6 +58,7 @@ function render(data) {
   const tableBody = document.getElementById('profileManagerBodyRows');
   const owner = document.getElementById('profileRuntimeOwner');
   if (!select || !status || !detailBody || !tableBody || !owner) return;
+  select.disabled = false;
 
   let viewed = readViewedProfile();
   if (viewed && !profiles.some((profile) => profile.profile_id === viewed)) {

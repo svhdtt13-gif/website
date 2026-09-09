@@ -15,4 +15,5 @@ def test_endpoint_is_read_only_and_not_in_generic_write_allowlist():
     assert 'if request.method != "GET":' in app
     assert '"api/profile_manager"' not in config
     assert "sqlite3.connect(path.resolve().as_uri() + \"?mode=ro\", uri=True)" in service
+    assert 'connection.execute("BEGIN")' in service
     assert '"active_runtime_owner": None' in service

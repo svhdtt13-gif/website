@@ -78,6 +78,8 @@ def _binding(row: sqlite3.Row) -> dict[str, object]:
 def _read_model(path: Path) -> dict[str, object]:
     connection = _read_only_connection(path)
     try:
+        # Keep metadata and domain rows on one SQLite snapshot.
+        connection.execute("BEGIN")
         _validate_meta(connection)
         profiles = connection.execute(
             "SELECT profile_id, display_name, account_ref, status, updated_at "

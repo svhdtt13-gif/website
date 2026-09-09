@@ -84,6 +84,13 @@ function contextValue(context, ...names) {
   return 'Not exposed by current read contract';
 }
 
+function contextAuthority(context) {
+  for (const name of ['control_authority', 'controlAuthority']) {
+    if (context[name] !== undefined && context[name] !== null && context[name] !== '') return context[name];
+  }
+  return 'READ ONLY / FAIL CLOSED';
+}
+
 function renderContext(state) {
   const context = state.general?.profile_context || state.general?.context
     || state.cycle?.profile_context || {};
@@ -91,8 +98,10 @@ function renderContext(state) {
     contextHost: contextValue(context, 'host_id', 'hostId'),
     contextProfile: contextValue(context, 'profile_id', 'profileId'),
     contextAccount: contextValue(context, 'remote_account', 'remoteAccount', 'account_ref'),
-    contextIdentity: contextValue(context, 'verified_identity', 'verifiedIdentity', 'identity_ref'),
-    contextAuthority: contextValue(context, 'control_authority', 'controlAuthority') || 'READ ONLY / FAIL CLOSED',
+    contextIdentity: contextValue(context, 'verified_identity', 'verifiedIdentity', 'identity_ref') === 'Not exposed by current read contract'
+      ? 'UNVERIFIED'
+      : contextValue(context, 'verified_identity', 'verifiedIdentity', 'identity_ref'),
+    contextAuthority: contextAuthority(context),
   };
   Object.entries(values).forEach(([id, value]) => {
     const target = document.getElementById(id);

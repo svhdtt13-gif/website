@@ -251,6 +251,7 @@ class OperationalSQLiteTests(unittest.TestCase):
         candidate = sqlite3.connect(backup)
         try:
             candidate.execute("ALTER TABLE jobs ADD COLUMN tampered TEXT")
+            candidate.execute("PRAGMA journal_mode=DELETE")
         finally:
             candidate.close()
         metadata = json.loads(manifest.read_text(encoding="utf-8"))

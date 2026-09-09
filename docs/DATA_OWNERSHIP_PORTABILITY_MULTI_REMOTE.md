@@ -203,7 +203,9 @@ The current `cycle_stopped.flag` is a global file path and therefore cannot be t
 
 - stop is a durable `profile_control_intent` with `kind=cycle_stopped`
 - the intent follows the profile across host handoff
-- a newly bound host must observe the intent before starting Cycle/Sync
+- a newly bound host must observe the intent before starting Cycle or any runtime with mutate/control authority
+- Remote Sync read-only observation and reconciliation remain allowed while the profile is stopped, including after reboot or handoff
+- if Sync must be stopped in the future, it requires a separate profile intent such as `sync_stopped`; `cycle_stopped` must not be reused for that purpose
 - clearing stop requires authenticated intent for the same profile and binding authority
 - host restart, PID loss, mutex loss or profile switch never clears the intent
 - copying a flag file between PCs is forbidden
@@ -226,6 +228,7 @@ U1 may continue in parallel, but it must display host/profile context and must n
 - [ ] Portable domain data is separated from host runtime facts and secrets.
 - [ ] Profile A/B synthetic tests prove reads, intents, schedules, observations and audit rows do not cross profiles.
 - [ ] Host/profile binding uniqueness and fail-closed command checks are specified before code.
-- [ ] `cycle_stopped` remains profile-scoped across handoff.
+- [ ] `cycle_stopped` remains profile-scoped across handoff and does not disable read-only Remote Sync.
+- [ ] A future `sync_stopped` intent is separate from `cycle_stopped`.
 - [ ] P4 operational DB remains separate from P3 immutable generations.
 - [ ] No migration, account switch, scheduler handoff, `db.html` change or Cloudflare legacy restart is included in this pack.

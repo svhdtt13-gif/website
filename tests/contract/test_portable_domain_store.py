@@ -1,0 +1,203 @@
+#!/usr/bin/env python3
+"""Acceptance tests for the Portable Domain Store Foundation."""
+import hashlib
+import json
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT / "webapp" / "backend"))
+
+from repositories.portable_store import (  # noqa: E402
+    BindingError,
+    PortableDomainStore,
+    ProfileRequiredError,
+    SCHEMA_VERSION,
+)
+from services.shadow_import import (  # noqa: E402
+    FileSystemGoldenSource,
+    GoldenSnapshot,
+    LegacyBinding,
+    ShadowImportError,
+    import_shadow,
+)
+
+
+NOW = "2026-09-09T00:00:00+00:00"
+
+
+class PortableDomainStoreTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.path = Path(self.temp.name) / "portable.sqlite3"
+        self.store = PortableDomainStore.create(self.path)
+
+    def tearDown(self):
+        self.store.close()
+        self.temp.cleanup()
+
+    def seed(self, profile_id, host_id, account_ref):
+        self.store.add_host(host_id, host_id, "explicit-test-origin", NOW)
+        self.store.add_profile(profile_id, profile_id, account_ref, "VERIFIED", NOW)
+        self.store.bind_profile("binding-" + profile_id, host_id, profile_id,
+                                account_ref, 1, "ACTIVE", NOW)
+
+    def test_empty_database_migrates_deterministically_and_reopens(self):
+        meta = dict(self.store.connection.execute("SELECT key, value FROM schema_meta"))
+        self.assertEqual(meta["schema_version"], str(SCHEMA_VERSION))
+        self.assertEqual(meta["store_kind"], "portable_domain_store")
+        tables = {
+            row[0] for row in self.store.connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+        }
+        self.assertTrue({
+            "schema_meta", "hosts", "remote_profiles", "host_profile_bindings",
+            "profile_clients", "profile_schedules", "profile_policies",
+            "profile_control_intents", "profile_observations", "profile_audit_events",
+        }.issubset(tables))
+        self.seed("profile-a", "host-a", "account-a")
+        self.store.upsert_client("profile-a", "shared", "A", "HAMI", "running", "test")
+        self.store.close()
+        self.store = PortableDomainStore.open(self.path)
+        self.assertEqual(self.store.list_clients("profile-a")[0]["display_name"], "A")
+
+    def test_schema_contains_no_runtime_or_secret_authority_fields(self):
+        sql = " ".join(
+            row[0] or "" for row in self.store.connection.execute(
+                "SELECT sql FROM sqlite_master WHERE sql IS NOT NULL"
+            )
+        ).lower()
+        for forbidden in (
+            "password", "session", "token", "cookie", "telegram", "pid",
+            "mutex", "lease", "task scheduler", "quick tunnel",
+        ):
+            self.assertNotIn(forbidden, sql)
+
+    def test_profile_a_b_isolation_and_composite_client_ownership(self):
+        self.seed("profile-a", "host-a", "account-a")
+        self.seed("profile-b", "host-b", "account-b")
+        for profile, group in (("profile-a", "A"), ("profile-b", "B")):
+            self.store.upsert_client(profile, "same-client", group, group, "running", "fixture")
+            self.store.upsert_schedule(profile, "same-schedule", group, "04:00", "08:00", True)
+            self.store.upsert_policy(profile, "same-policy", "mode", group)
+            self.store.add_observation(profile, "same-observation", NOW, "fixture", "state", group)
+            self.store.add_audit_event(profile, "same-event", NOW, "fixture", "test", group, "fixture")
+        self.assertEqual(self.store.list_clients("profile-a")[0]["group_name"], "A")
+        self.assertEqual(self.store.list_clients("profile-b")[0]["group_name"], "B")
+        self.assertEqual(self.store.list_schedules("profile-a")[0]["group_name"], "A")
+        self.assertEqual(self.store.list_policies("profile-b")[0]["policy_value"], "B")
+        self.assertEqual(self.store.list_observations("profile-a")[0]["observation_value"], "A")
+        self.assertEqual(self.store.list_audit_events("profile-b")[0]["summary"], "B")
+        export_a = json.dumps(self.store.export_profile("profile-a"), sort_keys=True)
+        self.assertIn("profile-a", export_a)
+        self.assertNotIn("profile-b", export_a)
+        self.assertNotIn('"B"', export_a)
+
+    def test_importing_a_then_b_does_not_overwrite_either_profile(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = PortableDomainStore.create(Path(directory) / "portable.sqlite3")
+            try:
+                for profile, host, account, name in (
+                    ("profile-a", "host-a", "account-a", "A"),
+                    ("profile-b", "host-b", "account-b", "B"),
+                ):
+                    import_shadow(
+                        store,
+                        GoldenSnapshot(
+                            clients=({"client": "shared", "name": name, "group": name, "status": "running"},),
+                            schedules=({"id": "shared", "group": name, "open": "04:00", "close": "08:00"},),
+                            policies=({"id": "shared", "key": "mode", "value": name},),
+                        ),
+                        LegacyBinding(host, profile, account, "binding-" + profile),
+                        NOW,
+                    )
+                self.assertEqual(store.list_clients("profile-a")[0]["display_name"], "A")
+                self.assertEqual(store.list_clients("profile-b")[0]["display_name"], "B")
+                self.assertEqual(store.list_schedules("profile-a")[0]["group_name"], "A")
+                self.assertEqual(store.list_policies("profile-b")[0]["policy_value"], "B")
+            finally:
+                store.close()
+
+    def test_cycle_stopped_is_profile_scoped(self):
+        self.seed("profile-a", "host-a", "account-a")
+        self.seed("profile-b", "host-b", "account-b")
+        self.store.upsert_cycle_stopped("profile-a", "stop-a", "REQUESTED", NOW, "test", "fixture")
+        self.assertEqual(self.store.list_control_intents("profile-a")[0]["state"], "REQUESTED")
+        self.assertEqual(self.store.list_control_intents("profile-b"), [])
+
+    def test_missing_profile_scope_fails_closed(self):
+        for method, args in (
+            (self.store.list_clients, ()), (self.store.list_schedules, ()),
+            (self.store.list_policies, ()), (self.store.list_control_intents, ()),
+            (self.store.list_observations, ()), (self.store.list_audit_events, ()),
+        ):
+            with self.subTest(method=method.__name__), self.assertRaises(TypeError):
+                method(*args)
+        with self.assertRaises(ProfileRequiredError):
+            self.store.list_clients("")
+
+    def test_binding_account_mismatch_and_active_host_conflict_are_rejected(self):
+        self.seed("profile-a", "host-a", "account-a")
+        self.store.add_profile("profile-b", "profile-b", "account-b", "VERIFIED", NOW)
+        with self.assertRaises(BindingError):
+            self.store.bind_profile("wrong-account", "host-a", "profile-b", "account-a", 2, "OFFLINE", NOW)
+        with self.assertRaises(BindingError):
+            self.store.bind_profile("second-active", "host-a", "profile-b", "account-b", 2, "ACTIVE", NOW)
+
+    def test_backup_manifest_and_reopen_preserve_data(self):
+        self.seed("profile-a", "host-a", "account-a")
+        self.store.upsert_client("profile-a", "client-a", "A", "A", "running", "fixture")
+        backup, manifest = self.store.backup_to(Path(self.temp.name) / "backup.sqlite3")
+        self.assertEqual(manifest["sha256"], hashlib.sha256(backup.read_bytes()).hexdigest())
+        self.assertTrue(backup.with_suffix(".sqlite3.manifest.json").is_file())
+        self.store.close()
+        reopened = PortableDomainStore.open(backup)
+        try:
+            self.assertEqual(reopened.list_clients("profile-a")[0]["client_id"], "client-a")
+        finally:
+            reopened.close()
+
+
+class ShadowImporterTests(unittest.TestCase):
+    def test_read_only_import_requires_explicit_binding_and_maps_stop_intent(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "client_database.json").write_text(json.dumps({
+                "clients": [{"client": "client-a", "name": "A", "group": "HAMI", "status": "running"}],
+                "schedule": [{"group": "HAMI", "open": "04:00", "close": "08:00"}],
+            }), encoding="utf-8")
+            (root / "cycle_stopped.flag").write_text("stopped\n", encoding="utf-8")
+            source = FileSystemGoldenSource(root, master_data="missing-master.json")
+            before = hashlib.sha256((root / "client_database.json").read_bytes()).hexdigest()
+            snapshot = source.snapshot()
+            self.assertTrue(snapshot.cycle_stopped)
+            store = PortableDomainStore.create(root / "portable.sqlite3")
+            try:
+                result = import_shadow(store, snapshot, LegacyBinding(
+                    "host-a", "profile-a", "account-a", "binding-a"), NOW)
+                self.assertEqual(result["clients"], 1)
+                self.assertEqual(store.list_control_intents("profile-a")[0]["intent_type"], "cycle_stopped")
+                self.assertEqual(hashlib.sha256((root / "client_database.json").read_bytes()).hexdigest(), before)
+            finally:
+                store.close()
+
+    def test_import_does_not_infer_binding_or_accept_secret_account_reference(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = GoldenSnapshot(clients=({"client": "a"},))
+            store = PortableDomainStore.create(Path(directory) / "portable.sqlite3")
+            try:
+                with self.assertRaises(ShadowImportError):
+                    import_shadow(store, source, LegacyBinding("h", "p", "session-token", "b"), NOW)
+            finally:
+                store.close()
+
+    def test_source_rejects_path_escape(self):
+        with self.assertRaises(ShadowImportError):
+            FileSystemGoldenSource(".", client_database="../client_database.json")
+
+
+if __name__ == "__main__":
+    unittest.main()

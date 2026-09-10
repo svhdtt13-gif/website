@@ -8,6 +8,7 @@
 <link rel="stylesheet" href="css/base.css" />
 <link rel="stylesheet" href="css/components.css" />
 <link rel="stylesheet" href="css/profile_manager.css" />
+<link rel="stylesheet" href="css/host_discovery.css" />
 </head>
 <body>
 <div class="app-shell">
@@ -70,6 +71,50 @@
       <button type="button" disabled>Activate profile (deferred)</button>
       <button type="button" disabled>Switch runtime account (deferred)</button>
       <button type="button" disabled>Bind host (deferred)</button>
+    </div>
+  </section>
+
+  <section id="hostDiscovery" class="panel host-discovery-panel" aria-label="Host Agent Discovery foundation">
+    <div class="panel-heading">
+      <div>
+        <p class="panel-kicker">Host Agent Discovery / foundation</p>
+        <h2>Configured host and local prerequisites</h2>
+      </div>
+      <span class="health health-readonly">READ ONLY</span>
+    </div>
+    <p class="panel-provenance">CONFIGURED IDENTITY != PORTABLE BINDING != LOCAL RUNTIME OBSERVATION</p>
+    <div class="profile-manager-toolbar">
+      <p id="hostDiscoveryStatus" class="profile-manager-status">Reading host discovery state.</p>
+      <div>Active runtime owner<br /><strong id="hostRuntimeOwner" class="host-runtime-owner">UNOBSERVED / LEGACY AUTHORITY</strong></div>
+    </div>
+    <div class="host-discovery-grid">
+      <div class="host-discovery-block">
+        <h3>Configured host identity</h3>
+        <dl id="hostIdentityDetails" class="detail-grid"></dl>
+      </div>
+      <div class="host-discovery-block">
+        <h3>Portable binding</h3>
+        <dl id="hostBindingDetails" class="detail-grid"></dl>
+      </div>
+    </div>
+    <div class="table-wrap host-prerequisite-table">
+      <table>
+        <thead><tr><th>Prerequisite</th><th>Allowlisted path</th><th>State</th><th>Read-only probe</th></tr></thead>
+        <tbody id="hostPrerequisiteBody"><tr><td colspan="4" class="empty-cell">Loading prerequisite observations...</td></tr></tbody>
+      </table>
+    </div>
+    <div class="host-discovery-controls" aria-label="Deferred host controls">
+      <button type="button" disabled>Install (deferred)</button>
+      <button type="button" disabled>Register (deferred)</button>
+      <button type="button" disabled>Start process (deferred)</button>
+      <button type="button" disabled>Stop process (deferred)</button>
+      <button type="button" disabled>Reconnect (deferred)</button>
+      <button type="button" disabled>Remote login (deferred)</button>
+      <button type="button" disabled>Rebind (deferred)</button>
+      <button type="button" disabled>Activate (deferred)</button>
+      <button type="button" disabled>Switch (deferred)</button>
+      <button type="button" disabled>Control (deferred)</button>
+      <button type="button" disabled>Bind (deferred)</button>
     </div>
   </section>
 
@@ -195,5 +240,6 @@
 </div>
 <script type="module" src="js/main.js"></script>
 <script type="module" src="js/profile_manager.js"></script>
+<script type="module" src="js/host_discovery.js"></script>
 </body>
 </html>

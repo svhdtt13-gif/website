@@ -15,6 +15,7 @@ Bundle 1 them guarded settings Telegram test va browser open actions.
 Bundle 2 chi mo guarded AI-fix creation; sync/answers/watcher remain deferred.
 Phase 3 adds guarded SQLite generation reads; enablement remains disabled by default.
 Remote Profile Manager foundation adds read-only portable profile state only.
+Host Registration foundation adds guarded portable configuration writes only.
 """
 import hmac
 import pathlib
@@ -27,6 +28,7 @@ from services import aifix as aifix_service
 from services import backup as backup_service
 from services import cycle as cycle_service
 from services import host_discovery as host_discovery_service
+from services import host_registration as host_registration_service
 from services import log as log_service
 from services import master as master_service
 from services import profile_manager as profile_manager_service
@@ -82,6 +84,19 @@ def _settings_action_gate():
         return jsonify({"error": "query parameters not allowed"}), 400
     if request.method != "POST":
         return jsonify({"error": "read-only proxy: write methods blocked"}), 403
+    if not _write_authorized():
+        return jsonify({"error": "write authentication required"}), 401, {
+            "WWW-Authenticate": "Bearer"
+        }
+    return None
+
+
+def _portable_write_gate():
+    """Guard configuration-only Portable Domain Store writes."""
+    if request.query_string:
+        return jsonify({"error": "query parameters not allowed"}), 400
+    if request.method != "POST":
+        return jsonify({"error": "portable configuration writes require POST"}), 403
     if not _write_authorized():
         return jsonify({"error": "write authentication required"}), 401, {
             "WWW-Authenticate": "Bearer"
@@ -213,6 +228,46 @@ def create_app(runtime=None):
             config.HOST_AGENT_HOST_ID,
             config.HOST_DISCOVERY_ROOT,
         )
+        return Response(body, status=status, content_type=ctype)
+
+    @app.route(
+        "/up/api/host_registration",
+        methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    )
+    def host_registration():
+        """Register or confirm the explicitly configured host only."""
+        rejection = _portable_write_gate()
+        if rejection:
+            return rejection
+        try:
+            body, status, ctype = host_registration_service.register_configured_host(
+                request.get_data(),
+                request.content_type,
+                config.PORTABLE_STORE_PATH,
+                config.HOST_AGENT_HOST_ID,
+            )
+        except UpstreamError as error:
+            return Response(error.body, status=error.status, content_type="application/json")
+        return Response(body, status=status, content_type=ctype)
+
+    @app.route(
+        "/up/api/host_binding",
+        methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    )
+    def host_binding():
+        """Create or confirm an OFFLINE host/profile binding only."""
+        rejection = _portable_write_gate()
+        if rejection:
+            return rejection
+        try:
+            body, status, ctype = host_registration_service.create_offline_binding(
+                request.get_data(),
+                request.content_type,
+                config.PORTABLE_STORE_PATH,
+                config.HOST_AGENT_HOST_ID,
+            )
+        except UpstreamError as error:
+            return Response(error.body, status=error.status, content_type="application/json")
         return Response(body, status=status, content_type=ctype)
 
     @app.route("/up/<path:subpath>", methods=["GET", "POST", "PUT", "PATCH", "DELETE"])

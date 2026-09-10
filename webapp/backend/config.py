@@ -30,6 +30,11 @@ PORTABLE_STORE_PATH = Path(os.environ.get(
     "PORTABLE_STORE_PATH",
     str(Path(__file__).resolve().parent / ".runtime" / "portable" / "portable_domain.sqlite3"),
 ))
+HOST_AGENT_HOST_ID = os.environ.get("HOST_AGENT_HOST_ID", "").strip()
+HOST_DISCOVERY_ROOT = Path(os.environ.get(
+    "HOST_DISCOVERY_ROOT",
+    str(Path(__file__).resolve().parent / ".runtime" / "host_discovery"),
+))
 
 # Chi cac endpoint GET nay duoc proxy (read-only). Moi thu khac -> 403.
 READ_ONLY_ALLOWLIST = {

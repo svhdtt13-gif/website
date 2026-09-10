@@ -1,0 +1,10 @@
+.host-discovery-panel{margin-top:14px;background:linear-gradient(120deg,rgba(72,213,151,.07),rgba(69,213,232,.06))}
+.host-discovery-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;margin-top:14px}
+.host-discovery-block{min-width:0;padding:12px;border:1px solid rgba(148,163,184,.12);border-radius:10px;background:rgba(8,17,31,.32)}
+.host-discovery-block h3{margin:0 0 9px;color:var(--muted);font-size:.7rem;letter-spacing:.1em;text-transform:uppercase}
+.host-runtime-owner{color:var(--cyan);font-family:"SFMono-Regular",Consolas,monospace;font-size:.75rem}
+.host-prerequisite-table{margin-top:14px}
+.host-discovery-controls{display:flex;gap:8px;flex-wrap:wrap;margin-top:14px}
+.host-discovery-controls button{padding:8px 10px;border:1px solid rgba(148,163,184,.2);border-radius:8px;background:rgba(148,163,184,.08);color:var(--muted);font-size:.75rem}
+.host-discovery-controls button:disabled{cursor:not-allowed;opacity:.62}
+@media(max-width:680px){.host-discovery-grid{grid-template-columns:1fr}}

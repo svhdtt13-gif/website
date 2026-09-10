@@ -254,16 +254,18 @@ class PortableDomainStore:
         if meta.get("schema_version") != str(SCHEMA_VERSION):
             raise SchemaError("unsupported portable schema version")
         if meta.get("schema_checksum") != SCHEMA_CHECKSUM:
-            raise SchemaError("portable schema checksum mismatch")
+            raise SchemaError("portable store schema checksum mismatch")
         if self.connection.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
             raise SchemaError("portable store integrity check failed")
 
     @contextmanager
-    def transaction(self) -> Iterator[sqlite3.Connection]:
+    def transaction(self, immediate: bool = False) -> Iterator[sqlite3.Connection]:
         outer = self._transaction_depth == 0
         self._transaction_depth += 1
         try:
             if outer:
+                if immediate:
+                    self.connection.execute("BEGIN IMMEDIATE")
                 with self.connection:
                     yield self.connection
             else:
@@ -304,6 +306,31 @@ class PortableDomainStore:
                 "UPDATE hosts SET display_name=?, updated_at=? WHERE host_id=?",
                 (display_name, now, host_id),
             )
+
+    def register_host(self, host_id: str, display_name: str, origin_ref: str, now: str) -> dict[str, object]:
+        """Create or confirm a host without changing an existing identity."""
+        host_id, display_name, origin_ref, now = (
+            _required(host_id, "host_id"), _required(display_name, "display_name"),
+            _safe_reference(origin_ref, "origin_ref"), _required(now, "now")
+        )
+        with self.transaction(immediate=True):
+            existing = self.connection.execute(
+                "SELECT host_id, display_name, origin_ref FROM hosts WHERE host_id=?",
+                (host_id,),
+            ).fetchone()
+            if existing is None:
+                self.connection.execute(
+                    "INSERT INTO hosts VALUES (?, ?, ?, ?, ?)",
+                    (host_id, display_name, origin_ref, now, now),
+                )
+                return {"host_id": host_id, "display_name": display_name, "created": True}
+            if existing["display_name"] != display_name:
+                raise BindingError("host display_name does not match existing host")
+            return {
+                "host_id": existing["host_id"],
+                "display_name": existing["display_name"],
+                "created": False,
+            }
 
     def add_profile(self, profile_id: str, display_name: str, account_ref: str,
                     status: str, now: str) -> None:
@@ -361,6 +388,51 @@ class PortableDomainStore:
                 "INSERT INTO host_profile_bindings VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (binding_id, host_id, profile_id, binding_generation, state, now, now),
             )
+
+    def ensure_offline_binding(self, host_id: str, profile_id: str, now: str) -> dict[str, object]:
+        """Create or confirm only an OFFLINE binding for an existing host/profile."""
+        host_id, profile_id, now = (
+            _required(host_id, "host_id"), _profile_id(profile_id), _required(now, "now")
+        )
+        with self.transaction(immediate=True):
+            if self.connection.execute(
+                "SELECT 1 FROM hosts WHERE host_id=?", (host_id,)
+            ).fetchone() is None:
+                raise BindingError("unknown host")
+            if self.connection.execute(
+                "SELECT 1 FROM remote_profiles WHERE profile_id=?", (profile_id,)
+            ).fetchone() is None:
+                raise BindingError("unknown profile")
+            rows = self.connection.execute(
+                "SELECT binding_id, host_id, profile_id, binding_generation, state, updated_at "
+                "FROM host_profile_bindings WHERE host_id=? AND profile_id=? "
+                "ORDER BY binding_generation DESC, binding_id",
+                (host_id, profile_id),
+            ).fetchall()
+            if any(row["state"] == "ACTIVE" for row in rows):
+                raise BindingError("active binding cannot be changed")
+            offline = next((row for row in rows if row["state"] == "OFFLINE"), None)
+            if offline is not None:
+                return dict(offline) | {"created": False}
+
+            generation = max((int(row["binding_generation"]) for row in rows), default=0) + 1
+            binding_id = "binding-" + hashlib.sha256(
+                f"{host_id}\0{profile_id}\0{generation}".encode("utf-8")
+            ).hexdigest()[:24]
+            self.connection.execute(
+                "INSERT OR IGNORE INTO host_profile_bindings "
+                "(binding_id, host_id, profile_id, binding_generation, state, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, 'OFFLINE', ?, ?)",
+                (binding_id, host_id, profile_id, generation, now, now),
+            )
+            created = self.connection.execute(
+                "SELECT binding_id, host_id, profile_id, binding_generation, state, updated_at "
+                "FROM host_profile_bindings WHERE binding_id=?",
+                (binding_id,),
+            ).fetchone()
+            if created is None:
+                raise BindingError("offline binding could not be confirmed")
+            return dict(created) | {"created": True}
 
     def ensure_binding(self, binding_id: str, host_id: str, profile_id: str,
                        account_ref: str, binding_generation: int, state: str, now: str) -> None:

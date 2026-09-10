@@ -12,6 +12,8 @@ repository/service boundary. The current implemented writes are:
 - guarded `POST /up/api/settings/test_telegram`
 - guarded `POST /up/api/settings/open_browser`
 - guarded `POST /up/api/ai_fix`
+- guarded `POST /up/api/host_registration` (Portable Domain Store only)
+- guarded `POST /up/api/host_binding` (OFFLINE binding only)
 
 The following remain intentionally blocked and are not in write dispatch:
 
@@ -54,6 +56,13 @@ Mo `http://127.0.0.1:8090`.
 - AI create accepts only the frozen `cycle`, `web`, and `userimport` schema, validates the returned queue basename, and spaces concurrent creates by 1.1 seconds under a named Windows mutex because the golden filename has only second precision.
 - Browser URLs are limited to absolute HTTP/HTTPS URLs with a hostname, no userinfo/control/CRLF/NUL, and at most 2048 UTF-8 bytes.
 - `POST /up/api/master` is a display-name-only CAS operation; it does not expose full master/schedule writes.
+- Host registration requires exactly `{host_id, display_name}`; binding requires exactly `{host_id, profile_id}`.
+  Both request host IDs must exactly match `HOST_AGENT_HOST_ID`.
+- Existing-host display-name conflicts return 409; this slice never renames hosts.
+- New bindings are always `OFFLINE` and create one profile-scoped audit event in the same immediate transaction.
+- Success responses expose `runtime_effect: NONE` and preserve `runtime_authority: LEGACY` with no active owner.
+- Portable host writes never call ai tool, write legacy files, create or change ACTIVE bindings,
+  or transfer runtime authority from LEGACY.
 - Backup listing/creation and settings GET/POST semantics are separated in `docs/API_CONTRACT.md`.
 
 ## Roadmap

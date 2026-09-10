@@ -40,6 +40,8 @@ function render(data) {
   const portable = data.portable_binding || {};
   const current = portable.current_binding || {};
   const observation = data.local_runtime_observation || {};
+  identity.replaceChildren();
+  binding.replaceChildren();
   detail(identity, 'Host ID', configured.host_id || 'NOT CONFIGURED');
   detail(identity, 'Identity source', configured.source || 'explicit_config');
   detail(identity, 'Hostname fallback', 'DISABLED');

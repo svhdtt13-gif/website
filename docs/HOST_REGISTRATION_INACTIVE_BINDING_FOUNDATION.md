@@ -15,9 +15,10 @@ The request contracts are exact JSON objects:
 - Host binding: `{ "host_id": "...", "profile_id": "..." }`.
 
 `host_id` is required in both requests and must match `HOST_AGENT_HOST_ID`
-exactly. The client cannot provide origin/account references, state, generation,
-or binding IDs. Malformed, wrong-type, control-field, overlength, missing-field,
-and mismatched-identity requests fail before a store write.
+exactly. Leading/trailing whitespace aliases are rejected rather than
+canonicalized. The client cannot provide origin/account references, state,
+generation, or binding IDs. Malformed, wrong-type, control-field, overlength,
+missing-field, and mismatched-identity requests fail before a store write.
 
 Both routes require `Authorization: Bearer <WEBAPP_WRITE_TOKEN>`, reject query
 strings and non-POST methods, and write only through `PortableDomainStore`.
@@ -27,7 +28,7 @@ strings and non-POST methods, and write only through `PortableDomainStore`.
 - A new host receives the logical origin `host_agent:configured`.
 - An existing host with the same display name is confirmed idempotently.
 - An existing host with a different display name returns `409`; it is never
-  renamed and the transaction performs zero writes.
+  renamed and the repository invariant rejects the rename for every caller.
 - New bindings are always `OFFLINE`.
 - Existing OFFLINE bindings are confirmed idempotently.
 - An existing ACTIVE binding returns `409` and is never changed, retired, or
@@ -39,7 +40,9 @@ Binding creation, deterministic audit-event creation, and conflict checks run
 inside one `BEGIN IMMEDIATE` transaction. The audit event is profile-scoped,
 has event type `host_binding_created`, and uses the binding ID in its stable
 event ID. Repeated or concurrent requests therefore produce one binding
-generation and one audit event, not duplicates.
+generation and one audit event, not duplicates. Concurrent registration of an
+absent host with different display names produces one host row, one success,
+and one `409` conflict without a later rename.
 
 ## Response and errors
 
@@ -49,7 +52,7 @@ Success responses include `runtime_effect: "NONE"`,
 runtime ownership or change any worker/scheduler/remote authority.
 
 - `400`: malformed JSON, wrong types, missing/extra/control fields, invalid
-  content type, or overlength text.
+  content type, whitespace aliases, or overlength text.
 - `401`: missing or invalid Bearer token; no store access occurs.
 - `403`: non-POST method; no store access occurs.
 - `409`: configured host identity mismatch, host display-name conflict, unknown

@@ -308,7 +308,7 @@ class PortableDomainStore:
             )
 
     def register_host(self, host_id: str, display_name: str, origin_ref: str, now: str) -> dict[str, object]:
-        """Create or confirm a host without changing its existing origin reference."""
+        """Create or confirm a host without changing an existing identity."""
         host_id, display_name, origin_ref, now = (
             _required(host_id, "host_id"), _required(display_name, "display_name"),
             _safe_reference(origin_ref, "origin_ref"), _required(now, "now")
@@ -325,13 +325,10 @@ class PortableDomainStore:
                 )
                 return {"host_id": host_id, "display_name": display_name, "created": True}
             if existing["display_name"] != display_name:
-                self.connection.execute(
-                    "UPDATE hosts SET display_name=?, updated_at=? WHERE host_id=?",
-                    (display_name, now, host_id),
-                )
+                raise BindingError("host display_name does not match existing host")
             return {
                 "host_id": existing["host_id"],
-                "display_name": display_name,
+                "display_name": existing["display_name"],
                 "created": False,
             }
 

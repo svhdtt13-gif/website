@@ -73,7 +73,15 @@ async function refresh() {
     const response = await fetch(ENDPOINT, { cache: 'no-store', credentials: 'same-origin' });
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     const data = await response.json();
-    if (data.read_only !== true || data.runtime_authority?.active_runtime_owner !== null) {
+    const mutationCapabilities = [
+      'can_install', 'can_register', 'can_start', 'can_stop', 'can_reconnect',
+      'can_login', 'can_rebind', 'can_activate', 'can_switch', 'can_control', 'can_bind',
+    ];
+    if (
+      data.read_only !== true
+      || data.runtime_authority?.active_runtime_owner !== null
+      || mutationCapabilities.some((name) => data.controls?.[name] !== false)
+    ) {
       throw new Error('unsafe host discovery response');
     }
     render(data);

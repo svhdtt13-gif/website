@@ -58,6 +58,8 @@ class HostDiscoveryRouteTests(unittest.TestCase):
         self.assertEqual(data["portable_binding"]["current_binding"]["profile_id"], "profile-a")
         self.assertIsNone(data["runtime_authority"]["active_runtime_owner"])
         self.assertIsNone(data["local_runtime_observation"]["runtime_owner"])
+        self.assertNotIn("origin_ref", data["portable_binding"]["host"])
+        self.assertNotIn("account_ref", data["portable_binding"]["current_binding"])
 
     def test_query_and_non_get_are_rejected(self):
         response = self.request(query_string={"host_id": "host-a"})
@@ -69,12 +71,18 @@ class HostDiscoveryRouteTests(unittest.TestCase):
                 self.assertEqual(response.status_code, 403)
                 self.assertEqual(response.get_json(), {"error": "host discovery is read-only"})
 
-    def test_missing_explicit_identity_does_not_fallback_or_create(self):
+    def test_missing_explicit_identity_fails_closed(self):
         response = self.request(host_id="")
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.get_json(), {"error": "configured host identity unavailable"})
+
+    def test_unknown_explicit_identity_is_unbound_without_creation(self):
+        response = self.request(host_id="unknown-host")
         self.assertEqual(response.status_code, 200)
         data = response.get_json()
-        self.assertFalse(data["configured_host_identity"]["configured"])
+        self.assertEqual(data["configured_host_identity"]["host_id"], "unknown-host")
         self.assertEqual(data["portable_binding"]["status"], "UNBOUND")
+        self.assertEqual(data["portable_binding"]["host_lookup"], "UNKNOWN")
 
     def test_malformed_store_is_generic_503(self):
         malformed = Path(self.temp.name) / "malformed.sqlite3"

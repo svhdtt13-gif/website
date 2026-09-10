@@ -10,6 +10,8 @@ hand control to P4/scheduler/Host Agent runtime code.
 
 1. **Configured Host Identity** comes only from `HOST_AGENT_HOST_ID`. The
    service never falls back to the machine hostname and never creates a host.
+   Missing configuration fails closed as unavailable; an explicit unknown ID
+   remains an unbound, unknown lookup without a write.
 2. **Portable Binding** is read from existing `hosts`, `remote_profiles`, and
    `host_profile_bindings` rows in one SQLite read snapshot. Missing host IDs or
    bindings remain unbound; nothing is created.
@@ -30,6 +32,8 @@ Only these relative paths are probed, read-only:
 - `tools/client_database.json`
 - `tools/cache/cycle_stopped.flag`
 
-The response reports only `PRESENT`, `ABSENT`, or `UNREADABLE`; it does not
-return file contents. All start, stop, login, switch, and bind controls remain
-disabled.
+The response reports only `PRESENT`, `ABSENT`, or `UNKNOWN` with an error marker
+for probe failures; it does not return file contents. Host origin and account
+references are not exposed in the public projection. All install, register,
+start, stop, reconnect, login, rebind, activate, switch, control, and bind
+capabilities remain explicitly false.

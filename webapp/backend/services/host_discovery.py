@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import stat
 from pathlib import Path
 
 from repositories.portable_store import SCHEMA_VERSION, STORE_KIND
@@ -33,19 +34,10 @@ def _error(message: str) -> tuple[bytes, int, str]:
 
 def _required_host_id(host_id: str) -> str:
     if type(host_id) is not str or not host_id.strip():
-        return ""
+        raise HostDiscoveryUnavailable("configured host identity unavailable")
     if any(ord(char) < 32 or ord(char) == 127 for char in host_id):
         raise HostDiscoveryUnavailable("invalid configured host identity")
     return host_id.strip()
-
-
-def _safe_reference(value: object) -> str:
-    if type(value) is not str or not value.strip() or "://" in value or any(
-        marker in value.lower()
-        for marker in ("password", "token", "cookie", "session", "secret")
-    ):
-        raise HostDiscoveryUnavailable("portable binding unavailable")
-    return value
 
 
 def _connection(path: Path) -> sqlite3.Connection:
@@ -81,12 +73,12 @@ def _read_bindings(store_path: Path, host_id: str) -> tuple[dict[str, object] | 
         connection.execute("BEGIN")
         _validate_store(connection)
         host = connection.execute(
-            "SELECT host_id, display_name, origin_ref FROM hosts WHERE host_id=?",
+            "SELECT host_id, display_name FROM hosts WHERE host_id=?",
             (host_id,),
         ).fetchone()
         rows = connection.execute(
             "SELECT b.binding_id, b.host_id, b.profile_id, b.binding_generation, b.state, "
-            "b.updated_at, p.display_name AS profile_display_name, p.account_ref, p.status AS profile_status "
+            "b.updated_at, p.display_name AS profile_display_name, p.status AS profile_status "
             "FROM host_profile_bindings AS b "
             "JOIN remote_profiles AS p ON p.profile_id = b.profile_id "
             "WHERE b.host_id=? ORDER BY b.binding_generation DESC, b.binding_id",
@@ -102,7 +94,6 @@ def _read_bindings(store_path: Path, host_id: str) -> tuple[dict[str, object] | 
         host_projection = {
             "host_id": host["host_id"],
             "display_name": host["display_name"],
-            "origin_ref": _safe_reference(host["origin_ref"]),
         }
     bindings: list[dict[str, object]] = []
     active_count = 0
@@ -116,7 +107,6 @@ def _read_bindings(store_path: Path, host_id: str) -> tuple[dict[str, object] | 
             "host_id": row["host_id"],
             "profile_id": row["profile_id"],
             "profile_display_name": row["profile_display_name"],
-            "account_ref": _safe_reference(row["account_ref"]),
             "profile_status": row["profile_status"],
             "binding_generation": row["binding_generation"],
             "state": row["state"],
@@ -134,23 +124,40 @@ def _probe_prerequisites(root: Path) -> list[dict[str, object]]:
         raise HostDiscoveryUnavailable("host prerequisite root unavailable") from error
     result = []
     for name, relative in PREREQUISITE_ALLOWLIST:
-        path = (resolved_root / relative).resolve()
+        try:
+            path = (resolved_root / relative).resolve()
+        except OSError as error:
+            raise HostDiscoveryUnavailable("host prerequisite probe unavailable") from error
         try:
             path.relative_to(resolved_root)
         except ValueError as error:
             raise HostDiscoveryUnavailable("host prerequisite allowlist escaped root") from error
         try:
-            exists = path.exists()
-            readable = path.is_file() and bool(path.stat().st_mode & 0o444) if exists else False
+            metadata = path.stat()
+        except FileNotFoundError:
+            result.append({
+                "name": name,
+                "path": relative,
+                "state": "ABSENT",
+                "read_only_probe": True,
+            })
         except OSError:
-            exists = True
-            readable = False
-        result.append({
-            "name": name,
-            "path": relative,
-            "state": "PRESENT" if readable else "UNREADABLE" if exists else "ABSENT",
-            "read_only_probe": True,
-        })
+            result.append({
+                "name": name,
+                "path": relative,
+                "state": "UNKNOWN",
+                "error": "probe_error",
+                "read_only_probe": True,
+            })
+        else:
+            is_regular_file = stat.S_ISREG(metadata.st_mode)
+            result.append({
+                "name": name,
+                "path": relative,
+                "state": "PRESENT" if is_regular_file else "UNKNOWN",
+                "error": None if is_regular_file else "not_regular_file",
+                "read_only_probe": True,
+            })
     return result
 
 
@@ -164,12 +171,13 @@ def _read_model(store_path: Path, host_id: str, prerequisite_root: Path) -> dict
         "ok": True,
         "read_only": True,
         "configured_host_identity": {
-            "host_id": explicit_host_id or None,
-            "configured": bool(explicit_host_id),
+            "host_id": explicit_host_id,
+            "configured": True,
             "source": "explicit_config",
         },
         "portable_binding": {
             "status": "BOUND" if current_binding else "UNBOUND",
+            "host_lookup": "FOUND" if host else "UNKNOWN",
             "host": host,
             "current_binding": current_binding,
             "bindings": bindings,
@@ -187,10 +195,16 @@ def _read_model(store_path: Path, host_id: str, prerequisite_root: Path) -> dict
             "reason": "Configured identity, portable binding, and local observation do not establish runtime ownership.",
         },
         "controls": {
+            "can_install": False,
+            "can_register": False,
             "can_start": False,
             "can_stop": False,
+            "can_reconnect": False,
             "can_login": False,
+            "can_rebind": False,
+            "can_activate": False,
             "can_switch": False,
+            "can_control": False,
             "can_bind": False,
             "reason": "Host Agent Discovery Foundation is read-only; runtime control is deferred.",
         },

@@ -31,12 +31,12 @@ def _invalid_request(message: str = "invalid host registration request") -> None
     raise UpstreamError(400, json.dumps({"error": message}, separators=(",", ":")).encode())
 
 
+def _conflict(message: str = "host binding conflict") -> None:
+    raise UpstreamError(409, json.dumps({"error": message}, separators=(",", ":")).encode())
+
+
 def _unavailable() -> None:
     raise UpstreamError(503, b'{"error":"portable profile store unavailable"}')
-
-
-def _conflict() -> None:
-    raise UpstreamError(409, b'{"error":"host binding conflict"}')
 
 
 def _decode_object(body: bytes) -> dict[str, object]:
@@ -58,7 +58,14 @@ def _valid_text(value: object, maximum: int = 200) -> bool:
 def _configured_host_id(host_id: str) -> str:
     if not _valid_text(host_id):
         raise UpstreamError(503, b'{"error":"configured host identity unavailable"}')
-    return host_id.strip()
+    return host_id
+
+
+def _request_host_id(value: object, configured_host_id: str) -> None:
+    if not _valid_text(value):
+        _invalid_request("host_id is required and must be valid text")
+    if value != configured_host_id:
+        _conflict("host_id does not match configured host identity")
 
 
 def _now() -> str:
@@ -79,25 +86,26 @@ def _check_content_type(content_type: str | None) -> None:
 
 def _registration_body(body: bytes, content_type: str | None, host_id: str) -> str:
     _check_content_type(content_type)
-    if not body:
-        return host_id
     value = _decode_object(body)
-    if set(value) - {"display_name"}:
-        _invalid_request()
-    display_name = value.get("display_name", host_id)
+    if set(value) != {"host_id", "display_name"}:
+        _invalid_request("request must contain exactly host_id and display_name")
+    _request_host_id(value["host_id"], host_id)
+    display_name = value["display_name"]
     if not _valid_text(display_name):
-        _invalid_request()
+        _invalid_request("display_name is required and must be valid text")
     return display_name.strip()
 
 
-def _binding_body(body: bytes, content_type: str | None) -> str:
+def _binding_body(body: bytes, content_type: str | None, host_id: str) -> str:
     _check_content_type(content_type)
-    if not body:
-        _invalid_request()
     value = _decode_object(body)
-    if set(value) != {"profile_id"} or not _valid_text(value["profile_id"]):
-        _invalid_request()
-    return value["profile_id"].strip()
+    if set(value) != {"host_id", "profile_id"}:
+        _invalid_request("request must contain exactly host_id and profile_id")
+    _request_host_id(value["host_id"], host_id)
+    profile_id = value["profile_id"]
+    if not _valid_text(profile_id):
+        _invalid_request("profile_id is required and must be valid text")
+    return profile_id.strip()
 
 
 def _response(operation: str, result: dict[str, object]) -> tuple[bytes, int, str]:
@@ -105,6 +113,7 @@ def _response(operation: str, result: dict[str, object]) -> tuple[bytes, int, st
         "ok": True,
         "operation": operation,
         "result": result,
+        "runtime_effect": "NONE",
         "runtime_authority": {
             "mode": "LEGACY",
             "active_runtime_owner": None,
@@ -127,12 +136,20 @@ def register_configured_host(
     display_name = _registration_body(body, content_type, configured_id)
     store = _open_store(store_path)
     try:
-        result = store.register_host(
-            configured_id,
-            display_name,
-            _HOST_ORIGIN_REF,
-            now or _now(),
-        )
+        with store.transaction(immediate=True):
+            existing = store.connection.execute(
+                "SELECT display_name FROM hosts WHERE host_id=?", (configured_id,)
+            ).fetchone()
+            if existing is not None and existing["display_name"] != display_name:
+                _conflict("host display_name does not match existing host")
+            result = store.register_host(
+                configured_id,
+                display_name,
+                _HOST_ORIGIN_REF,
+                now or _now(),
+            )
+    except BindingError:
+        _conflict("host registration conflict")
     except (OSError, sqlite3.Error, PortableStoreError):
         _unavailable()
     finally:
@@ -147,12 +164,25 @@ def create_offline_binding(
     host_id: str,
     now: str | None = None,
 ) -> tuple[bytes, int, str]:
-    """Create or confirm an OFFLINE binding without touching ACTIVE state."""
+    """Create or confirm an OFFLINE binding and its profile-scoped audit event."""
     configured_id = _configured_host_id(host_id)
-    profile_id = _binding_body(body, content_type)
+    profile_id = _binding_body(body, content_type, configured_id)
     store = _open_store(store_path)
+    timestamp = now or _now()
     try:
-        result = store.ensure_offline_binding(configured_id, profile_id, now or _now())
+        with store.transaction(immediate=True):
+            result = store.ensure_offline_binding(configured_id, profile_id, timestamp)
+            if result["created"]:
+                binding_id = str(result["binding_id"])
+                store.add_audit_event(
+                    profile_id,
+                    f"binding:{binding_id}:created",
+                    timestamp,
+                    "host_binding_created",
+                    "webapp:host_registration",
+                    f"Created OFFLINE binding {binding_id}.",
+                    "webapp:host_binding",
+                )
     except BindingError:
         _conflict()
     except (OSError, sqlite3.Error, PortableStoreError):

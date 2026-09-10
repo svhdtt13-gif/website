@@ -42,12 +42,12 @@ class HostRegistrationTests(unittest.TestCase):
         finally:
             store.close()
 
-    def registration(self, host_id="host-a", display_name="Existing Host"):
+    def registration(self, host_id="host-a", display_name="Existing Host", configured_host_id="host-a"):
         return register_configured_host(
             json.dumps({"host_id": host_id, "display_name": display_name}).encode(),
             JSON,
             self.path,
-            "host-a",
+            configured_host_id,
             NOW,
         )
 
@@ -61,7 +61,7 @@ class HostRegistrationTests(unittest.TestCase):
         )
 
     def test_registration_is_server_identity_scoped_and_idempotent(self):
-        raw, status, _ = self.registration("host-new", "Local Host")
+        raw, status, _ = self.registration("host-new", "Local Host", "host-new")
         data = json.loads(raw)
         self.assertEqual(status, 200)
         self.assertTrue(data["result"]["created"])
@@ -74,7 +74,7 @@ class HostRegistrationTests(unittest.TestCase):
         })
         self.assertFalse(data["controls"]["can_start"])
 
-        raw, status, _ = self.registration("host-new", "Local Host")
+        raw, status, _ = self.registration("host-new", "Local Host", "host-new")
         self.assertEqual(status, 200)
         self.assertFalse(json.loads(raw)["result"]["created"])
         rows = self.read("SELECT host_id, display_name, origin_ref FROM hosts WHERE host_id='host-new'")

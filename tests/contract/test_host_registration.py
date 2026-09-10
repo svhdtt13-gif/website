@@ -13,7 +13,11 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "webapp" / "backend"))
 
 from repositories.aitool import UpstreamError  # noqa: E402
-from repositories.portable_store import PortableDomainStore, PortableStoreError  # noqa: E402
+from repositories.portable_store import (  # noqa: E402
+    BindingError,
+    PortableDomainStore,
+    PortableStoreError,
+)
 from services.host_registration import (  # noqa: E402
     create_offline_binding,
     register_configured_host,
@@ -88,6 +92,15 @@ class HostRegistrationTests(unittest.TestCase):
         rows = self.read("SELECT display_name, origin_ref FROM hosts WHERE host_id='host-a'")
         self.assertEqual([tuple(row) for row in rows], [("Existing Host", "existing-origin")])
 
+    def test_repository_register_host_rejects_rename(self):
+        store = PortableDomainStore.open(self.path)
+        with self.assertRaises(BindingError):
+            store.register_host("host-a", "Renamed Host", "existing-origin", NOW)
+        store.close()
+        self.assertEqual(self.read(
+            "SELECT display_name FROM hosts WHERE host_id='host-a'"
+        )[0][0], "Existing Host")
+
     def test_existing_registration_rename_is_conflict_and_zero_write(self):
         before = self.path.read_bytes()
         with self.assertRaises(UpstreamError) as raised:
@@ -112,6 +125,8 @@ class HostRegistrationTests(unittest.TestCase):
             b'{"host_id":7,"display_name":"Host"}',
             b'{"host_id":"host-a","display_name":7}',
             b'{"host_id":"host-a","display_name":"Host","state":"ACTIVE"}',
+            b'{"host_id":"host-a","display_name":" Host"}',
+            b'{"host_id":"host-a","display_name":"Host "}',
             json.dumps({"host_id": "host-a", "display_name": "x" * 201}).encode(),
         )
         for body in bodies:
@@ -126,6 +141,8 @@ class HostRegistrationTests(unittest.TestCase):
             b'{"host_id":7,"profile_id":"profile-a"}',
             b'{"host_id":"host-a","profile_id":7}',
             b'{"host_id":"host-a","profile_id":"profile-a","state":"ACTIVE"}',
+            b'{"host_id":"host-a","profile_id":" profile-a"}',
+            b'{"host_id":"host-a","profile_id":"profile-a "}',
             json.dumps({"host_id": "host-a", "profile_id": "x" * 201}).encode(),
         )
         for body in binding_bodies:
@@ -253,6 +270,30 @@ class HostRegistrationTests(unittest.TestCase):
         self.assertEqual(self.read(
             "SELECT display_name FROM hosts WHERE host_id='host-a'"
         )[0][0], "Existing Host")
+
+    def test_concurrent_new_host_conflicting_names_creates_one_identity(self):
+        barrier = threading.Barrier(2)
+
+        def invoke(display_name):
+            barrier.wait()
+            body = json.dumps({
+                "host_id": "host-new",
+                "display_name": display_name,
+            }).encode()
+            try:
+                raw, status, _ = register_configured_host(
+                    body, JSON, self.path, "host-new", NOW
+                )
+                return status, json.loads(raw)
+            except UpstreamError as error:
+                return error.status, None
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            responses = list(executor.map(invoke, ("Host A", "Host B")))
+        self.assertEqual(sorted(status for status, _ in responses), [200, 409])
+        rows = self.read("SELECT host_id, display_name FROM hosts WHERE host_id='host-new'")
+        self.assertEqual(len(rows), 1)
+        self.assertIn(rows[0][1], {"Host A", "Host B"})
 
 
 if __name__ == "__main__":

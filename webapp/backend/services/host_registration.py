@@ -56,16 +56,22 @@ def _valid_text(value: object, maximum: int = 200) -> bool:
 
 
 def _configured_host_id(host_id: str) -> str:
-    if not _valid_text(host_id):
+    if not _valid_text(host_id) or host_id != host_id.strip():
         raise UpstreamError(503, b'{"error":"configured host identity unavailable"}')
     return host_id
 
 
 def _request_host_id(value: object, configured_host_id: str) -> None:
-    if not _valid_text(value):
-        _invalid_request("host_id is required and must be valid text")
+    if not _valid_text(value) or value != value.strip():
+        _invalid_request("host_id is required and must be exact text")
     if value != configured_host_id:
         _conflict("host_id does not match configured host identity")
+
+
+def _exact_text(value: object, field: str) -> str:
+    if not _valid_text(value) or value != value.strip():
+        _invalid_request(f"{field} is required and must be exact text")
+    return value
 
 
 def _now() -> str:
@@ -90,10 +96,7 @@ def _registration_body(body: bytes, content_type: str | None, host_id: str) -> s
     if set(value) != {"host_id", "display_name"}:
         _invalid_request("request must contain exactly host_id and display_name")
     _request_host_id(value["host_id"], host_id)
-    display_name = value["display_name"]
-    if not _valid_text(display_name):
-        _invalid_request("display_name is required and must be valid text")
-    return display_name.strip()
+    return _exact_text(value["display_name"], "display_name")
 
 
 def _binding_body(body: bytes, content_type: str | None, host_id: str) -> str:
@@ -102,10 +105,7 @@ def _binding_body(body: bytes, content_type: str | None, host_id: str) -> str:
     if set(value) != {"host_id", "profile_id"}:
         _invalid_request("request must contain exactly host_id and profile_id")
     _request_host_id(value["host_id"], host_id)
-    profile_id = value["profile_id"]
-    if not _valid_text(profile_id):
-        _invalid_request("profile_id is required and must be valid text")
-    return profile_id.strip()
+    return _exact_text(value["profile_id"], "profile_id")
 
 
 def _response(operation: str, result: dict[str, object]) -> tuple[bytes, int, str]:

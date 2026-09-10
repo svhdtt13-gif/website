@@ -7,16 +7,17 @@ import threading
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "webapp" / "backend"))
 
-from repositories.portable_store import PortableDomainStore  # noqa: E402
+from repositories.aitool import UpstreamError  # noqa: E402
+from repositories.portable_store import PortableDomainStore, PortableStoreError  # noqa: E402
 from services.host_registration import (  # noqa: E402
     create_offline_binding,
     register_configured_host,
 )
-from repositories.aitool import UpstreamError  # noqa: E402
 
 
 NOW = "2026-09-10T00:00:00+00:00"
@@ -166,6 +167,21 @@ class HostRegistrationTests(unittest.TestCase):
             "webapp:host_binding",
         ))
 
+    def test_binding_and_audit_roll_back_together_on_late_failure(self):
+        with patch.object(
+            PortableDomainStore,
+            "add_audit_event",
+            side_effect=PortableStoreError("injected audit failure"),
+        ):
+            with self.assertRaises(UpstreamError) as raised:
+                self.binding()
+        self.assertEqual(raised.exception.status, 503)
+        self.assertEqual(len(self.read(
+            "SELECT 1 FROM host_profile_bindings "
+            "WHERE host_id='host-a' AND profile_id='profile-a'"
+        )), 0)
+        self.assertEqual(len(self.read("SELECT 1 FROM profile_audit_events")), 0)
+
     def test_retired_binding_gets_next_generation(self):
         store = PortableDomainStore.open(self.path)
         store.bind_profile("retired", "host-a", "profile-a", "account-a", 1, "RETIRED", NOW)
@@ -219,6 +235,24 @@ class HostRegistrationTests(unittest.TestCase):
             "SELECT binding_generation FROM host_profile_bindings "
             "WHERE host_id='host-a' AND profile_id='profile-a'"
         )[0][0], 1)
+
+    def test_concurrent_conflicting_registrations_never_rename_host(self):
+        barrier = threading.Barrier(4)
+
+        def invoke(display_name):
+            barrier.wait()
+            try:
+                self.registration("host-a", display_name)
+            except UpstreamError as error:
+                return error.status
+            return 200
+
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            statuses = list(executor.map(invoke, ("Rename A", "Rename B", "Rename C", "Rename D")))
+        self.assertEqual(statuses, [409] * 4)
+        self.assertEqual(self.read(
+            "SELECT display_name FROM hosts WHERE host_id='host-a'"
+        )[0][0], "Existing Host")
 
 
 if __name__ == "__main__":

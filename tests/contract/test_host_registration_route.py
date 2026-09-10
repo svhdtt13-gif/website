@@ -106,12 +106,14 @@ class HostRegistrationRouteTests(unittest.TestCase):
             body=self.registration_body(display_name="Renamed Host"),
         )
         self.assertEqual(response.status_code, 409)
+        self.assertNotIn("runtime_effect", response.get_json())
         self.assertEqual(self.path.read_bytes(), before)
         response = self.request(
             "/up/api/host_registration",
             body=self.registration_body(host_id="other-host", display_name="Other"),
         )
         self.assertEqual(response.status_code, 409)
+        self.assertNotIn("runtime_authority", response.get_json())
         self.assertEqual(self.path.read_bytes(), before)
 
     def test_binding_requires_exact_contract_and_forces_offline(self):

@@ -85,8 +85,10 @@ export async function refresh() {
       throw new Error('unsafe host discovery response');
     }
     render(data);
+    return true;
   } catch (error) {
     clearView(`Host discovery unavailable: ${error.message || 'unknown error'}`);
+    return false;
   }
 }
 

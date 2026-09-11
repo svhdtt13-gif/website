@@ -123,8 +123,10 @@ export async function refresh() {
       throw new Error('unsafe profile manager response');
     }
     render(data);
+    return true;
   } catch (error) {
     renderError(`Profile manager unavailable: ${error.message || 'unknown error'}`);
+    return false;
   }
 }
 

@@ -4,6 +4,9 @@ import { refresh as refreshProfiles } from './profile_manager.js';
 const HOST_REGISTRATION_ENDPOINT = '/up/api/host_registration';
 const HOST_BINDING_ENDPOINT = '/up/api/host_binding';
 const CONFIGURATION_STYLE = 'css/host_configuration.css';
+const MUTATION_FAILURE = 'ERROR — configuration write failed';
+const PROJECTIONS_REFRESHED = 'SUCCESS — write confirmed, projections refreshed';
+const PROJECTIONS_STALE = 'WARNING/STALE — write confirmed, projection refresh failed/stale';
 
 function addStyle() {
   if (document.querySelector(`link[href="${CONFIGURATION_STYLE}"]`)) return;
@@ -83,6 +86,11 @@ async function post(request) {
   if (!responseIsSafe(data, request)) throw new Error('Unsafe configuration response.');
 }
 
+async function refreshProjections() {
+  const results = await Promise.allSettled([refreshProfiles(), refreshHosts()]);
+  return results.every((result) => result.status === 'fulfilled' && result.value === true);
+}
+
 function showConfirmation(request) {
   const dialog = document.getElementById('configurationConfirmation');
   const title = document.getElementById('confirmationTitle');
@@ -108,13 +116,18 @@ async function submit(request) {
   status.dataset.state = 'pending'; status.textContent = `Submitting ${request.kind} request...`;
   try {
     await post(request);
-    await Promise.all([refreshProfiles(), refreshHosts()]);
-    status.dataset.state = 'success'; status.textContent = `${request.label} confirmed. Read-only projections refreshed.`;
-    setMessage(error, '');
   } catch (reason) {
-    const message = `${request.label} unavailable: ${reason.message || 'unknown error'}`;
+    const message = `${MUTATION_FAILURE}: ${reason.message || 'unknown error'}`;
     status.dataset.state = 'error'; status.textContent = message; setMessage(error, message);
+    return;
   }
+  if (!await refreshProjections()) {
+    status.dataset.state = 'warning'; status.textContent = PROJECTIONS_STALE;
+    setMessage(error, '');
+    return;
+  }
+  status.dataset.state = 'success'; status.textContent = PROJECTIONS_REFRESHED;
+  setMessage(error, '');
 }
 
 function wireForm(form, errorId, buildRequest) {

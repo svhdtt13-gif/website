@@ -80,8 +80,48 @@ def test_success_requires_server_owned_safety_response():
     assert "data.runtime_authority?.mode !== 'LEGACY'" in source
     assert "active_runtime_owner !== null" in source
     assert "data.result?.state === 'OFFLINE'" in source
-    assert "Promise.all([refreshProfiles(), refreshHosts()])" in source
+    assert "Promise.allSettled([refreshProfiles(), refreshHosts()])" in source
     assert "Unsafe configuration response." in source
+
+
+def test_post_failure_does_not_refresh_or_retry_mutation():
+    source = read("js/host_configuration.js")
+    submit = source[source.index("async function submit("):]
+
+    assert "const MUTATION_FAILURE = 'ERROR — configuration write failed';" in source
+    assert source.count("await post(request)") == 1
+    assert submit.index("await post(request)") < submit.index("if (!await refreshProjections())")
+    assert submit.index("return;") < submit.index("if (!await refreshProjections())")
+    assert "status.dataset.state = 'error'; status.textContent = message;" in submit
+
+
+def test_post_success_with_both_projections_fresh_reports_success():
+    source = read("js/host_configuration.js")
+    submit = source[source.index("async function submit("):]
+
+    assert "const PROJECTIONS_REFRESHED = 'SUCCESS — write confirmed, projections refreshed';" in source
+    assert "const results = await Promise.allSettled([refreshProfiles(), refreshHosts()]);" in source
+    assert "result.status === 'fulfilled' && result.value === true" in source
+    assert "status.dataset.state = 'success'; status.textContent = PROJECTIONS_REFRESHED;" in submit
+
+
+def test_post_success_with_profile_host_or_both_projection_failures_reports_warning():
+    source = read("js/host_configuration.js")
+    submit = source[source.index("async function submit("):]
+
+    assert "const PROJECTIONS_STALE = 'WARNING/STALE — write confirmed, projection refresh failed/stale';" in source
+    assert "status.dataset.state = 'warning'; status.textContent = PROJECTIONS_STALE;" in submit
+    assert "setMessage(error, '');" in submit
+    assert source.count("refreshProfiles()") == 1
+    assert source.count("refreshHosts()") == 1
+    assert source.count("Promise.allSettled") == 1
+
+
+def test_projection_refreshers_report_failure_to_the_mutation_flow():
+    for name in ("js/profile_manager.js", "js/host_discovery.js"):
+        source = read(name)
+        assert "return true;" in source
+        assert "return false;" in source
 
 
 def test_configuration_surface_has_no_runtime_controls():

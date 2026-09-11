@@ -30,7 +30,8 @@ Confirmation metadata is a readable stacked definition list at every width.
 ### Host configuration panel
 
 - **Structure**: heading, safety note, registration form, binding form, result.
-- **States**: idle, invalid, confirmation, submitting, success, error.
+- **States**: idle, invalid, confirmation, submitting, mutation error, confirmed,
+  and confirmed-with-stale-projection warning.
 - **Accessibility**: explicit labels, inline `role=alert` errors, native dialog,
   visible focus, keyboard reachability.
 - **Layout**: responsive grid; no runtime controls.
@@ -61,4 +62,7 @@ translucent borders for form grouping. No new shadows or glass effects.
   `runtime_authority.mode=LEGACY`, `active_runtime_owner=null`, and binding
   `result.state=OFFLINE` before the UI reports success.
 - Successful writes refresh both read-only projections.
+- Mutation result and projection freshness are independent states. A server-confirmed
+  write remains confirmed when either read-only projection refresh fails; the UI must
+  report the view as stale rather than reporting the mutation as failed.
 - No ACTIVE/runtime/remote/scheduler controls are exposed.

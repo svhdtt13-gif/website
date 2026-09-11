@@ -114,7 +114,7 @@ function render(data) {
   }
 }
 
-async function refresh() {
+export async function refresh() {
   try {
     const response = await fetch(ENDPOINT, { cache: 'no-store', credentials: 'same-origin' });
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
@@ -123,8 +123,10 @@ async function refresh() {
       throw new Error('unsafe profile manager response');
     }
     render(data);
+    return true;
   } catch (error) {
     renderError(`Profile manager unavailable: ${error.message || 'unknown error'}`);
+    return false;
   }
 }
 

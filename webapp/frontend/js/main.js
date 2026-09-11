@@ -1,5 +1,6 @@
 import { refreshStore, store } from './store.js';
 import { render, showBanner } from './views.js';
+import './host_configuration.js';
 
 async function refresh() {
   await refreshStore();

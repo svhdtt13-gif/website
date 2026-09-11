@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Route regressions for guarded Portable Domain Store configuration writes."""
+import importlib
 import json
 import sys
 import tempfile
@@ -10,11 +11,14 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "webapp" / "backend"))
 
-import config  # noqa: E402
-from app import create_app  # noqa: E402
-from repositories.portable_store import PortableDomainStore  # noqa: E402
-from services import host_discovery, profile_manager  # noqa: E402
-
+config = importlib.import_module("config")
+create_app = importlib.import_module("app").create_app
+PortableDomainStore = importlib.import_module(
+    "repositories.portable_store"
+).PortableDomainStore
+_services = importlib.import_module("services")
+host_discovery = _services.host_discovery
+profile_manager = _services.profile_manager
 
 NOW = "2026-09-10T00:00:00+00:00"
 
@@ -36,7 +40,7 @@ class HostRegistrationRouteTests(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
 
-    def request(self, endpoint, body=b"{}", method="POST", token="write-secret", query_string=None):
+    def request(self, endpoint, body=b"{}", method="POST", token: str | None = "write-secret", query_string=None):
         with patch.multiple(
             config,
             PORTABLE_STORE_PATH=self.path,

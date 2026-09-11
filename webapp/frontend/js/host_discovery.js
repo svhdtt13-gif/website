@@ -68,7 +68,7 @@ function render(data) {
   });
 }
 
-async function refresh() {
+export async function refresh() {
   try {
     const response = await fetch(ENDPOINT, { cache: 'no-store', credentials: 'same-origin' });
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
@@ -85,8 +85,10 @@ async function refresh() {
       throw new Error('unsafe host discovery response');
     }
     render(data);
+    return true;
   } catch (error) {
     clearView(`Host discovery unavailable: ${error.message || 'unknown error'}`);
+    return false;
   }
 }
 

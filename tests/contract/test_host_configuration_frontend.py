@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
+import re
 from pathlib import Path
-
 
 ROOT = Path(__file__).resolve().parents[2]
 FRONTEND = ROOT / "webapp" / "frontend"
@@ -28,6 +28,49 @@ def test_requests_match_exact_backend_contracts():
     assert "runtime_effect: RUNTIME_EFFECT" not in source
     assert "runtime_authority: RUNTIME_AUTHORITY" not in source
     assert "state: BINDING_STATE" not in source
+
+
+def test_write_authorization_is_prompted_once_and_request_scoped():
+    source = read("js/host_configuration.js")
+    helper = re.search(
+        r"function authorizationHeader\(\) \{(?P<body>.*?)\n\}", source, re.DOTALL
+    )
+
+    assert helper is not None
+    assert helper.group("body").count("window.prompt(") == 1
+    assert "`Bearer ${operatorToken}`" in helper.group("body")
+    assert "Authorization: authorization" in source
+    assert source.index("authorizationHeader()") < source.index("fetch(request.endpoint")
+
+
+def test_form_values_are_sent_without_frontend_normalization():
+    source = read("js/host_configuration.js")
+
+    assert "new FormData(form).get(name)" in source
+    assert ".trim()" not in source
+    assert ".toLowerCase()" not in source
+    assert ".toUpperCase()" not in source
+
+
+def test_operator_token_has_no_storage_dom_url_message_or_log_path():
+    source = read("js/host_configuration.js")
+    helper = re.search(
+        r"function authorizationHeader\(\) \{(?P<body>.*?)\n\}", source, re.DOTALL
+    )
+
+    assert helper is not None
+    assert "operatorToken" not in source.replace(helper.group(0), "")
+    for forbidden in (
+        "localStorage",
+        "sessionStorage",
+        "console.",
+        "location.",
+        "URLSearchParams",
+        "document.cookie",
+    ):
+        assert forbidden not in source
+    for dom_sink in ("textContent", "innerHTML", "insertAdjacentHTML", "setMessage"):
+        assert dom_sink not in helper.group("body")
 
 
 def test_success_requires_server_owned_safety_response():

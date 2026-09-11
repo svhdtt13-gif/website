@@ -47,7 +47,12 @@ function mount() {
 }
 
 function value(form, name) {
-  return String(new FormData(form).get(name) || '').trim();
+  return String(new FormData(form).get(name) || '');
+}
+
+function authorizationHeader() {
+  const operatorToken = window.prompt('Operator write token');
+  return operatorToken ? `Bearer ${operatorToken}` : null;
 }
 
 function setMessage(element, message) {
@@ -67,9 +72,10 @@ function responseIsSafe(data, request) {
 }
 
 async function post(request) {
+  const authorization = authorizationHeader();
   const response = await fetch(request.endpoint, {
     method: 'POST', cache: 'no-store', credentials: 'same-origin',
-    headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(request.payload),
+    headers: { 'Content-Type': 'application/json', ...(authorization ? { Authorization: authorization } : {}) }, body: JSON.stringify(request.payload),
   });
   let data;
   try { data = await response.json(); } catch (_error) { throw new Error('Malformed JSON response.'); }

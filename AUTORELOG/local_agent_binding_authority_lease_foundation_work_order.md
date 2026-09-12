@@ -27,6 +27,17 @@ verified context from becoming an untracked replay. A positive result means
 only `AUTHORITY_ELIGIBILITY / FENCED_BINDING_MATCH`; it is not an ACTIVE
 transition, a runtime-owner selection, or permission to dispatch.
 
+The fence identity is explicitly:
+
+```text
+fence_identity = (authority_epoch, fence_counter)
+```
+
+`authority_epoch` comes from a fresh coordinator/supervisor source that is not
+inside the Operational SQLite backup or any restored database. The counter is
+monotonic only within that epoch. The pair is never reused, and every
+lease/heartbeat/eligibility/revalidation compares both values.
+
 ## 2. Existing boundaries
 
 - `host_profile_bindings` remains portable domain state in the separate
@@ -36,6 +47,15 @@ transition, a runtime-owner selection, or permission to dispatch.
 - A verified remote identity is a stable, non-secret identity reference backed
   by an explicit verification result. It is not a password, cookie, session,
   bearer value, account credential or display name.
+- The authoritative source for that identity is a future Portable Domain Store
+  schema migration to version 3, adding non-secret `verified_identity_ref` to
+  `remote_profiles`. A binding snapshot obtains it only by joining the exact
+  `host_profile_bindings.profile_id` to that profile row. Existing
+  `account_ref`, display names, session state and remote observations are never
+  identity proofs or fallbacks. Existing v2 rows without the field remain
+  ineligible until explicitly verified. The implementation slice defined by
+  this work-order includes that schema-v3 migration; this document does not
+  perform it and no separate proof store/adapter is permitted as a fallback.
 - P4 operational state remains in the separate mutable Operational SQLite.
 - Binding leases, fence values, heartbeat, expiry, jobs, checkpoints and worker
   events do not move into the Portable Domain Store or a P3 generation.
@@ -73,13 +93,15 @@ directly or through a transactionally linked row:
 - exact verified remote identity reference;
 - acquisition, heartbeat and expiry evidence;
 - release/reconciliation state;
-- a monotonically increasing fencing token/epoch.
+- `fence_identity = (authority_epoch, fence_counter)`.
 
-The fencing token is store/coordinator generated. It is never supplied by a
+The epoch is created by a fresh non-backup coordinator/supervisor source before
+the first acquisition after startup/restore. The counter is coordinator/store
+generated and increases within that epoch. Neither value is supplied by a
 Local Agent, restored from portable data, or accepted from a caller as proof of
-ownership. Every new acquisition or approved takeover gets a strictly newer
-token. A holder with an old token is rejected forever for that authority scope,
-even if its process is still running or its old timestamps appear live.
+ownership. A holder with an old epoch or counter is rejected forever for that
+authority scope, even if its process is still running or its old timestamps
+appear live.
 
 ### Authority eligibility
 
@@ -106,13 +128,15 @@ The coordinator owns:
 
 - the authoritative clock used for acquisition, heartbeat and expiry;
 - bounded TTL configuration;
-- fencing-token allocation and monotonicity;
+- fresh `authority_epoch` creation outside restored DB/backup state;
+- `fence_counter` allocation and monotonicity within that epoch;
 - serialized acquisition, renewal, release and reconciliation;
 - invalidation of stale owners and evidence recording.
 
 Caller-supplied `now`, `heartbeat_at`, `expires_at`, TTL or fence values are
 rejected as authority inputs. A caller may provide a request ID and
-idempotency key, but the coordinator computes all authority timestamps.
+idempotency key, but the coordinator computes all authority timestamps and the
+full fence identity.
 
 The current P4 `claim_job()` behavior may remain a job-foundation primitive,
 but an expired-row overwrite must not be treated as sufficient fencing for
@@ -130,12 +154,13 @@ that the two stores commit atomically:
    profile, binding generation, binding state and verified identity.
 2. Reject missing, conflicting, `OFFLINE`, `RETIRED` or revoked binding state.
 3. Acquire or renew the scoped lease only in the canonical Operational SQLite,
-   using the coordinator clock and a new/current fencing token.
+   using the coordinator clock and a new/current `(authority_epoch,
+   fence_counter)`.
 4. Record the binding snapshot identity and verified identity beside the lease
    evidence; do not copy portable lease authority into the portable store.
 5. Before any future dispatch, re-read the binding snapshot and the operational
    lease and compare host, profile, verified identity, generation, owner,
-   fencing token, expiry and idempotency key.
+   `authority_epoch`, `fence_counter`, expiry and idempotency key.
 6. Reject on any mismatch. Do not repair the mismatch inline, fall back to
    host/profile matching, or dispatch after a failed re-check.
 
@@ -160,12 +185,14 @@ conditions are proven in the applicable read/revalidation boundaries:
 6. The lease owner is the expected owner for the requested future role.
 7. The lease is unexpired according to the coordinator clock.
 8. Heartbeat/expiry evidence is parseable and within bounded TTL policy.
-9. The fencing token is the current token for the scope; no older token is
-   accepted after acquisition or takeover.
+9. The full fence identity `(authority_epoch, fence_counter)` is current for
+   the scope. A different epoch always rejects, even when its counter is
+   numerically higher or equal. No older pair is accepted after acquisition,
+   takeover or restore.
 10. No competing live lease claims the same authority scope.
 11. The binding generation has not been superseded.
 12. The idempotency key is unique for the intended command or resolves to the
-    same previously recorded command; a new corrective action gets a new key.
+   same previously recorded command; a new corrective action gets a new key.
 
 The check must be read-only. Lease acquisition, renewal, release and takeover
 are separate coordinator transactions and must revalidate the current binding
@@ -182,16 +209,18 @@ unbound -> requested -> acquired -> heartbeating -> released
 ```
 
 - `requested` is input only and grants no authority.
-- `acquired` allocates a new fencing token in the canonical store.
-- `heartbeating` may extend only the exact owner/scope/current-token pair.
+- `acquired` allocates a new fence identity in the canonical store.
+- `heartbeating` may extend only the exact owner/scope/current
+  `(authority_epoch, fence_counter)` pair.
 - `released` is terminal for that lease instance.
 - `expired` makes reconciliation eligible; it does not grant takeover.
 - Expiry never dispatches, retries, or proves that a prior remote action
   failed.
 - A future takeover requires fresh verified identity, current binding
-  generation, canonical coordinator serialization, a strictly newer fence,
-  and explicit invalidation of the old holder. The old fence must remain
-  rejected even if the old process continues running.
+  generation, canonical coordinator serialization, a fresh authority epoch or
+  strictly newer counter within the current epoch, and explicit invalidation
+  of the old holder. The old fence identity must remain rejected even if the
+  old process continues running.
 - An ambiguous post-dispatch result remains `unknown` and requires the
   existing reconciliation contract. It must not be replayed from a new lease.
 
@@ -204,12 +233,15 @@ copy or restore must never revive mutate authority:
   canonical coordinator with a fresh fencing token.
 - An operational DB restore opens in quarantine/read-only mode.
 - Before any lease can be acquired after restore, the supervisor/coordinator
-  must establish a fresh non-backup runtime/restore epoch, invalidate all
-  restored lease rows, and reconcile the current binding generation and
-  verified identity.
+  must establish a fresh non-backup `authority_epoch`, reset the
+  epoch-local counter, invalidate all restored lease rows, and reconcile the
+  current binding generation and verified identity.
 - The fresh epoch/restore marker must not be sourced solely from the restored
   database or a portable package. If it cannot be established, authority stays
   disabled.
+- Every restored lease/heartbeat/revalidation must compare the new epoch and
+  its counter; a restored row from any prior epoch is historical evidence and
+  can never match. No `(authority_epoch, fence_counter)` pair may be reused.
 - Restored jobs with post-dispatch ambiguity remain `unknown`; restore cannot
   mark them successful or replay them.
 - Backup/portable export never transfers live lease ownership, fence tokens,
@@ -230,7 +262,9 @@ copy or restore must never revive mutate authority:
 | Lease scope or identity differs from binding | Reject | Repair the lease or fall back to host/profile |
 | Lease missing, released, expired or malformed | Reject/reconcile only | Renew or takeover implicitly in the check |
 | Lease owner differs from expected owner | Reject | Steal, impersonate or continue work |
-| Fencing token is stale, missing, reused or non-monotonic | Reject | Accept old owner after takeover |
+| Fence epoch differs from coordinator epoch | Reject | Accept a restored or stale epoch |
+| Fence counter is stale, missing, reused or non-monotonic within the epoch | Reject | Accept old owner after takeover |
+| Fence pair is reused after restore | Reject | Treat equal integers as equal authority |
 | Competing live lease exists | Reject | Use a mutex or local cache as proof |
 | Newer binding generation exists | Reject | Replay against the older generation |
 | Caller supplies authority timestamps, TTL or fence | Reject | Trust client clock or client token |
@@ -289,14 +323,20 @@ all of the following before its review can request a GO decision:
    fence.
 8. Backup/restore tests proving restored lease rows cannot become live without
    a fresh non-backup runtime/restore epoch and reconciliation.
-9. Idempotency tests proving duplicate keys do not dispatch twice and
-   corrective actions use new keys; ambiguous jobs remain `unknown`.
+9. Idempotency tests proving a duplicate key resolves to the same recorded
+   command-context or fails closed on conflict; eligibility/acquisition never
+   enqueue or dispatch, and remote dispatch count for this slice is exactly
+   zero. The future dispatch slice must separately prove no duplicate remote
+   dispatch.
 10. A no-side-effect test proving eligibility verification does not open a
     WebSocket, enqueue a job, change binding state, start/stop a process,
     invoke a scheduler, or mutate a remote system.
-11. Sanitized audit evidence proving rejected mismatches expose no secret,
+11. Portable schema-v3 tests proving `verified_identity_ref` is the sole
+    authoritative identity source for this contract and that `account_ref`,
+    display name, session and observation values cannot satisfy the check.
+12. Sanitized audit evidence proving rejected mismatches expose no secret,
     session or identity credential material.
-12. Regression evidence that Host Configuration, Portable Domain Store,
+13. Regression evidence that Host Configuration, Portable Domain Store,
     Remote Profile Manager and read-only route contracts remain unchanged.
 
 ## 12. Review gate
@@ -306,12 +346,18 @@ must explicitly confirm:
 
 - verified remote identity and idempotency are required in future command
   context;
+- `verified_identity_ref` is sourced only from the approved Portable Domain
+  Store schema-v3 migration and never inferred from `account_ref` or
+  observations;
 - a lease is not runtime authority and actual authority remains `LEGACY`;
-- fencing is monotonic and stale holders are rejected permanently;
+- fencing identity is `(authority_epoch, fence_counter)`, with an epoch from
+  outside restored DB/backup state, monotonic counter per epoch, and permanent
+  stale-holder rejection;
 - expiry is only reconciliation-eligible and never an automatic takeover;
 - one canonical coordinator controls the authority store and its clock;
 - no cross-database atomicity is assumed; revalidation and fencing are used;
 - backup/restore/restart cannot revive mutate authority;
+- this slice's eligibility/acquisition path has exactly zero remote dispatch;
 - every mismatch is fail-closed;
 - no ACTIVE/runtime/scheduler/remote control is included;
 - the twelve implementation evidence groups above are sufficient.

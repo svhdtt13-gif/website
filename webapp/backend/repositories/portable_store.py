@@ -9,12 +9,11 @@ import hashlib
 import json
 import shutil
 import sqlite3
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Iterator
 
-
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 STORE_KIND = "portable_domain_store"
 DB_FILENAME = "portable_domain.sqlite3"
 
@@ -36,6 +35,7 @@ CREATE TABLE IF NOT EXISTS remote_profiles (
     profile_id TEXT PRIMARY KEY,
     display_name TEXT NOT NULL,
     account_ref TEXT NOT NULL,
+    verified_identity_ref TEXT,
     status TEXT NOT NULL CHECK (status IN ('VERIFIED', 'ACTIVE', 'OFFLINE', 'NEEDS_LOGIN')),
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
@@ -123,10 +123,22 @@ CREATE TABLE IF NOT EXISTS profile_audit_events (
 SCHEMA_CHECKSUM = hashlib.sha256(
     " ".join(line.strip() for line in SCHEMA_SQL.splitlines() if line.strip()).encode()
 ).hexdigest()
-MIGRATIONS = {
+
+
+def _migrate_v3(connection: sqlite3.Connection) -> None:
+    columns = {
+        row[1]
+        for row in connection.execute("PRAGMA table_info(remote_profiles)")
+    }
+    if "verified_identity_ref" not in columns:
+        connection.execute(
+            "ALTER TABLE remote_profiles ADD COLUMN verified_identity_ref TEXT"
+        )
+MIGRATIONS: dict[int, str | Callable[[sqlite3.Connection], None]] = {
     1: SCHEMA_SQL,
     2: "CREATE UNIQUE INDEX IF NOT EXISTS one_active_host_per_profile "
        "ON host_profile_bindings(profile_id) WHERE state = 'ACTIVE';",
+    3: _migrate_v3,
 }
 
 
@@ -181,7 +193,7 @@ class PortableDomainStore:
         self._transaction_depth = 0
 
     @classmethod
-    def create(cls, path: Path | str) -> "PortableDomainStore":
+    def create(cls, path: Path | str) -> PortableDomainStore:
         target = Path(path)
         target.parent.mkdir(parents=True, exist_ok=True)
         if target.exists() and target.stat().st_size:
@@ -193,7 +205,7 @@ class PortableDomainStore:
         return store
 
     @classmethod
-    def open(cls, path: Path | str) -> "PortableDomainStore":
+    def open(cls, path: Path | str) -> PortableDomainStore:
         target = Path(path)
         if not target.is_file():
             raise PortableStoreError("portable store does not exist")
@@ -222,7 +234,11 @@ class PortableDomainStore:
             raise SchemaError("portable schema version is newer than this code")
         for target in range(current + 1, SCHEMA_VERSION + 1):
             with self.transaction():
-                self.connection.executescript(MIGRATIONS[target])
+                migration = MIGRATIONS[target]
+                if callable(migration):
+                    migration(self.connection)
+                else:
+                    self.connection.executescript(migration)
                 self.connection.execute(
                     "INSERT OR REPLACE INTO schema_meta(key, value) VALUES ('store_kind', ?)",
                     (STORE_KIND,),
@@ -343,9 +359,35 @@ class PortableDomainStore:
             raise PortableStoreError("invalid profile status")
         with self.transaction():
             self.connection.execute(
-                "INSERT INTO remote_profiles VALUES (?, ?, ?, ?, ?, ?)",
-                (profile_id, display_name, account_ref, status, now, now),
+                "INSERT INTO remote_profiles VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (profile_id, display_name, account_ref, None, status, now, now),
             )
+
+    def record_verified_identity(
+        self, profile_id: str, verified_identity_ref: str, now: str
+    ) -> None:
+        """Persist only an explicit non-secret remote identity proof reference."""
+        profile_id = _profile_id(profile_id)
+        verified_identity_ref = _safe_reference(
+            verified_identity_ref, "verified_identity_ref"
+        )
+        now = _required(now, "now")
+        with self.transaction(immediate=True):
+            profile = self.connection.execute(
+                "SELECT account_ref FROM remote_profiles WHERE profile_id=?",
+                (profile_id,),
+            ).fetchone()
+            if profile is None:
+                raise BindingError("unknown profile_id")
+            if profile[0] == verified_identity_ref:
+                raise BindingError("verified identity must not reuse account_ref")
+            updated = self.connection.execute(
+                "UPDATE remote_profiles SET verified_identity_ref=?, updated_at=? "
+                "WHERE profile_id=?",
+                (verified_identity_ref, now, profile_id),
+            ).rowcount
+            if updated != 1:
+                raise BindingError("verified identity could not be recorded")
 
     def ensure_profile(self, profile_id: str, display_name: str, account_ref: str,
                        status: str, now: str) -> None:
@@ -389,6 +431,24 @@ class PortableDomainStore:
                 (binding_id, host_id, profile_id, binding_generation, state, now, now),
             )
 
+    def binding_snapshot(self, host_id: str, profile_id: str,
+                         binding_generation: int) -> dict[str, object]:
+        host_id, profile_id = _required(host_id, "host_id"), _profile_id(profile_id)
+        if not isinstance(binding_generation, int) or binding_generation < 1:
+            raise BindingError("binding_generation must be positive")
+        rows = self.connection.execute(
+            "SELECT b.host_id, b.profile_id, b.binding_generation, b.state, "
+            "h.origin_ref, p.account_ref, p.verified_identity_ref, p.status "
+            "FROM host_profile_bindings AS b "
+            "JOIN hosts AS h ON h.host_id=b.host_id "
+            "JOIN remote_profiles AS p ON p.profile_id=b.profile_id "
+            "WHERE b.host_id=? AND b.profile_id=? AND b.binding_generation=?",
+            (host_id, profile_id, binding_generation),
+        ).fetchall()
+        if len(rows) != 1:
+            raise BindingError("binding snapshot is not unique")
+        return dict(rows[0])
+
     def ensure_offline_binding(self, host_id: str, profile_id: str, now: str) -> dict[str, object]:
         """Create or confirm only an OFFLINE binding for an existing host/profile."""
         host_id, profile_id, now = (
@@ -413,11 +473,19 @@ class PortableDomainStore:
                 raise BindingError("active binding cannot be changed")
             offline = next((row for row in rows if row["state"] == "OFFLINE"), None)
             if offline is not None:
-                return dict(offline) | {"created": False}
+                return {
+                    "binding_id": offline["binding_id"],
+                    "host_id": offline["host_id"],
+                    "profile_id": offline["profile_id"],
+                    "binding_generation": offline["binding_generation"],
+                    "state": offline["state"],
+                    "updated_at": offline["updated_at"],
+                    "created": False,
+                }
 
             generation = max((int(row["binding_generation"]) for row in rows), default=0) + 1
             binding_id = "binding-" + hashlib.sha256(
-                f"{host_id}\0{profile_id}\0{generation}".encode("utf-8")
+                f"{host_id}\0{profile_id}\0{generation}".encode()
             ).hexdigest()[:24]
             self.connection.execute(
                 "INSERT OR IGNORE INTO host_profile_bindings "
@@ -432,7 +500,15 @@ class PortableDomainStore:
             ).fetchone()
             if created is None:
                 raise BindingError("offline binding could not be confirmed")
-            return dict(created) | {"created": True}
+            return {
+                "binding_id": created["binding_id"],
+                "host_id": created["host_id"],
+                "profile_id": created["profile_id"],
+                "binding_generation": created["binding_generation"],
+                "state": created["state"],
+                "updated_at": created["updated_at"],
+                "created": True,
+            }
 
     def ensure_binding(self, binding_id: str, host_id: str, profile_id: str,
                        account_ref: str, binding_generation: int, state: str, now: str) -> None:
@@ -642,7 +718,8 @@ class PortableDomainStore:
     def export_profile(self, profile_id: str) -> dict[str, object]:
         profile_id = _profile_id(profile_id)
         profile = self.connection.execute(
-            "SELECT profile_id, display_name, account_ref, status FROM remote_profiles WHERE profile_id=?",
+            "SELECT profile_id, display_name, account_ref, verified_identity_ref, status "
+            "FROM remote_profiles WHERE profile_id=?",
             (profile_id,),
         ).fetchone()
         if profile is None:

@@ -2,6 +2,7 @@
 """Acceptance tests for the Portable Domain Store Foundation."""
 import hashlib
 import json
+import sqlite3
 import sys
 import tempfile
 import unittest
@@ -10,20 +11,20 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "webapp" / "backend"))
 
-from repositories.portable_store import (  # noqa: E402
+from repositories.portable_store import (
+    SCHEMA_SQL,
+    SCHEMA_VERSION,
     BindingError,
     PortableDomainStore,
     ProfileRequiredError,
-    SCHEMA_VERSION,
 )
-from services.shadow_import import (  # noqa: E402
+from services.shadow_import import (
     FileSystemGoldenSource,
     GoldenSnapshot,
     LegacyBinding,
     ShadowImportError,
     import_shadow,
 )
-
 
 NOW = "2026-09-09T00:00:00+00:00"
 
@@ -44,6 +45,40 @@ class PortableDomainStoreTests(unittest.TestCase):
         self.store.bind_profile("binding-" + profile_id, host_id, profile_id,
                                 account_ref, 1, "ACTIVE", NOW)
 
+    def create_v2_fixture(self):
+        v2_schema = SCHEMA_SQL.replace("    verified_identity_ref TEXT,\n", "")
+        v2_checksum = hashlib.sha256(v2_schema.encode("utf-8")).hexdigest()
+        connection = sqlite3.connect(self.path)
+        try:
+            connection.executescript(v2_schema)
+            connection.execute(
+                "UPDATE schema_meta SET value=? WHERE key='store_kind'",
+                ("portable_domain_store",),
+            )
+            connection.execute(
+                "UPDATE schema_meta SET value=? WHERE key='schema_version'",
+                ("2",),
+            )
+            connection.execute(
+                "UPDATE schema_meta SET value=? WHERE key='schema_checksum'",
+                (v2_checksum,),
+            )
+            connection.execute(
+                "INSERT INTO hosts VALUES (?, ?, ?, ?, ?)",
+                ("host-a", "Host A", "explicit-test-origin", NOW, NOW),
+            )
+            connection.execute(
+                "INSERT INTO remote_profiles VALUES (?, ?, ?, ?, ?, ?)",
+                ("profile-a", "Profile A", "account-a", "VERIFIED", NOW, NOW),
+            )
+            connection.execute(
+                "INSERT INTO host_profile_bindings VALUES (?, ?, ?, ?, ?, ?, ?)",
+                ("binding-a", "host-a", "profile-a", 1, "ACTIVE", NOW, NOW),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
     def test_empty_database_migrates_deterministically_and_reopens(self):
         meta = dict(self.store.connection.execute("SELECT key, value FROM schema_meta"))
         self.assertEqual(meta["schema_version"], str(SCHEMA_VERSION))
@@ -63,6 +98,58 @@ class PortableDomainStoreTests(unittest.TestCase):
         self.store.close()
         self.store = PortableDomainStore.open(self.path)
         self.assertEqual(self.store.list_clients("profile-a")[0]["display_name"], "A")
+
+    def test_v2_migration_adds_unverified_identity_without_inference(self):
+        self.store.close()
+        self.path.unlink()
+        self.create_v2_fixture()
+
+        migrated = PortableDomainStore.open(self.path)
+        try:
+            meta = dict(migrated.connection.execute("SELECT key, value FROM schema_meta"))
+            columns = {
+                row[1]
+                for row in migrated.connection.execute("PRAGMA table_info(remote_profiles)")
+            }
+            identity = migrated.connection.execute(
+                "SELECT verified_identity_ref FROM remote_profiles WHERE profile_id=?",
+                ("profile-a",),
+            ).fetchone()[0]
+            self.assertEqual(meta["schema_version"], str(SCHEMA_VERSION))
+            self.assertIn("verified_identity_ref", columns)
+            self.assertIsNone(identity)
+            self.assertEqual(
+                migrated.connection.execute(
+                    "SELECT account_ref FROM remote_profiles WHERE profile_id=?",
+                    ("profile-a",),
+                ).fetchone()[0],
+                "account-a",
+            )
+        finally:
+            migrated.close()
+
+    def test_verified_identity_requires_explicit_non_secret_reference(self):
+        with self.assertRaises(BindingError):
+            self.store.record_verified_identity("missing", "identity-a", NOW)
+
+        self.seed("profile-a", "host-a", "account-a")
+        self.assertIsNone(
+            self.store.connection.execute(
+                "SELECT verified_identity_ref FROM remote_profiles WHERE profile_id=?",
+                ("profile-a",),
+            ).fetchone()[0]
+        )
+        with self.assertRaises(BindingError):
+            self.store.record_verified_identity("profile-a", "account-a", NOW)
+
+        self.store.record_verified_identity("profile-a", "identity-a", NOW)
+        self.assertEqual(
+            self.store.connection.execute(
+                "SELECT verified_identity_ref FROM remote_profiles WHERE profile_id=?",
+                ("profile-a",),
+            ).fetchone()[0],
+            "identity-a",
+        )
 
     def test_schema_contains_no_runtime_or_secret_authority_fields(self):
         sql = " ".join(

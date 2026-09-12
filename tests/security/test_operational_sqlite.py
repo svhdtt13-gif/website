@@ -2,23 +2,25 @@
 """Runtime acceptance tests for the P4 operational SQLite foundation."""
 import hashlib
 import json
-from pathlib import Path
 import sqlite3
 import sys
 import tempfile
 import unittest
+from pathlib import Path
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "webapp" / "backend"))
 
-from repositories.operational_sqlite import (  # noqa: E402
+from repositories.operational_sqlite import (
     OPERATIONAL_FILENAME,
+    SCHEMA_CHECKSUM,
+    SCHEMA_SQL,
+    SCHEMA_VERSION,
     OperationalIntegrityError,
     OperationalPathError,
     OperationalSchemaError,
     OperationalSQLiteRepository,
-    SCHEMA_VERSION,
-    SCHEMA_CHECKSUM,
     backup_directory,
     operational_path,
 )
@@ -33,6 +35,29 @@ class OperationalSQLiteTests(unittest.TestCase):
     def tearDown(self):
         self.repository.close()
         self.temp.cleanup()
+
+    def _write_v1_database(self, tampered=False, metadata=True):
+        self.repository.close()
+        path = operational_path(self.runtime)
+        path.unlink()
+        connection = sqlite3.connect(path)
+        try:
+            connection.executescript(SCHEMA_SQL)
+            connection.execute("DROP INDEX fenced_identity_idx")
+            connection.execute("DROP INDEX fenced_live_scope_idx")
+            connection.execute("DROP TABLE fenced_leases")
+            connection.execute("DROP TABLE authority_state")
+            if tampered:
+                connection.execute("ALTER TABLE jobs ADD COLUMN tampered TEXT")
+            if metadata:
+                connection.execute(
+                    "INSERT INTO schema_meta(key, value) VALUES (?, ?), (?, ?)",
+                    ("schema_version", "1", "schema_checksum", "legacy-v1"),
+                )
+            connection.commit()
+        finally:
+            connection.close()
+        return path
 
     def test_schema_wal_foreign_keys_and_integrity_are_verified(self):
         self.assertEqual(
@@ -67,6 +92,113 @@ class OperationalSQLiteTests(unittest.TestCase):
         for forbidden in ("password", "token", "secret", "credential"):
             self.assertNotIn(forbidden, schema_sql)
 
+    def test_fenced_authority_schema_starts_with_epoch_and_empty_counter(self):
+        tables = {
+            row[0]
+            for row in self.repository.rows(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+        }
+        self.assertTrue({"authority_state", "fenced_leases"}.issubset(tables))
+        state = self.repository.rows(
+            "SELECT authority_epoch, fence_counter, quarantined FROM authority_state"
+        )[0]
+        self.assertTrue(state[0])
+        self.assertEqual(tuple(state[1:]), (0, 0))
+
+    def test_v1_operational_database_migrates_to_fenced_schema(self):
+        self._write_v1_database()
+
+        self.repository = OperationalSQLiteRepository.open(self.runtime)
+
+        self.assertEqual(
+            self.repository.rows(
+                "SELECT value FROM schema_meta WHERE key='schema_version'"
+            )[0][0],
+            str(SCHEMA_VERSION),
+        )
+        self.assertTrue(
+            self.repository.rows(
+                "SELECT authority_epoch FROM authority_state"
+            )[0][0]
+        )
+
+    def test_tampered_v1_operational_database_fails_closed(self):
+        self._write_v1_database(tampered=True)
+
+        with self.assertRaises(OperationalSchemaError):
+            OperationalSQLiteRepository.open(self.runtime)
+
+    def test_missing_v1_metadata_fails_closed(self):
+        self._write_v1_database(metadata=False)
+
+        with self.assertRaises(OperationalSchemaError):
+            OperationalSQLiteRepository.open(self.runtime)
+
+    def test_wrong_metadata_fails_closed(self):
+        self.repository.connection.execute(
+            "UPDATE schema_meta SET value='wrong' WHERE key='schema_checksum'"
+        )
+        self.repository.close()
+
+        with self.assertRaises(OperationalSchemaError):
+            OperationalSQLiteRepository.open(self.runtime)
+
+    def test_newer_operational_schema_fails_closed(self):
+        self.repository.connection.execute(
+            "UPDATE schema_meta SET value='99' WHERE key='schema_version'"
+        )
+        self.repository.close()
+
+        with self.assertRaises(OperationalSchemaError):
+            OperationalSQLiteRepository.open(self.runtime)
+
+    def test_v1_migration_rolls_back_when_epoch_creation_fails(self):
+        path = self._write_v1_database()
+
+        with patch(
+            "repositories.operational_sqlite._new_authority_epoch",
+            side_effect=RuntimeError("epoch source unavailable"),
+        ), self.assertRaises(RuntimeError):
+            OperationalSQLiteRepository.open(self.runtime)
+
+        connection = sqlite3.connect(path)
+        try:
+            self.assertEqual(
+                connection.execute(
+                    "SELECT value FROM schema_meta WHERE key='schema_version'"
+                ).fetchone()[0],
+                "1",
+            )
+            self.assertIsNone(
+                connection.execute(
+                    "SELECT 1 FROM sqlite_master WHERE name='authority_state'"
+                ).fetchone()
+            )
+        finally:
+            connection.close()
+
+    def test_v1_backup_is_rejected_without_restoring_authority(self):
+        path = self._write_v1_database()
+        backup = backup_directory(self.runtime) / "legacy-v1.sqlite3"
+        backup.write_bytes(path.read_bytes())
+        manifest = backup.with_suffix(".manifest.json")
+        manifest.write_text(
+            json.dumps({
+                "schema_version": 1,
+                "schema_checksum": "legacy-v1",
+                "size": backup.stat().st_size,
+                "sha256": hashlib.sha256(backup.read_bytes()).hexdigest(),
+            }) + "\n",
+            encoding="utf-8",
+        )
+        before = hashlib.sha256(path.read_bytes()).hexdigest()
+
+        with self.assertRaises(OperationalSchemaError):
+            OperationalSQLiteRepository.restore_from(self.runtime, backup)
+
+        self.assertEqual(hashlib.sha256(path.read_bytes()).hexdigest(), before)
+
     def test_only_dedicated_operational_path_is_openable(self):
         p3 = self.runtime / "sqlite" / "verified.sqlite3"
         p3.parent.mkdir(parents=True)
@@ -93,13 +225,12 @@ class OperationalSQLiteTests(unittest.TestCase):
         self.assertEqual(p3.stat().st_mtime_ns, before_mtime)
 
     def test_transaction_primitive_rolls_back_all_changes(self):
-        with self.assertRaises(RuntimeError):
-            with self.repository.transaction():
-                self.repository.connection.execute(
-                    "INSERT INTO checkpoints VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    ("checkpoint-1", "test", None, None, None, None, "[]", "now", "{}"),
-                )
-                raise RuntimeError("force rollback")
+        with self.assertRaises(RuntimeError), self.repository.transaction():
+            self.repository.connection.execute(
+                "INSERT INTO checkpoints VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                ("checkpoint-1", "test", None, None, None, None, "[]", "now", "{}"),
+            )
+            raise RuntimeError("force rollback")
         self.assertEqual(
             self.repository.rows(
                 "SELECT COUNT(*) FROM checkpoints WHERE checkpoint_id='checkpoint-1'"
@@ -238,6 +369,35 @@ class OperationalSQLiteTests(unittest.TestCase):
         self.assertEqual(job_ids, ["job-3"])
         self.assertEqual(hashlib.sha256(p3.read_bytes()).hexdigest(), p3_hash)
         self.assertEqual(p3.stat().st_mtime_ns, p3_mtime)
+
+    def test_restore_quarantines_fenced_leases_and_rotates_epoch(self):
+        old_epoch = self.repository.rows(
+            "SELECT authority_epoch FROM authority_state"
+        )[0][0]
+        self.repository.connection.execute(
+            "INSERT INTO fenced_leases VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "lease-1", "host-a", "profile-a", 1, "identity-a", "owner-a",
+                old_epoch, 1, "idem-1", "ACQUIRED",
+                "2026-09-09T10:00:00+00:00", "2026-09-09T10:00:00+00:00",
+                "2026-09-09T10:05:00+00:00", None,
+            ),
+        )
+        backup, _manifest = self.repository.backup_to(
+            backup_directory(self.runtime) / "fenced.sqlite3"
+        )
+        self.repository.close()
+
+        self.repository = OperationalSQLiteRepository.restore_from(self.runtime, backup)
+        state = self.repository.rows(
+            "SELECT authority_epoch, fence_counter, quarantined FROM authority_state"
+        )[0]
+        lease = self.repository.rows(
+            "SELECT state, release_reason FROM fenced_leases WHERE lease_id='lease-1'"
+        )[0]
+        self.assertNotEqual(state[0], old_epoch)
+        self.assertEqual(tuple(state[1:]), (0, 1))
+        self.assertEqual(tuple(lease), ("QUARANTINED", "operational_restore"))
 
     def test_restore_rejects_valid_but_wrong_schema_without_replacing(self):
         backup, manifest = self.repository.backup_to(

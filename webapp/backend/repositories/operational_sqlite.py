@@ -5,17 +5,16 @@ imported by Flask routes, the scheduler, or the Phase 3 immutable generation
 reader. The exact operational path is guarded so a P3 generation cannot be
 opened for writes accidentally.
 """
-from contextlib import contextmanager
-from datetime import datetime, timezone
 import hashlib
 import json
 import os
-from pathlib import Path
 import secrets
 import sqlite3
+from contextlib import contextmanager
+from datetime import datetime, timezone
+from pathlib import Path
 
-
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 OPERATIONAL_FILENAME = "p4_operational.sqlite3"
 OPERATIONAL_DIRNAME = "operational"
 BACKUP_DIRNAME = "backups"
@@ -60,6 +59,38 @@ CREATE TABLE IF NOT EXISTS leases (
   expires_at TEXT NOT NULL,
   release_reason TEXT
 );
+
+CREATE TABLE IF NOT EXISTS authority_state (
+  singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+  authority_epoch TEXT NOT NULL,
+  fence_counter INTEGER NOT NULL CHECK (fence_counter >= 0),
+  quarantined INTEGER NOT NULL CHECK (quarantined IN (0, 1))
+);
+
+CREATE TABLE IF NOT EXISTS fenced_leases (
+  lease_id TEXT PRIMARY KEY,
+  host_id TEXT NOT NULL,
+  profile_id TEXT NOT NULL,
+  binding_generation INTEGER NOT NULL CHECK (binding_generation > 0),
+  verified_identity_ref TEXT NOT NULL,
+  owner_id TEXT NOT NULL,
+  authority_epoch TEXT NOT NULL,
+  fence_counter INTEGER NOT NULL CHECK (fence_counter > 0),
+  idempotency_key TEXT NOT NULL UNIQUE,
+  state TEXT NOT NULL CHECK
+    (state IN ('ACQUIRED','HEARTBEATING','RELEASED','EXPIRED','QUARANTINED')),
+  acquired_at TEXT NOT NULL,
+  heartbeat_at TEXT NOT NULL,
+  expires_at TEXT NOT NULL,
+  release_reason TEXT
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS fenced_live_scope_idx
+  ON fenced_leases(host_id, profile_id, binding_generation, verified_identity_ref)
+  WHERE state IN ('ACQUIRED', 'HEARTBEATING');
+
+CREATE UNIQUE INDEX IF NOT EXISTS fenced_identity_idx
+  ON fenced_leases(authority_epoch, fence_counter);
 
 CREATE TABLE IF NOT EXISTS checkpoints (
   checkpoint_id TEXT PRIMARY KEY,
@@ -121,6 +152,10 @@ class OperationalTransactionError(RuntimeError):
 
 def _utc_now():
     return datetime.now(timezone.utc).isoformat()
+
+
+def _new_authority_epoch():
+    return secrets.token_hex(16)
 
 
 def _resolved(path):
@@ -249,6 +284,23 @@ def _expected_schema_identity():
 EXPECTED_SCHEMA_IDENTITY = _expected_schema_identity()
 
 
+def _expected_legacy_schema_identity():
+    connection = sqlite3.connect(":memory:")
+    try:
+        connection.executescript(SCHEMA_SQL)
+        connection.execute("DROP INDEX fenced_identity_idx")
+        connection.execute("DROP INDEX fenced_live_scope_idx")
+        connection.execute("DROP TABLE fenced_leases")
+        connection.execute("DROP TABLE authority_state")
+        connection.execute("PRAGMA foreign_keys = ON")
+        return _schema_identity(connection)
+    finally:
+        connection.close()
+
+
+EXPECTED_LEGACY_SCHEMA_IDENTITY = _expected_legacy_schema_identity()
+
+
 def _integrity_ok(connection):
     result = connection.execute("PRAGMA integrity_check").fetchone()
     if not result or result[0] != "ok":
@@ -299,6 +351,12 @@ class OperationalSQLiteRepository:
                     "INSERT INTO schema_meta(key, value) VALUES (?, ?)",
                     ("schema_checksum", SCHEMA_CHECKSUM),
                 )
+                connection.execute(
+                    "INSERT INTO authority_state "
+                    "(singleton, authority_epoch, fence_counter, quarantined) "
+                    "VALUES (1, ?, 0, 0)",
+                    (_new_authority_epoch(),),
+                )
         except Exception:
             connection.close()
             try:
@@ -318,6 +376,7 @@ class OperationalSQLiteRepository:
             raise OperationalPathError("operational database does not exist")
         repository = cls(cls._connect(path), runtime_dir)
         try:
+            repository._migrate_schema()
             repository._validate_schema()
         except Exception:
             repository.close()
@@ -333,6 +392,7 @@ class OperationalSQLiteRepository:
             raise OperationalPathError("operational database does not exist")
         repository = cls(cls._connect(checked), runtime_dir)
         try:
+            repository._migrate_schema()
             repository._validate_schema()
         except Exception:
             repository.close()
@@ -356,6 +416,67 @@ class OperationalSQLiteRepository:
             raise OperationalSchemaError("actual operational schema does not match expected schema")
         if not _integrity_ok(self.connection):
             raise OperationalIntegrityError("operational SQLite integrity check failed")
+
+    def _migrate_schema(self):
+        try:
+            values = dict(
+                self.connection.execute(
+                    "SELECT key, value FROM schema_meta"
+                ).fetchall()
+            )
+        except sqlite3.DatabaseError as error:
+            raise OperationalSchemaError("schema metadata is missing") from error
+        if values.get("schema_version") != "1":
+            return
+        if _schema_identity(self.connection) != EXPECTED_LEGACY_SCHEMA_IDENTITY:
+            raise OperationalSchemaError("legacy operational schema is not trusted")
+        if not _integrity_ok(self.connection):
+            raise OperationalIntegrityError("legacy operational SQLite integrity check failed")
+        with self.transaction():
+            self.connection.execute(
+                "CREATE TABLE IF NOT EXISTS authority_state ( "
+                "singleton INTEGER PRIMARY KEY CHECK (singleton = 1), "
+                "authority_epoch TEXT NOT NULL, "
+                "fence_counter INTEGER NOT NULL CHECK (fence_counter >= 0), "
+                "quarantined INTEGER NOT NULL CHECK (quarantined IN (0, 1)) )"
+            )
+            self.connection.execute(
+                "CREATE TABLE IF NOT EXISTS fenced_leases ( "
+                "lease_id TEXT PRIMARY KEY, host_id TEXT NOT NULL, "
+                "profile_id TEXT NOT NULL, "
+                "binding_generation INTEGER NOT NULL CHECK (binding_generation > 0), "
+                "verified_identity_ref TEXT NOT NULL, owner_id TEXT NOT NULL, "
+                "authority_epoch TEXT NOT NULL, "
+                "fence_counter INTEGER NOT NULL CHECK (fence_counter > 0), "
+                "idempotency_key TEXT NOT NULL UNIQUE, "
+                "state TEXT NOT NULL CHECK (state IN "
+                "('ACQUIRED','HEARTBEATING','RELEASED','EXPIRED','QUARANTINED')), "
+                "acquired_at TEXT NOT NULL, heartbeat_at TEXT NOT NULL, "
+                "expires_at TEXT NOT NULL, release_reason TEXT )"
+            )
+            self.connection.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS fenced_live_scope_idx ON fenced_leases("
+                "host_id, profile_id, binding_generation, verified_identity_ref) "
+                "WHERE state IN ('ACQUIRED', 'HEARTBEATING')"
+            )
+            self.connection.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS fenced_identity_idx ON fenced_leases("
+                "authority_epoch, fence_counter)"
+            )
+            self.connection.execute(
+                "INSERT INTO authority_state "
+                "(singleton, authority_epoch, fence_counter, quarantined) "
+                "VALUES (1, ?, 0, 0)",
+                (_new_authority_epoch(),),
+            )
+            self.connection.execute(
+                "UPDATE schema_meta SET value=? WHERE key='schema_version'",
+                (str(SCHEMA_VERSION),),
+            )
+            self.connection.execute(
+                "UPDATE schema_meta SET value=? WHERE key='schema_checksum'",
+                (SCHEMA_CHECKSUM,),
+            )
 
     @contextmanager
     def transaction(self, immediate=True):
@@ -535,7 +656,23 @@ class OperationalSQLiteRepository:
                 temporary.unlink()
             except FileNotFoundError:
                 pass
-        return cls.open(runtime_dir)
+        repository = cls.open(runtime_dir)
+        repository.quarantine_restored_authority()
+        return repository
+
+    def quarantine_restored_authority(self):
+        """Invalidate restored authority rows and require coordinator activation."""
+        with self.transaction():
+            self.connection.execute(
+                "UPDATE authority_state SET authority_epoch=?, fence_counter=0, "
+                "quarantined=1 WHERE singleton=1",
+                (_new_authority_epoch(),),
+            )
+            self.connection.execute(
+                "UPDATE fenced_leases SET state='QUARANTINED', "
+                "release_reason='operational_restore' "
+                "WHERE state IN ('ACQUIRED', 'HEARTBEATING')"
+            )
 
     def rows(self, query, args=()):
         return self.connection.execute(query, args).fetchall()

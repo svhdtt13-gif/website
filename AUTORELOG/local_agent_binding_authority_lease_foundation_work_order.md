@@ -360,7 +360,7 @@ must explicitly confirm:
 - this slice's eligibility/acquisition path has exactly zero remote dispatch;
 - every mismatch is fail-closed;
 - no ACTIVE/runtime/scheduler/remote control is included;
-- the twelve implementation evidence groups above are sufficient.
+- the thirteen implementation evidence groups above are sufficient.
 
 Until approval is recorded, do not create the implementation branch, edit
 runtime code, open P4 Slice 1B, or change the existing ownership model.

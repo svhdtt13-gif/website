@@ -20,6 +20,11 @@ from services.binding_authority_types import (
 )
 
 _REFERENCE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,199}\Z")
+_SENSITIVE_REFERENCE = re.compile(
+    r"(?i)(?:access[_-]?token|authorization|bearer|cookie|credential|jwt|"
+    r"password|payload|raw[_-]?data|secret|session|token)"
+)
+_JWT_REFERENCE = re.compile(r"[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\Z")
 
 
 class AuthorityBoundTargetService:
@@ -243,7 +248,12 @@ class AuthorityBoundTargetService:
 
     @staticmethod
     def _validate_reference(value, label, correlation_id):
-        if not isinstance(value, str) or not _REFERENCE.fullmatch(value):
+        if (
+            not isinstance(value, str)
+            or not _REFERENCE.fullmatch(value)
+            or _SENSITIVE_REFERENCE.search(value)
+            or _JWT_REFERENCE.fullmatch(value)
+        ):
             raise _reject(correlation_id, label + "_invalid")
 
     @staticmethod

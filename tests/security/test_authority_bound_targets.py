@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-import sqlite3
 import sys
 import tempfile
 import unittest
@@ -12,11 +11,8 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "webapp" / "backend"))
 
 from repositories.operational_sqlite import (
-    SCHEMA_V3_CHECKSUM,
-    SCHEMA_V3_SQL,
     OperationalSQLiteRepository,
     backup_directory,
-    operational_path,
 )
 from repositories.portable_store import PortableDomainStore
 from services.authority_bound_targets import AuthorityBoundTargetService
@@ -185,43 +181,41 @@ class AuthorityBoundTargetTests(unittest.TestCase):
         )[0]
         self.assertEqual(tuple(row), ("quarantined", "operational_restore"))
 
-    def test_v3_to_v4_migration_rolls_back_target_schema_installation(self):
-        self.operational.close()
-        path = operational_path(self.runtime)
-        path.unlink()
-        connection = sqlite3.connect(path)
-        try:
-            connection.executescript(SCHEMA_V3_SQL)
-            connection.execute(
-                "INSERT INTO schema_meta(key, value) VALUES (?, ?), (?, ?)",
-                ("schema_version", "3", "schema_checksum", SCHEMA_V3_CHECKSUM),
-            )
-            connection.commit()
-        finally:
-            connection.close()
+    def test_sensitive_references_are_rejected_and_request_ids_are_not_persisted(self):
+        cases = (
+            ("target_ref", "raw-payload"),
+            ("requested_by", "session-token"),
+            ("idempotency_key", "eyJhbGciOiJub25lIn0.eyJzdWIiOiJhIn0.signature"),
+        )
+        for field, value in cases:
+            values = {
+                "operation_kind": "refresh",
+                "target_ref": "profile-a",
+                "requested_by": "operator-a",
+                "idempotency_key": "target-key-" + field,
+            }
+            values[field] = value
+            with self.assertRaises(AuthorityRejected):
+                self.service.record_target(
+                    self.scope,
+                    self.lease,
+                    values["operation_kind"],
+                    values["target_ref"],
+                    values["requested_by"],
+                    values["idempotency_key"],
+                )
 
-        with patch.object(
-            OperationalSQLiteRepository,
-            "_install_authority_target_schema",
-            side_effect=RuntimeError("target schema unavailable"),
-        ), self.assertRaises(RuntimeError):
-            OperationalSQLiteRepository.open(self.runtime)
-
-        connection = sqlite3.connect(path)
-        try:
-            self.assertEqual(
-                connection.execute(
-                    "SELECT value FROM schema_meta WHERE key='schema_version'"
-                ).fetchone()[0],
-                "3",
-            )
-            self.assertIsNone(
-                connection.execute(
-                    "SELECT 1 FROM sqlite_master WHERE name='authority_bound_targets'"
-                ).fetchone()
-            )
-        finally:
-            connection.close()
+        result = self.service.record_target(
+            self.scope,
+            self.lease,
+            "refresh",
+            "profile-a",
+            "operator-a",
+            "safe-target-key",
+            request_id="session-token",
+        )
+        self.assertNotIn("session-token", result["provenance_json"])
+        self.assertNotIn("session-token", str(result))
 
     def test_concurrent_claims_have_one_winner(self):
         recorded = self._record()

@@ -15,6 +15,7 @@ sys.path.insert(0, str(ROOT / "webapp" / "backend"))
 from repositories.portable_store import (
     SCHEMA_V2_CHECKSUM,
     SCHEMA_V2_SQL,
+    SCHEMA_V3_CHECKSUM,
     SCHEMA_VERSION,
     BindingError,
     PortableDomainStore,
@@ -128,6 +129,88 @@ class PortableDomainStoreTests(unittest.TestCase):
             )
         finally:
             migrated.close()
+
+    def test_v3_migration_preserves_identity_but_does_not_infer_revision(self):
+        self.store.close()
+        self.path.unlink()
+        self.create_v2_fixture()
+        connection = sqlite3.connect(self.path)
+        try:
+            connection.execute(
+                "ALTER TABLE remote_profiles ADD COLUMN verified_identity_ref TEXT"
+            )
+            connection.execute(
+                "UPDATE remote_profiles SET verified_identity_ref='identity-a' "
+                "WHERE profile_id='profile-a'"
+            )
+            connection.execute(
+                "UPDATE schema_meta SET value=? WHERE key='schema_version'",
+                ("3",),
+            )
+            connection.execute(
+                "UPDATE schema_meta SET value=? WHERE key='schema_checksum'",
+                (SCHEMA_V3_CHECKSUM,),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        migrated = PortableDomainStore.open(self.path)
+        try:
+            snapshot = migrated.binding_snapshot("host-a", "profile-a", 1)
+            self.assertEqual(snapshot["verified_identity_ref"], "identity-a")
+            self.assertIsNone(snapshot["verified_identity_revision"])
+            self.assertEqual(
+                migrated.connection.execute(
+                    "SELECT COUNT(*) FROM profile_verified_identity_events"
+                ).fetchone()[0],
+                0,
+            )
+        finally:
+            migrated.close()
+
+    def test_v3_checksum_is_frozen_before_event_migration(self):
+        self.assertEqual(
+            SCHEMA_V3_CHECKSUM,
+            "0d71d4192a24ced2e5a544a663c1b2b3097474817d5aa3cb4dc630ca462d1b71",
+        )
+
+    def test_verified_identity_events_are_append_only(self):
+        self.seed("profile-a", "host-a", "account-a")
+        self.store.record_verified_identity("profile-a", "identity-a", NOW)
+
+        with self.assertRaises(BindingError), self.store.transaction(immediate=True):
+            self.store.connection.execute(
+                "UPDATE profile_verified_identity_events "
+                "SET verified_identity_ref='identity-b' "
+                "WHERE profile_id='profile-a' AND revision=1"
+            )
+        with self.assertRaises(BindingError), self.store.transaction(immediate=True):
+            self.store.connection.execute(
+                "INSERT OR REPLACE INTO profile_verified_identity_events "
+                "(profile_id, revision, verified_identity_ref, verified_at) "
+                "VALUES ('profile-a', 1, 'identity-b', ?) ",
+                (NOW,),
+            )
+        with self.assertRaises(BindingError), self.store.transaction(immediate=True):
+            self.store.connection.execute(
+                "DELETE FROM profile_verified_identity_events "
+                "WHERE profile_id='profile-a' AND revision=1"
+            )
+
+    def test_fresh_create_removes_artifact_when_migration_fails(self):
+        self.store.close()
+        self.path.unlink()
+        failure = sqlite3.DatabaseError("bootstrap failure")
+
+        def fail_bootstrap(connection):
+            raise failure
+
+        with patch.dict(
+            "repositories.portable_store.MIGRATIONS", {4: fail_bootstrap}
+        ), self.assertRaises(sqlite3.DatabaseError):
+            PortableDomainStore.create(self.path)
+        self.assertFalse(self.path.exists())
 
     def test_tampered_v2_schema_fails_before_identity_migration(self):
         self.store.close()
@@ -268,6 +351,45 @@ class PortableDomainStoreTests(unittest.TestCase):
         finally:
             connection.close()
 
+    def test_v4_migration_rolls_back_after_v3_step(self):
+        self.store.close()
+        self.path.unlink()
+        self.create_v2_fixture()
+
+        def fail_event_migration(connection):
+            connection.execute(
+                "CREATE TABLE transient_identity_event (value TEXT NOT NULL)"
+            )
+            raise sqlite3.DatabaseError("event migration failure")
+
+        with patch.dict(
+            "repositories.portable_store.MIGRATIONS", {4: fail_event_migration}
+        ), self.assertRaises(sqlite3.DatabaseError):
+            PortableDomainStore.open(self.path)
+
+        connection = sqlite3.connect(self.path)
+        try:
+            self.assertEqual(
+                connection.execute(
+                    "SELECT value FROM schema_meta WHERE key='schema_version'"
+                ).fetchone()[0],
+                "2",
+            )
+            self.assertIsNone(
+                connection.execute(
+                    "SELECT 1 FROM pragma_table_info('remote_profiles') "
+                    "WHERE name='verified_identity_ref'"
+                ).fetchone()
+            )
+            self.assertIsNone(
+                connection.execute(
+                    "SELECT 1 FROM sqlite_master "
+                    "WHERE name='transient_identity_event'"
+                ).fetchone()
+            )
+        finally:
+            connection.close()
+
     def test_verified_identity_requires_explicit_non_secret_reference(self):
         with self.assertRaises(BindingError):
             self.store.record_verified_identity("missing", "identity-a", NOW)
@@ -289,6 +411,30 @@ class PortableDomainStoreTests(unittest.TestCase):
                 ("profile-a",),
             ).fetchone()[0],
             "identity-a",
+        )
+
+    def test_verified_identity_events_have_independent_monotonic_revision(self):
+        self.seed("profile-a", "host-a", "account-a")
+
+        first_revision = self.store.record_verified_identity(
+            "profile-a", "identity-a", NOW
+        )
+        second_revision = self.store.record_verified_identity(
+            "profile-a", "identity-a", NOW
+        )
+
+        self.assertEqual((first_revision, second_revision), (1, 2))
+        snapshot = self.store.binding_snapshot("host-a", "profile-a", 1)
+        self.assertEqual(snapshot["verified_identity_revision"], 2)
+        self.assertEqual(
+            [
+                tuple(row)
+                for row in self.store.connection.execute(
+                    "SELECT profile_id, revision, verified_identity_ref "
+                    "FROM profile_verified_identity_events ORDER BY revision"
+                )
+            ],
+            [("profile-a", 1, "identity-a"), ("profile-a", 2, "identity-a")],
         )
 
     def test_schema_contains_no_runtime_or_secret_authority_fields(self):

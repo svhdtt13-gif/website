@@ -13,11 +13,56 @@ from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 STORE_KIND = "portable_domain_store"
 DB_FILENAME = "portable_domain.sqlite3"
 
-SCHEMA_SQL = """
+IDENTITY_EVENTS_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS profile_verified_identity_events (
+    profile_id TEXT NOT NULL REFERENCES remote_profiles(profile_id),
+    revision INTEGER NOT NULL CHECK (revision > 0),
+    verified_identity_ref TEXT NOT NULL,
+    verified_at TEXT NOT NULL,
+    PRIMARY KEY(profile_id, revision)
+);
+"""
+
+IDENTITY_EVENTS_UPDATE_TRIGGER_SQL = """
+CREATE TRIGGER IF NOT EXISTS profile_verified_identity_events_no_update
+BEFORE UPDATE ON profile_verified_identity_events
+BEGIN
+    SELECT RAISE(ABORT, 'verified identity events are append-only');
+END;
+"""
+
+IDENTITY_EVENTS_INSERT_TRIGGER_SQL = """
+CREATE TRIGGER IF NOT EXISTS profile_verified_identity_events_no_replace
+BEFORE INSERT ON profile_verified_identity_events
+WHEN EXISTS (
+    SELECT 1 FROM profile_verified_identity_events
+    WHERE profile_id=NEW.profile_id AND revision=NEW.revision
+)
+BEGIN
+    SELECT RAISE(ABORT, 'verified identity events are append-only');
+END;
+"""
+
+IDENTITY_EVENTS_DELETE_TRIGGER_SQL = """
+CREATE TRIGGER IF NOT EXISTS profile_verified_identity_events_no_delete
+BEFORE DELETE ON profile_verified_identity_events
+BEGIN
+    SELECT RAISE(ABORT, 'verified identity events are append-only');
+END;
+"""
+
+IDENTITY_EVENTS_SQL = (
+    IDENTITY_EVENTS_TABLE_SQL
+    + IDENTITY_EVENTS_UPDATE_TRIGGER_SQL
+    + IDENTITY_EVENTS_INSERT_TRIGGER_SQL
+    + IDENTITY_EVENTS_DELETE_TRIGGER_SQL
+)
+
+SCHEMA_SQL = f"""
 CREATE TABLE IF NOT EXISTS schema_meta (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
@@ -118,14 +163,18 @@ CREATE TABLE IF NOT EXISTS profile_audit_events (
     source_ref TEXT NOT NULL,
     PRIMARY KEY(profile_id, event_id)
 );
+
+{IDENTITY_EVENTS_SQL}
 """
 
 def _canonical_sql(sql: str) -> str:
     return " ".join(line.strip() for line in sql.splitlines() if line.strip())
 
 
+SCHEMA_V3_SQL = SCHEMA_SQL.replace(IDENTITY_EVENTS_SQL, "")
 SCHEMA_CHECKSUM = hashlib.sha256(_canonical_sql(SCHEMA_SQL).encode()).hexdigest()
-SCHEMA_V2_SQL = SCHEMA_SQL.replace("    verified_identity_ref TEXT,\n", "")
+SCHEMA_V3_CHECKSUM = hashlib.sha256(_canonical_sql(SCHEMA_V3_SQL).encode()).hexdigest()
+SCHEMA_V2_SQL = SCHEMA_V3_SQL.replace("    verified_identity_ref TEXT,\n", "")
 if SCHEMA_V2_SQL == SCHEMA_SQL:
     raise RuntimeError("portable v2 schema source is missing its v3 delta")
 SCHEMA_V2_CHECKSUM = hashlib.sha256(_canonical_sql(SCHEMA_V2_SQL).encode()).hexdigest()
@@ -187,6 +236,7 @@ def _expected_schema_identity(schema_sql: str) -> str:
 
 
 SCHEMA_V2_IDENTITY = _expected_schema_identity(SCHEMA_V2_SQL)
+SCHEMA_V3_IDENTITY = _expected_schema_identity(SCHEMA_V3_SQL)
 SCHEMA_IDENTITY = _expected_schema_identity(SCHEMA_SQL)
 
 
@@ -206,6 +256,26 @@ def _expected_migrated_v3_identity() -> str:
 MIGRATED_V3_IDENTITY = _expected_migrated_v3_identity()
 
 
+def _expected_migrated_v4_identity() -> str:
+    connection = sqlite3.connect(":memory:")
+    try:
+        connection.executescript(SCHEMA_V2_SQL)
+        connection.execute(
+            "ALTER TABLE remote_profiles ADD COLUMN verified_identity_ref TEXT"
+        )
+        connection.execute(IDENTITY_EVENTS_TABLE_SQL)
+        connection.execute(IDENTITY_EVENTS_UPDATE_TRIGGER_SQL)
+        connection.execute(IDENTITY_EVENTS_INSERT_TRIGGER_SQL)
+        connection.execute(IDENTITY_EVENTS_DELETE_TRIGGER_SQL)
+        connection.execute("PRAGMA foreign_keys = ON")
+        return _schema_identity(connection)
+    finally:
+        connection.close()
+
+
+MIGRATED_V4_IDENTITY = _expected_migrated_v4_identity()
+
+
 def _migrate_v3(connection: sqlite3.Connection) -> None:
     columns = {
         row[1]
@@ -215,11 +285,21 @@ def _migrate_v3(connection: sqlite3.Connection) -> None:
         connection.execute(
             "ALTER TABLE remote_profiles ADD COLUMN verified_identity_ref TEXT"
         )
+
+
+def _migrate_v4(connection: sqlite3.Connection) -> None:
+    connection.execute(IDENTITY_EVENTS_TABLE_SQL)
+    connection.execute(IDENTITY_EVENTS_UPDATE_TRIGGER_SQL)
+    connection.execute(IDENTITY_EVENTS_INSERT_TRIGGER_SQL)
+    connection.execute(IDENTITY_EVENTS_DELETE_TRIGGER_SQL)
+
+
 MIGRATIONS: dict[int, str | Callable[[sqlite3.Connection], None]] = {
     1: SCHEMA_SQL,
     2: "CREATE UNIQUE INDEX IF NOT EXISTS one_active_host_per_profile "
        "ON host_profile_bindings(profile_id) WHERE state = 'ACTIVE';",
     3: _migrate_v3,
+    4: _migrate_v4,
 }
 
 
@@ -265,6 +345,17 @@ def _json(value: object) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
+def _execute_sql_script(connection: sqlite3.Connection, script: str) -> None:
+    statement = ""
+    for line in script.splitlines(keepends=True):
+        statement += line
+        if sqlite3.complete_statement(statement):
+            connection.execute(statement)
+            statement = ""
+    if statement.strip():
+        raise sqlite3.ProgrammingError("incomplete SQL migration statement")
+
+
 class PortableDomainStore:
     """Small repository with profile-scoped signatures for every domain read."""
 
@@ -281,8 +372,13 @@ class PortableDomainStore:
             raise PortableStoreError("portable store path must be new")
         connection = sqlite3.connect(target)
         store = cls(connection, target)
-        store._configure()
-        store.migrate()
+        try:
+            store._configure()
+            store.migrate()
+        except Exception:
+            store.close()
+            target.unlink(missing_ok=True)
+            raise
         return store
 
     @classmethod
@@ -334,39 +430,33 @@ class PortableDomainStore:
             raise SchemaError("portable schema version is newer than this code")
         if current == 1:
             raise SchemaError("portable schema version 1 is not supported")
-        for target in range(current + 1, SCHEMA_VERSION + 1):
+        if current < SCHEMA_VERSION:
             with self.transaction(immediate=True):
-                if target == SCHEMA_VERSION and current == 2:
+                if current == 2:
                     self._verify_v2_before_migration()
-                migration = MIGRATIONS[target]
-                if callable(migration):
-                    migration(self.connection)
-                else:
-                    self.connection.executescript(migration)
-                self.connection.execute(
-                    "INSERT OR REPLACE INTO schema_meta(key, value) VALUES ('store_kind', ?)",
-                    (STORE_KIND,),
-                )
-                self.connection.execute(
-                    "INSERT OR REPLACE INTO schema_meta(key, value) VALUES ('schema_version', ?)",
-                    (str(target),),
-                )
-                self.connection.execute(
-                    "INSERT OR REPLACE INTO schema_meta(key, value) VALUES ('schema_checksum', ?)",
-                    (SCHEMA_CHECKSUM,),
-                )
-                if target == SCHEMA_VERSION:
-                    self._verify()
+                elif current == 3:
+                    self._verify_v3_before_migration()
+                for target in range(current + 1, SCHEMA_VERSION + 1):
+                    migration = MIGRATIONS[target]
+                    if callable(migration):
+                        migration(self.connection)
+                    else:
+                        _execute_sql_script(self.connection, migration)
+                    self.connection.execute(
+                        "INSERT OR REPLACE INTO schema_meta(key, value) VALUES ('store_kind', ?)",
+                        (STORE_KIND,),
+                    )
+                    self.connection.execute(
+                        "INSERT OR REPLACE INTO schema_meta(key, value) VALUES ('schema_version', ?)",
+                        (str(target),),
+                    )
+                    self.connection.execute(
+                        "INSERT OR REPLACE INTO schema_meta(key, value) VALUES ('schema_checksum', ?)",
+                        (SCHEMA_CHECKSUM,),
+                    )
+                self._verify()
         if current == SCHEMA_VERSION:
-            with self.transaction():
-                self.connection.execute(
-                    "INSERT OR IGNORE INTO schema_meta(key, value) VALUES ('store_kind', ?)",
-                    (STORE_KIND,),
-                )
-                self.connection.execute(
-                    "INSERT OR IGNORE INTO schema_meta(key, value) VALUES ('schema_checksum', ?)",
-                    (SCHEMA_CHECKSUM,),
-                )
+            self._verify()
         self._verify()
 
     def _verify(self) -> None:
@@ -377,9 +467,7 @@ class PortableDomainStore:
             raise SchemaError("unsupported portable schema version")
         if meta.get("schema_checksum") != SCHEMA_CHECKSUM:
             raise SchemaError("portable store schema checksum mismatch")
-        if _schema_identity(self.connection) not in {
-            SCHEMA_IDENTITY, MIGRATED_V3_IDENTITY
-        }:
+        if _schema_identity(self.connection) not in {SCHEMA_IDENTITY, MIGRATED_V4_IDENTITY}:
             raise SchemaError("portable store schema identity mismatch")
         if self.connection.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
             raise SchemaError("portable store integrity check failed")
@@ -396,6 +484,21 @@ class PortableDomainStore:
             raise SchemaError("portable v2 schema identity mismatch")
         if self.connection.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
             raise SchemaError("portable v2 integrity check failed")
+
+    def _verify_v3_before_migration(self) -> None:
+        meta = dict(self.connection.execute("SELECT key, value FROM schema_meta"))
+        if (
+            meta.get("store_kind") != STORE_KIND
+            or meta.get("schema_version") != "3"
+            or meta.get("schema_checksum") != SCHEMA_V3_CHECKSUM
+        ):
+            raise SchemaError("portable v3 metadata is not trusted")
+        if _schema_identity(self.connection) not in {
+            SCHEMA_V3_IDENTITY, MIGRATED_V3_IDENTITY
+        }:
+            raise SchemaError("portable v3 schema identity mismatch")
+        if self.connection.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+            raise SchemaError("portable v3 integrity check failed")
 
     @contextmanager
     def transaction(self, immediate: bool = False) -> Iterator[sqlite3.Connection]:
@@ -487,7 +590,7 @@ class PortableDomainStore:
 
     def record_verified_identity(
         self, profile_id: str, verified_identity_ref: str, now: str
-    ) -> None:
+    ) -> int:
         """Persist only an explicit non-secret remote identity proof reference."""
         profile_id = _profile_id(profile_id)
         verified_identity_ref = _safe_reference(
@@ -503,6 +606,17 @@ class PortableDomainStore:
                 raise BindingError("unknown profile_id")
             if profile[0] == verified_identity_ref:
                 raise BindingError("verified identity must not reuse account_ref")
+            revision = self.connection.execute(
+                "SELECT COALESCE(MAX(revision), 0) + 1 "
+                "FROM profile_verified_identity_events WHERE profile_id=?",
+                (profile_id,),
+            ).fetchone()[0]
+            self.connection.execute(
+                "INSERT INTO profile_verified_identity_events "
+                "(profile_id, revision, verified_identity_ref, verified_at) "
+                "VALUES (?, ?, ?, ?)",
+                (profile_id, revision, verified_identity_ref, now),
+            )
             updated = self.connection.execute(
                 "UPDATE remote_profiles SET verified_identity_ref=?, updated_at=? "
                 "WHERE profile_id=?",
@@ -510,6 +624,7 @@ class PortableDomainStore:
             ).rowcount
             if updated != 1:
                 raise BindingError("verified identity could not be recorded")
+            return int(revision)
 
     def ensure_profile(self, profile_id: str, display_name: str, account_ref: str,
                        status: str, now: str) -> None:
@@ -562,10 +677,16 @@ class PortableDomainStore:
             "SELECT b.binding_id, b.host_id, b.profile_id, b.binding_generation, "
             "b.state, b.updated_at AS binding_updated_at, h.origin_ref, "
             "p.account_ref, p.verified_identity_ref, p.status, "
-            "p.updated_at AS profile_updated_at "
+            "p.updated_at AS profile_updated_at, "
+            "identity_event.verified_identity_ref AS verified_identity_event_ref, "
+            "identity_event.revision AS verified_identity_revision "
             "FROM host_profile_bindings AS b "
             "JOIN hosts AS h ON h.host_id=b.host_id "
             "JOIN remote_profiles AS p ON p.profile_id=b.profile_id "
+            "LEFT JOIN profile_verified_identity_events AS identity_event "
+            "ON identity_event.profile_id=p.profile_id AND identity_event.revision=( "
+            "SELECT MAX(revision) FROM profile_verified_identity_events "
+            "WHERE profile_id=p.profile_id) "
             "WHERE b.host_id=? AND b.profile_id=? AND b.binding_generation=?",
             (host_id, profile_id, binding_generation),
         ).fetchall()

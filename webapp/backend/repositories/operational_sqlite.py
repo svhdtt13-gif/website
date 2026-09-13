@@ -602,28 +602,26 @@ class OperationalSQLiteRepository:
                     return
                 self._verify_v2_before_migration(values)
                 self._rebuild_v2_fenced_leases()
+                self._install_authority_target_schema()
                 self.connection.execute(
                     "UPDATE schema_meta SET value=? WHERE key='schema_version'",
                     (str(SCHEMA_VERSION),),
                 )
                 self.connection.execute(
                     "UPDATE schema_meta SET value=? WHERE key='schema_checksum'",
-                    (SCHEMA_V3_CHECKSUM,),
+                    (SCHEMA_CHECKSUM,),
                 )
-            version = "3"
+            return
         if version == "3":
-            values = dict(
-                self.connection.execute(
-                    "SELECT key, value FROM schema_meta"
-                ).fetchall()
-            )
-            if values.get("schema_checksum") != SCHEMA_V3_CHECKSUM:
-                raise OperationalSchemaError("operational v3 schema checksum mismatch")
-            if _schema_identity(self.connection) != EXPECTED_V3_SCHEMA_IDENTITY:
-                raise OperationalSchemaError("operational v3 schema is not trusted")
-            if not _integrity_ok(self.connection):
-                raise OperationalIntegrityError("operational v3 SQLite integrity check failed")
             with self.transaction():
+                values = dict(
+                    self.connection.execute(
+                        "SELECT key, value FROM schema_meta"
+                    ).fetchall()
+                )
+                if values.get("schema_version") != "3":
+                    return
+                self._verify_v3_before_migration(values)
                 self._install_authority_target_schema()
                 self.connection.execute(
                     "UPDATE schema_meta SET value=? WHERE key='schema_version'",
@@ -705,6 +703,14 @@ class OperationalSQLiteRepository:
             raise OperationalSchemaError("operational v2 schema is not trusted")
         if not _integrity_ok(self.connection):
             raise OperationalIntegrityError("operational v2 SQLite integrity check failed")
+
+    def _verify_v3_before_migration(self, values):
+        if values.get("schema_checksum") != SCHEMA_V3_CHECKSUM:
+            raise OperationalSchemaError("operational v3 schema checksum mismatch")
+        if _schema_identity(self.connection) != EXPECTED_V3_SCHEMA_IDENTITY:
+            raise OperationalSchemaError("operational v3 schema is not trusted")
+        if not _integrity_ok(self.connection):
+            raise OperationalIntegrityError("operational v3 SQLite integrity check failed")
 
     def _rebuild_v2_fenced_leases(self):
         self.connection.execute("DROP INDEX IF EXISTS fenced_live_scope_idx")

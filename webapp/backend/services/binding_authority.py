@@ -61,6 +61,12 @@ class BindingAuthorityCoordinator:
                 "release_reason='coordinator_restart' "
                 "WHERE state IN ('ACQUIRED', 'HEARTBEATING')"
             )
+            self.operational.connection.execute(
+                "UPDATE authority_bound_targets SET status='quarantined', "
+                "claimed_at=NULL, claimed_by=NULL, claim_lease_id=NULL, "
+                "quarantine_reason='coordinator_restart' "
+                "WHERE status IN ('requested', 'claimable', 'claimed')"
+            )
         self.operational.requires_fresh_bootstrap = False
         return FenceIdentity(epoch, 0)
 

@@ -131,7 +131,88 @@ CREATE TABLE IF NOT EXISTS worker_events (
   data_json TEXT NOT NULL
 );
 """
+LEGACY_SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS schema_meta (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS jobs (
+  job_id TEXT PRIMARY KEY,
+  kind TEXT NOT NULL,
+  target_json TEXT NOT NULL,
+  requested_by TEXT NOT NULL,
+  idempotency_key TEXT NOT NULL UNIQUE,
+  parent_job_id TEXT REFERENCES jobs(job_id),
+  status TEXT NOT NULL CHECK (status IN
+    ('queued','claimed','running','dispatched','succeeded','failed','cancelled','unknown')),
+  attempt INTEGER NOT NULL DEFAULT 0,
+  owner_id TEXT,
+  lease_name TEXT,
+  created_at TEXT NOT NULL,
+  claimed_at TEXT,
+  started_at TEXT,
+  dispatched_at TEXT,
+  finished_at TEXT,
+  lease_until TEXT,
+  remote_action_id TEXT,
+  result_json TEXT,
+  error_json TEXT
+);
+
+CREATE INDEX IF NOT EXISTS jobs_status_idx ON jobs(status, created_at);
+CREATE INDEX IF NOT EXISTS jobs_owner_idx ON jobs(owner_id, lease_name, lease_until);
+
+CREATE TABLE IF NOT EXISTS leases (
+  lease_name TEXT PRIMARY KEY,
+  owner_id TEXT NOT NULL,
+  acquired_at TEXT NOT NULL,
+  heartbeat_at TEXT NOT NULL,
+  expires_at TEXT NOT NULL,
+  release_reason TEXT
+);
+
+CREATE TABLE IF NOT EXISTS checkpoints (
+  checkpoint_id TEXT PRIMARY KEY,
+  kind TEXT NOT NULL,
+  p3_generation_id TEXT,
+  p3_source_hash TEXT,
+  active_group TEXT,
+  live_snapshot_hash TEXT,
+  pending_jobs_json TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  data_json TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS manual_overrides (
+  override_id TEXT PRIMARY KEY,
+  target_id TEXT NOT NULL,
+  source TEXT NOT NULL,
+  requested_state TEXT,
+  observed_state TEXT,
+  precedence INTEGER NOT NULL,
+  request_id TEXT,
+  created_at TEXT NOT NULL,
+  expires_at TEXT,
+  resolved_at TEXT,
+  resolution TEXT,
+  evidence_json TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS manual_override_active_idx
+  ON manual_overrides(target_id, resolved_at, expires_at, precedence);
+
+CREATE TABLE IF NOT EXISTS worker_events (
+  event_id TEXT PRIMARY KEY,
+  owner_id TEXT NOT NULL,
+  job_id TEXT REFERENCES jobs(job_id),
+  event_type TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  data_json TEXT NOT NULL
+);
+"""
 SCHEMA_CHECKSUM = hashlib.sha256(SCHEMA_SQL.encode("utf-8")).hexdigest()
+LEGACY_SCHEMA_CHECKSUM = hashlib.sha256(LEGACY_SCHEMA_SQL.encode("utf-8")).hexdigest()
 
 
 class OperationalPathError(ValueError):
@@ -287,11 +368,7 @@ EXPECTED_SCHEMA_IDENTITY = _expected_schema_identity()
 def _expected_legacy_schema_identity():
     connection = sqlite3.connect(":memory:")
     try:
-        connection.executescript(SCHEMA_SQL)
-        connection.execute("DROP INDEX fenced_identity_idx")
-        connection.execute("DROP INDEX fenced_live_scope_idx")
-        connection.execute("DROP TABLE fenced_leases")
-        connection.execute("DROP TABLE authority_state")
+        connection.executescript(LEGACY_SCHEMA_SQL)
         connection.execute("PRAGMA foreign_keys = ON")
         return _schema_identity(connection)
     finally:
@@ -299,6 +376,8 @@ def _expected_legacy_schema_identity():
 
 
 EXPECTED_LEGACY_SCHEMA_IDENTITY = _expected_legacy_schema_identity()
+_ACTIVE_CONNECTIONS = {}
+_BOOTSTRAP_REQUIRED = {}
 
 
 def _integrity_ok(connection):
@@ -311,10 +390,26 @@ def _integrity_ok(connection):
 class OperationalSQLiteRepository:
     """Connection and transaction primitives for the mutable P4 database."""
 
-    def __init__(self, connection, runtime_dir):
+    def __init__(self, connection, runtime_dir, track_lifecycle=True):
         self.connection = connection
         self.runtime_dir = _resolved(runtime_dir)
         self.path = operational_path(runtime_dir)
+        self._track_lifecycle = track_lifecycle
+        self._closed = False
+        if track_lifecycle:
+            _BOOTSTRAP_REQUIRED.setdefault(self.path, True)
+            _ACTIVE_CONNECTIONS[self.path] = _ACTIVE_CONNECTIONS.get(self.path, 0) + 1
+        self._bootstrap_required = _BOOTSTRAP_REQUIRED.get(self.path, False)
+
+    @property
+    def requires_fresh_bootstrap(self):
+        return _BOOTSTRAP_REQUIRED.get(self.path, self._bootstrap_required)
+
+    @requires_fresh_bootstrap.setter
+    def requires_fresh_bootstrap(self, value):
+        self._bootstrap_required = bool(value)
+        if self._track_lifecycle:
+            _BOOTSTRAP_REQUIRED[self.path] = self._bootstrap_required
 
     @staticmethod
     def _connect(path):
@@ -340,9 +435,10 @@ class OperationalSQLiteRepository:
         path.parent.mkdir(parents=True, exist_ok=True)
         backup_directory(runtime_dir).mkdir(parents=True, exist_ok=True)
         connection = cls._connect(path)
+        repository = cls(connection, runtime_dir)
         try:
             connection.executescript(SCHEMA_SQL)
-            with cls(connection, runtime_dir).transaction():
+            with repository.transaction():
                 connection.execute(
                     "INSERT INTO schema_meta(key, value) VALUES (?, ?)",
                     ("schema_version", str(SCHEMA_VERSION)),
@@ -358,13 +454,13 @@ class OperationalSQLiteRepository:
                     (_new_authority_epoch(),),
                 )
         except Exception:
-            connection.close()
+            repository.close()
             try:
                 path.unlink()
             except OSError:
                 pass
             raise
-        repository = cls(connection, runtime_dir)
+        repository.requires_fresh_bootstrap = False
         repository._validate_schema()
         return repository
 
@@ -428,6 +524,8 @@ class OperationalSQLiteRepository:
             raise OperationalSchemaError("schema metadata is missing") from error
         if values.get("schema_version") != "1":
             return
+        if values.get("schema_checksum") != LEGACY_SCHEMA_CHECKSUM:
+            raise OperationalSchemaError("legacy operational schema checksum mismatch")
         if _schema_identity(self.connection) != EXPECTED_LEGACY_SCHEMA_IDENTITY:
             raise OperationalSchemaError("legacy operational schema is not trusted")
         if not _integrity_ok(self.connection):
@@ -630,7 +728,7 @@ class OperationalSQLiteRepository:
         temporary = operational_path(runtime_dir).with_suffix(".restore.tmp")
         temporary.parent.mkdir(parents=True, exist_ok=True)
         try:
-            source_repository = cls(source, runtime_dir)
+            source_repository = cls(source, runtime_dir, track_lifecycle=False)
             source_repository._validate_schema()
             try:
                 temporary.unlink()
@@ -646,8 +744,9 @@ class OperationalSQLiteRepository:
         try:
             candidate = cls._connect(temporary)
             try:
-                candidate_repository = cls(candidate, runtime_dir)
+                candidate_repository = cls(candidate, runtime_dir, track_lifecycle=False)
                 candidate_repository._validate_schema()
+                candidate_repository.quarantine_restored_authority()
             finally:
                 candidate.close()
             os.replace(temporary, operational_path(runtime_dir))
@@ -678,4 +777,14 @@ class OperationalSQLiteRepository:
         return self.connection.execute(query, args).fetchall()
 
     def close(self):
+        if self._closed:
+            return
         self.connection.close()
+        self._closed = True
+        if self._track_lifecycle:
+            count = _ACTIVE_CONNECTIONS[self.path] - 1
+            if count:
+                _ACTIVE_CONNECTIONS[self.path] = count
+            else:
+                del _ACTIVE_CONNECTIONS[self.path]
+                _BOOTSTRAP_REQUIRED[self.path] = True

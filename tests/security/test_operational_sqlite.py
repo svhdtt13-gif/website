@@ -13,9 +13,10 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "webapp" / "backend"))
 
 from repositories.operational_sqlite import (
+    LEGACY_SCHEMA_CHECKSUM,
+    LEGACY_SCHEMA_SQL,
     OPERATIONAL_FILENAME,
     SCHEMA_CHECKSUM,
-    SCHEMA_SQL,
     SCHEMA_VERSION,
     OperationalIntegrityError,
     OperationalPathError,
@@ -36,23 +37,22 @@ class OperationalSQLiteTests(unittest.TestCase):
         self.repository.close()
         self.temp.cleanup()
 
-    def _write_v1_database(self, tampered=False, metadata=True):
+    def _write_v1_database(self, tampered=False, metadata=True, checksum=None):
         self.repository.close()
         path = operational_path(self.runtime)
         path.unlink()
         connection = sqlite3.connect(path)
         try:
-            connection.executescript(SCHEMA_SQL)
-            connection.execute("DROP INDEX fenced_identity_idx")
-            connection.execute("DROP INDEX fenced_live_scope_idx")
-            connection.execute("DROP TABLE fenced_leases")
-            connection.execute("DROP TABLE authority_state")
+            connection.executescript(LEGACY_SCHEMA_SQL)
             if tampered:
                 connection.execute("ALTER TABLE jobs ADD COLUMN tampered TEXT")
             if metadata:
                 connection.execute(
                     "INSERT INTO schema_meta(key, value) VALUES (?, ?), (?, ?)",
-                    ("schema_version", "1", "schema_checksum", "legacy-v1"),
+                    (
+                        "schema_version", "1",
+                        "schema_checksum", checksum or LEGACY_SCHEMA_CHECKSUM,
+                    ),
                 )
             connection.commit()
         finally:
@@ -107,6 +107,10 @@ class OperationalSQLiteTests(unittest.TestCase):
         self.assertEqual(tuple(state[1:]), (0, 0))
 
     def test_v1_operational_database_migrates_to_fenced_schema(self):
+        self.assertEqual(
+            LEGACY_SCHEMA_CHECKSUM,
+            "5c77c441f30684803d55094863b763c7e962a39b20985daf34aedaec96f52609",
+        )
         self._write_v1_database()
 
         self.repository = OperationalSQLiteRepository.open(self.runtime)
@@ -125,6 +129,12 @@ class OperationalSQLiteTests(unittest.TestCase):
 
     def test_tampered_v1_operational_database_fails_closed(self):
         self._write_v1_database(tampered=True)
+
+        with self.assertRaises(OperationalSchemaError):
+            OperationalSQLiteRepository.open(self.runtime)
+
+    def test_wrong_v1_checksum_fails_closed_before_migration(self):
+        self._write_v1_database(checksum="wrong-v1-checksum")
 
         with self.assertRaises(OperationalSchemaError):
             OperationalSQLiteRepository.open(self.runtime)
@@ -186,7 +196,7 @@ class OperationalSQLiteTests(unittest.TestCase):
         manifest.write_text(
             json.dumps({
                 "schema_version": 1,
-                "schema_checksum": "legacy-v1",
+                "schema_checksum": LEGACY_SCHEMA_CHECKSUM,
                 "size": backup.stat().st_size,
                 "sha256": hashlib.sha256(backup.read_bytes()).hexdigest(),
             }) + "\n",

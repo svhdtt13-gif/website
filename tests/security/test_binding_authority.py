@@ -45,7 +45,9 @@ class BindingAuthorityTests(unittest.TestCase):
         portable.add_profile(
             "profile-a", "Profile A", "account-a", "VERIFIED", START.isoformat()
         )
-        portable.record_verified_identity("profile-a", "identity-a", START.isoformat())
+        identity_revision = portable.record_verified_identity(
+            "profile-a", "identity-a", START.isoformat()
+        )
         portable.bind_profile(
             "binding-a", "host-a", "profile-a", "account-a", 1, "ACTIVE", START.isoformat()
         )
@@ -58,7 +60,9 @@ class BindingAuthorityTests(unittest.TestCase):
             self.clock,
             AuthorityConfig(lease_ttl=timedelta(seconds=30)),
         )
-        self.scope = BindingScope("host-a", "profile-a", 1, "identity-a")
+        self.scope = BindingScope(
+            "host-a", "profile-a", 1, "identity-a", identity_revision
+        )
 
     def tearDown(self):
         self.operational.close()
@@ -105,8 +109,31 @@ class BindingAuthorityTests(unittest.TestCase):
             )[0][0],
             "ACQUIRED",
         )
-        self.coordinator.reconcile_expired(old, request_id="expiry-reconcile")
-        current = self.coordinator.acquire(self.scope, "agent-b", "idem-b")
+        with self.assertRaises(AuthorityRejected) as stale_reconcile:
+            self.coordinator.reconcile_expired(
+                old, self.scope, request_id="expiry-reconcile"
+            )
+        self.assertEqual(
+            stale_reconcile.exception.evidence.reason_class,
+            "fresh_verification_required",
+        )
+        portable = PortableDomainStore.open(self.portable_path)
+        revision = portable.record_verified_identity(
+            "profile-a", "identity-a", START.isoformat()
+        )
+        portable.close()
+        fresh_scope = BindingScope("host-a", "profile-a", 1, "identity-a", revision)
+        self.coordinator.reconcile_expired(
+            old, fresh_scope, request_id="expiry-reconcile"
+        )
+        current = self.coordinator.acquire(fresh_scope, "agent-b", "idem-b")
+
+        with self.assertRaises(AuthorityRejected) as stale_scope:
+            self.coordinator.acquire(self.scope, "agent-c", "idem-c")
+        self.assertEqual(
+            stale_scope.exception.evidence.reason_class,
+            "verified_identity_revision_mismatch",
+        )
 
         self.assertEqual(current.fence.authority_epoch, old.fence.authority_epoch)
         self.assertGreater(current.fence.fence_counter, old.fence.fence_counter)
@@ -235,11 +262,82 @@ class BindingAuthorityTests(unittest.TestCase):
         with self.assertRaises(AuthorityRejected):
             self.coordinator.acquire(self.scope, "agent-a", "idem-a")
 
+    def test_projection_event_mismatch_is_rejected(self):
+        portable = PortableDomainStore.open(self.portable_path)
+        with portable.transaction(immediate=True):
+            portable.connection.execute(
+                "UPDATE remote_profiles SET verified_identity_ref='identity-b' "
+                "WHERE profile_id='profile-a'"
+            )
+        portable.close()
+
+        mismatched_scope = BindingScope(
+            "host-a", "profile-a", 1, "identity-b", self.scope.verified_identity_revision
+        )
+        with self.assertRaises(AuthorityRejected) as raised:
+            self.coordinator.acquire(mismatched_scope, "agent-a", "idem-a")
+        self.assertEqual(
+            raised.exception.evidence.reason_class,
+            "verified_identity_event_mismatch",
+        )
+
+    def test_identity_reference_drift_cannot_create_parallel_live_lease(self):
+        old = self.coordinator.acquire(self.scope, "agent-a", "idem-a")
+        portable = PortableDomainStore.open(self.portable_path)
+        revision = portable.record_verified_identity(
+            "profile-a", "identity-b", START.isoformat()
+        )
+        portable.close()
+        fresh_scope = BindingScope("host-a", "profile-a", 1, "identity-b", revision)
+
+        with self.assertRaises(AuthorityRejected) as raised:
+            self.coordinator.acquire(fresh_scope, "agent-b", "idem-b")
+        self.assertEqual(
+            raised.exception.evidence.reason_class,
+            "binding_lease_held",
+        )
+        self.assertEqual(
+            self.operational.rows(
+                "SELECT COUNT(*) FROM fenced_leases "
+                "WHERE state IN ('ACQUIRED','HEARTBEATING')"
+            )[0][0],
+            1,
+        )
+        self.assertEqual(old.scope.verified_identity_ref, "identity-a")
+
+    def test_stale_same_reference_operations_require_current_revision(self):
+        lease = self.coordinator.acquire(self.scope, "agent-a", "idem-a")
+        portable = PortableDomainStore.open(self.portable_path)
+        revision = portable.record_verified_identity(
+            "profile-a", "identity-a", START.isoformat()
+        )
+        portable.close()
+
+        with self.assertRaises(AuthorityRejected) as heartbeat_error:
+            self.coordinator.heartbeat(lease, "agent-a")
+        with self.assertRaises(AuthorityRejected) as release_error:
+            self.coordinator.release(lease, "agent-a", "planned_shutdown")
+        self.assertEqual(
+            heartbeat_error.exception.evidence.reason_class,
+            "verified_identity_revision_mismatch",
+        )
+        self.assertEqual(
+            release_error.exception.evidence.reason_class,
+            "verified_identity_revision_mismatch",
+        )
+        self.assertEqual(
+            self.operational.rows(
+                "SELECT state FROM fenced_leases WHERE lease_id=?", (lease.lease_id,)
+            )[0][0],
+            "ACQUIRED",
+        )
+        self.assertGreater(revision, self.scope.verified_identity_revision)
+
     def test_rejection_evidence_is_structured_and_sanitized(self):
         for request_id in ("/tmp/session-secret-token", "profile-a", "ses_abc123"):
             with self.assertRaises(AuthorityRejected) as raised:
                 self.coordinator.acquire(
-                    BindingScope("host-a", "profile-a", 2, "identity-a"),
+                BindingScope("host-a", "profile-a", 2, "identity-a", 1),
                     "agent-a",
                     "idem-a",
                     request_id=request_id,
@@ -397,7 +495,7 @@ class BindingAuthorityTests(unittest.TestCase):
         )
 
     def test_generation_mismatch_is_rejected(self):
-        wrong_scope = BindingScope("host-a", "profile-a", 2, "identity-a")
+        wrong_scope = BindingScope("host-a", "profile-a", 2, "identity-a", 1)
 
         with self.assertRaises(AuthorityRejected):
             self.coordinator.acquire(wrong_scope, "agent-a", "idem-a")

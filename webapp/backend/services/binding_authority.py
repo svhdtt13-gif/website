@@ -98,9 +98,9 @@ class BindingAuthorityCoordinator:
                 raise _reject(correlation_id, "idempotency_key_conflict")
             live = self.operational.connection.execute(
                 "SELECT expires_at FROM fenced_leases WHERE host_id=? AND profile_id=? "
-                "AND binding_generation=? AND verified_identity_ref=? "
+                "AND binding_generation=? "
                 "AND state IN ('ACQUIRED','HEARTBEATING')",
-                self._scope_values(scope),
+                self._binding_values(scope),
             ).fetchone()
             if live is not None:
                 reason = (
@@ -118,12 +118,15 @@ class BindingAuthorityCoordinator:
             self.operational.connection.execute(
                 "INSERT INTO fenced_leases "
                 "(lease_id, host_id, profile_id, binding_generation, "
-                "verified_identity_ref, owner_id, authority_epoch, fence_counter, "
+                "verified_identity_ref, verified_identity_revision, owner_id, "
+                "authority_epoch, fence_counter, "
                 "idempotency_key, state, acquired_at, heartbeat_at, expires_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'ACQUIRED', ?, ?, ?)",
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ACQUIRED', ?, ?, ?)",
                 (
-                    lease_id, *self._scope_values(scope), owner_id,
-                    state["authority_epoch"], counter, idempotency_key,
+                    lease_id, *self._scope_values(scope),
+                    scope.verified_identity_revision, owner_id,
+                    state["authority_epoch"],
+                    counter, idempotency_key,
                     _stamp(now), _stamp(now), _stamp(expires),
                 ),
             )
@@ -188,14 +191,27 @@ class BindingAuthorityCoordinator:
             self._revalidate_snapshot(lease.scope, snapshot, correlation_id)
 
     def reconcile_expired(
-        self, lease: BindingLease, request_id: str | None = None
+        self,
+        lease: BindingLease,
+        fresh_scope: BindingScope,
+        request_id: str | None = None,
     ) -> None:
         """Explicitly invalidate an expired lease before a later acquisition."""
         correlation_id = _correlation_id(request_id)
         self._validate_request(
-            lease.scope, lease.owner_id, lease.idempotency_key, correlation_id
+            fresh_scope, lease.owner_id, lease.idempotency_key, correlation_id
         )
-        snapshot = self._require_snapshot(lease.scope, correlation_id)
+        if (
+            fresh_scope.host_id,
+            fresh_scope.profile_id,
+            fresh_scope.binding_generation,
+        ) != (
+            lease.scope.host_id,
+            lease.scope.profile_id,
+            lease.scope.binding_generation,
+        ):
+            raise _reject(correlation_id, "reconciliation_scope_mismatch")
+        snapshot = self._require_snapshot(fresh_scope, correlation_id)
         now = self._now(correlation_id)
         with self.operational.transaction():
             state = self._authority_state(correlation_id)
@@ -204,12 +220,14 @@ class BindingAuthorityCoordinator:
             row = self.operational.connection.execute(
                 "SELECT * FROM fenced_leases WHERE lease_id=? AND owner_id=? "
                 "AND host_id=? AND profile_id=? AND binding_generation=? "
-                "AND verified_identity_ref=? AND authority_epoch=? AND fence_counter=? "
+                "AND verified_identity_ref=? AND verified_identity_revision=? "
+                "AND authority_epoch=? AND fence_counter=? "
                 "AND state IN ('ACQUIRED','HEARTBEATING')",
                 (
                     lease.lease_id,
                     lease.owner_id,
                     *self._scope_values(lease.scope),
+                    lease.scope.verified_identity_revision,
                     lease.fence.authority_epoch,
                     lease.fence.fence_counter,
                 ),
@@ -218,7 +236,13 @@ class BindingAuthorityCoordinator:
                 raise _reject(correlation_id, "lease_not_current")
             if self._lease_expiration(row, correlation_id) > now:
                 raise _reject(correlation_id, "lease_not_expired")
-            self._revalidate_snapshot(lease.scope, snapshot, correlation_id)
+            current_revision = snapshot["verified_identity_revision"]
+            if (
+                not isinstance(current_revision, int)
+                or current_revision <= lease.scope.verified_identity_revision
+            ):
+                raise _reject(correlation_id, "fresh_verification_required")
+            self._revalidate_snapshot(fresh_scope, snapshot, correlation_id)
             updated = self.operational.connection.execute(
                 "UPDATE fenced_leases SET state='EXPIRED', "
                 "release_reason='explicit_reconciliation' WHERE lease_id=? "
@@ -227,7 +251,7 @@ class BindingAuthorityCoordinator:
             ).rowcount
             if updated != 1:
                 raise _reject(correlation_id, "reconciliation_fenced")
-            self._revalidate_snapshot(lease.scope, snapshot, correlation_id)
+            self._revalidate_snapshot(fresh_scope, snapshot, correlation_id)
 
     def check_eligibility(
         self,
@@ -270,6 +294,10 @@ class BindingAuthorityCoordinator:
             raise _reject(correlation_id, "profile_not_verified")
         if snapshot["verified_identity_ref"] != scope.verified_identity_ref:
             raise _reject(correlation_id, "verified_identity_mismatch")
+        if snapshot["verified_identity_event_ref"] != snapshot["verified_identity_ref"]:
+            raise _reject(correlation_id, "verified_identity_event_mismatch")
+        if snapshot["verified_identity_revision"] != scope.verified_identity_revision:
+            raise _reject(correlation_id, "verified_identity_revision_mismatch")
         if not snapshot["origin_ref"] or not snapshot["account_ref"]:
             raise _reject(correlation_id, "binding_records_incomplete")
         return snapshot
@@ -311,10 +339,12 @@ class BindingAuthorityCoordinator:
         row = self.operational.connection.execute(
             "SELECT * FROM fenced_leases WHERE lease_id=? AND owner_id=? "
             "AND host_id=? AND profile_id=? AND binding_generation=? "
-            "AND verified_identity_ref=? AND authority_epoch=? AND fence_counter=? "
+            "AND verified_identity_ref=? AND verified_identity_revision=? "
+            "AND authority_epoch=? AND fence_counter=? "
             "AND state IN ('ACQUIRED','HEARTBEATING')",
             (
                 lease.lease_id, owner_id, *self._scope_values(lease.scope),
+                lease.scope.verified_identity_revision,
                 lease.fence.authority_epoch, lease.fence.fence_counter,
             ),
         ).fetchone()
@@ -338,13 +368,22 @@ class BindingAuthorityCoordinator:
     def _same_lease_request(row, scope: BindingScope, owner_id: str) -> bool:
         return (
             row["host_id"], row["profile_id"], row["binding_generation"],
-            row["verified_identity_ref"], row["owner_id"],
-        ) == (*BindingAuthorityCoordinator._scope_values(scope), owner_id)
+            row["verified_identity_ref"], row["verified_identity_revision"],
+            row["owner_id"],
+        ) == (
+            *BindingAuthorityCoordinator._scope_values(scope),
+            scope.verified_identity_revision,
+            owner_id,
+        )
 
     @staticmethod
     def _scope_values(scope: BindingScope) -> tuple[object, ...]:
         return (scope.host_id, scope.profile_id, scope.binding_generation,
                 scope.verified_identity_ref)
+
+    @staticmethod
+    def _binding_values(scope: BindingScope) -> tuple[object, ...]:
+        return (scope.host_id, scope.profile_id, scope.binding_generation)
 
     @staticmethod
     def _validate_request(
@@ -357,6 +396,11 @@ class BindingAuthorityCoordinator:
             raise _reject(correlation_id, "authority_identifiers_required")
         if not isinstance(scope.binding_generation, int) or scope.binding_generation < 1:
             raise _reject(correlation_id, "binding_generation_invalid")
+        if (
+            not isinstance(scope.verified_identity_revision, int)
+            or scope.verified_identity_revision < 1
+        ):
+            raise _reject(correlation_id, "verified_identity_revision_invalid")
 
     def _now(self, correlation_id: str) -> datetime:
         now = self.clock.now()
@@ -376,7 +420,7 @@ class BindingAuthorityCoordinator:
             raise _reject(correlation_id, "lease_timestamp_invalid") from None
         scope = BindingScope(
             row["host_id"], row["profile_id"], row["binding_generation"],
-            row["verified_identity_ref"],
+            row["verified_identity_ref"], row["verified_identity_revision"],
         )
         return BindingLease(
             row["lease_id"], scope, row["owner_id"],

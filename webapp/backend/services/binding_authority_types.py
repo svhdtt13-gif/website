@@ -28,6 +28,7 @@ class BindingScope:
     profile_id: str
     binding_generation: int
     verified_identity_ref: str
+    verified_identity_revision: int
 
 
 @dataclass(frozen=True, slots=True)

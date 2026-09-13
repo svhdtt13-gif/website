@@ -17,6 +17,8 @@ from repositories.operational_sqlite import (
     LEGACY_SCHEMA_SQL,
     OPERATIONAL_FILENAME,
     SCHEMA_CHECKSUM,
+    SCHEMA_V2_CHECKSUM,
+    SCHEMA_V2_SQL,
     SCHEMA_VERSION,
     OperationalIntegrityError,
     OperationalPathError,
@@ -54,6 +56,38 @@ class OperationalSQLiteTests(unittest.TestCase):
                         "schema_checksum", checksum or LEGACY_SCHEMA_CHECKSUM,
                     ),
                 )
+            connection.commit()
+        finally:
+            connection.close()
+        return path
+
+    def _write_v2_database(self):
+        self.repository.close()
+        path = operational_path(self.runtime)
+        path.unlink()
+        connection = sqlite3.connect(path)
+        try:
+            connection.executescript(SCHEMA_V2_SQL)
+            connection.execute(
+                "INSERT INTO schema_meta(key, value) VALUES (?, ?), (?, ?)",
+                (
+                    "schema_version", "2",
+                    "schema_checksum", SCHEMA_V2_CHECKSUM,
+                ),
+            )
+            connection.execute(
+                "INSERT INTO authority_state VALUES (1, ?, 1, 0)",
+                ("epoch-v2",),
+            )
+            connection.execute(
+                "INSERT INTO fenced_leases VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    "lease-v2", "host-a", "profile-a", 1, "identity-a", "owner-a",
+                    "epoch-v2", 1, "idem-v2", "ACQUIRED",
+                    "2026-09-09T10:00:00+00:00", "2026-09-09T10:00:00+00:00",
+                    "2026-09-09T10:05:00+00:00", None,
+                ),
+            )
             connection.commit()
         finally:
             connection.close()
@@ -132,6 +166,57 @@ class OperationalSQLiteTests(unittest.TestCase):
 
         with self.assertRaises(OperationalSchemaError):
             OperationalSQLiteRepository.open(self.runtime)
+
+    def test_v2_operational_database_quarantines_old_identity_leases(self):
+        self.assertEqual(
+            SCHEMA_V2_CHECKSUM,
+            "8a66f5c0b070fc2af79e77f6e686aee126fe5a37ae837c23191944fd3650dc2f",
+        )
+        self._write_v2_database()
+
+        self.repository = OperationalSQLiteRepository.open(self.runtime)
+
+        self.assertEqual(
+            self.repository.rows(
+                "SELECT value FROM schema_meta WHERE key='schema_version'"
+            )[0][0],
+            str(SCHEMA_VERSION),
+        )
+        self.assertEqual(
+            tuple(self.repository.rows(
+                "SELECT state, verified_identity_revision, release_reason "
+                "FROM fenced_leases WHERE lease_id='lease-v2'"
+            )[0]),
+            ("QUARANTINED", 1, "identity_revision_migration"),
+        )
+
+    def test_migrated_operational_schema_requires_identity_revision_on_insert(self):
+        self._write_v2_database()
+        self.repository = OperationalSQLiteRepository.open(self.runtime)
+
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.repository.connection.execute(
+                "INSERT INTO fenced_leases ("
+                "lease_id, host_id, profile_id, binding_generation, "
+                "verified_identity_ref, owner_id, authority_epoch, fence_counter, "
+                "idempotency_key, state, acquired_at, heartbeat_at, expires_at"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    "lease-missing-revision",
+                    "host-new",
+                    "profile-new",
+                    1,
+                    "identity-new",
+                    "agent-new",
+                    "epoch-new",
+                    2,
+                    "idem-new",
+                    "ACQUIRED",
+                    "2026-01-01T00:00:00+00:00",
+                    "2026-01-01T00:00:00+00:00",
+                    "2026-01-01T00:01:00+00:00",
+                ),
+            )
 
     def test_wrong_v1_checksum_fails_closed_before_migration(self):
         self._write_v1_database(checksum="wrong-v1-checksum")
@@ -385,9 +470,9 @@ class OperationalSQLiteTests(unittest.TestCase):
             "SELECT authority_epoch FROM authority_state"
         )[0][0]
         self.repository.connection.execute(
-            "INSERT INTO fenced_leases VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO fenced_leases VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
-                "lease-1", "host-a", "profile-a", 1, "identity-a", "owner-a",
+                "lease-1", "host-a", "profile-a", 1, "identity-a", 1, "owner-a",
                 old_epoch, 1, "idem-1", "ACQUIRED",
                 "2026-09-09T10:00:00+00:00", "2026-09-09T10:00:00+00:00",
                 "2026-09-09T10:05:00+00:00", None,

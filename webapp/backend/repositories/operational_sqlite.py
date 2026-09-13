@@ -14,7 +14,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 OPERATIONAL_FILENAME = "p4_operational.sqlite3"
 OPERATIONAL_DIRNAME = "operational"
 BACKUP_DIRNAME = "backups"
@@ -73,6 +73,7 @@ CREATE TABLE IF NOT EXISTS fenced_leases (
   profile_id TEXT NOT NULL,
   binding_generation INTEGER NOT NULL CHECK (binding_generation > 0),
   verified_identity_ref TEXT NOT NULL,
+  verified_identity_revision INTEGER NOT NULL CHECK (verified_identity_revision > 0),
   owner_id TEXT NOT NULL,
   authority_epoch TEXT NOT NULL,
   fence_counter INTEGER NOT NULL CHECK (fence_counter > 0),
@@ -86,7 +87,7 @@ CREATE TABLE IF NOT EXISTS fenced_leases (
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS fenced_live_scope_idx
-  ON fenced_leases(host_id, profile_id, binding_generation, verified_identity_ref)
+  ON fenced_leases(host_id, profile_id, binding_generation)
   WHERE state IN ('ACQUIRED', 'HEARTBEATING');
 
 CREATE UNIQUE INDEX IF NOT EXISTS fenced_identity_idx
@@ -212,6 +213,14 @@ CREATE TABLE IF NOT EXISTS worker_events (
 );
 """
 SCHEMA_CHECKSUM = hashlib.sha256(SCHEMA_SQL.encode("utf-8")).hexdigest()
+SCHEMA_V2_SQL = SCHEMA_SQL.replace(
+    "  verified_identity_revision INTEGER NOT NULL CHECK (verified_identity_revision > 0),\n",
+    "",
+).replace(
+    "  ON fenced_leases(host_id, profile_id, binding_generation)\n",
+    "  ON fenced_leases(host_id, profile_id, binding_generation, verified_identity_ref)\n",
+)
+SCHEMA_V2_CHECKSUM = hashlib.sha256(SCHEMA_V2_SQL.encode("utf-8")).hexdigest()
 LEGACY_SCHEMA_CHECKSUM = hashlib.sha256(LEGACY_SCHEMA_SQL.encode("utf-8")).hexdigest()
 
 
@@ -352,10 +361,10 @@ def _schema_identity(connection):
     return json.dumps(objects, sort_keys=True, separators=(",", ":"))
 
 
-def _expected_schema_identity():
+def _expected_schema_identity(schema_sql=SCHEMA_SQL):
     connection = sqlite3.connect(":memory:")
     try:
-        connection.executescript(SCHEMA_SQL)
+        connection.executescript(schema_sql)
         connection.execute("PRAGMA foreign_keys = ON")
         return _schema_identity(connection)
     finally:
@@ -363,6 +372,25 @@ def _expected_schema_identity():
 
 
 EXPECTED_SCHEMA_IDENTITY = _expected_schema_identity()
+EXPECTED_V2_SCHEMA_IDENTITY = _expected_schema_identity(SCHEMA_V2_SQL)
+
+
+def _expected_migrated_v3_identity():
+    connection = sqlite3.connect(":memory:")
+    try:
+        connection.executescript(SCHEMA_V2_SQL)
+        connection.execute(
+            "ALTER TABLE fenced_leases ADD COLUMN "
+            "verified_identity_revision INTEGER NOT NULL DEFAULT 1 "
+            "CHECK (verified_identity_revision > 0)"
+        )
+        connection.execute("PRAGMA foreign_keys = ON")
+        return _schema_identity(connection)
+    finally:
+        connection.close()
+
+
+EXPECTED_MIGRATED_V3_IDENTITY = _expected_migrated_v3_identity()
 
 
 def _expected_legacy_schema_identity():
@@ -522,7 +550,28 @@ class OperationalSQLiteRepository:
             )
         except sqlite3.DatabaseError as error:
             raise OperationalSchemaError("schema metadata is missing") from error
-        if values.get("schema_version") != "1":
+        version = values.get("schema_version")
+        if version == "2":
+            with self.transaction():
+                values = dict(
+                    self.connection.execute(
+                        "SELECT key, value FROM schema_meta"
+                    ).fetchall()
+                )
+                if values.get("schema_version") != "2":
+                    return
+                self._verify_v2_before_migration(values)
+                self._rebuild_v2_fenced_leases()
+                self.connection.execute(
+                    "UPDATE schema_meta SET value=? WHERE key='schema_version'",
+                    (str(SCHEMA_VERSION),),
+                )
+                self.connection.execute(
+                    "UPDATE schema_meta SET value=? WHERE key='schema_checksum'",
+                    (SCHEMA_CHECKSUM,),
+                )
+            return
+        if version != "1":
             return
         if values.get("schema_checksum") != LEGACY_SCHEMA_CHECKSUM:
             raise OperationalSchemaError("legacy operational schema checksum mismatch")
@@ -543,7 +592,9 @@ class OperationalSQLiteRepository:
                 "lease_id TEXT PRIMARY KEY, host_id TEXT NOT NULL, "
                 "profile_id TEXT NOT NULL, "
                 "binding_generation INTEGER NOT NULL CHECK (binding_generation > 0), "
-                "verified_identity_ref TEXT NOT NULL, owner_id TEXT NOT NULL, "
+                "verified_identity_ref TEXT NOT NULL, "
+                "verified_identity_revision INTEGER NOT NULL CHECK (verified_identity_revision > 0), "
+                "owner_id TEXT NOT NULL, "
                 "authority_epoch TEXT NOT NULL, "
                 "fence_counter INTEGER NOT NULL CHECK (fence_counter > 0), "
                 "idempotency_key TEXT NOT NULL UNIQUE, "
@@ -554,7 +605,7 @@ class OperationalSQLiteRepository:
             )
             self.connection.execute(
                 "CREATE UNIQUE INDEX IF NOT EXISTS fenced_live_scope_idx ON fenced_leases("
-                "host_id, profile_id, binding_generation, verified_identity_ref) "
+                "host_id, profile_id, binding_generation) "
                 "WHERE state IN ('ACQUIRED', 'HEARTBEATING')"
             )
             self.connection.execute(
@@ -575,6 +626,66 @@ class OperationalSQLiteRepository:
                 "UPDATE schema_meta SET value=? WHERE key='schema_checksum'",
                 (SCHEMA_CHECKSUM,),
             )
+
+    def _verify_v2_before_migration(self, values):
+        if values.get("schema_checksum") != SCHEMA_V2_CHECKSUM:
+            raise OperationalSchemaError("operational v2 schema checksum mismatch")
+        if _schema_identity(self.connection) != EXPECTED_V2_SCHEMA_IDENTITY:
+            raise OperationalSchemaError("operational v2 schema is not trusted")
+        if not _integrity_ok(self.connection):
+            raise OperationalIntegrityError("operational v2 SQLite integrity check failed")
+
+    def _rebuild_v2_fenced_leases(self):
+        self.connection.execute("DROP INDEX IF EXISTS fenced_live_scope_idx")
+        self.connection.execute("DROP INDEX IF EXISTS fenced_identity_idx")
+        self.connection.execute(
+            "CREATE TABLE fenced_leases_staged AS SELECT lease_id, host_id, "
+            "profile_id, binding_generation, verified_identity_ref, 1 AS "
+            "verified_identity_revision, owner_id, authority_epoch, fence_counter, "
+            "idempotency_key, CASE WHEN state IN ('ACQUIRED','HEARTBEATING') "
+            "THEN 'QUARANTINED' ELSE state END AS state, acquired_at, "
+            "heartbeat_at, expires_at, CASE WHEN state IN ('ACQUIRED','HEARTBEATING') "
+            "THEN 'identity_revision_migration' ELSE release_reason END AS release_reason "
+            "FROM fenced_leases"
+        )
+        self.connection.execute("DROP TABLE fenced_leases")
+        self.connection.execute(
+            "CREATE TABLE IF NOT EXISTS fenced_leases ( "
+            "lease_id TEXT PRIMARY KEY, host_id TEXT NOT NULL, "
+            "profile_id TEXT NOT NULL, "
+            "binding_generation INTEGER NOT NULL CHECK (binding_generation > 0), "
+            "verified_identity_ref TEXT NOT NULL, "
+            "verified_identity_revision INTEGER NOT NULL CHECK (verified_identity_revision > 0), "
+            "owner_id TEXT NOT NULL, authority_epoch TEXT NOT NULL, "
+            "fence_counter INTEGER NOT NULL CHECK (fence_counter > 0), "
+            "idempotency_key TEXT NOT NULL UNIQUE, "
+            "state TEXT NOT NULL CHECK (state IN "
+            "('ACQUIRED','HEARTBEATING','RELEASED','EXPIRED','QUARANTINED')), "
+            "acquired_at TEXT NOT NULL, heartbeat_at TEXT NOT NULL, "
+            "expires_at TEXT NOT NULL, release_reason TEXT )"
+        )
+        self.connection.execute(
+            "INSERT INTO fenced_leases "
+            "(lease_id, host_id, profile_id, binding_generation, "
+            "verified_identity_ref, verified_identity_revision, owner_id, "
+            "authority_epoch, fence_counter, idempotency_key, state, "
+            "acquired_at, heartbeat_at, expires_at, release_reason) "
+            "SELECT lease_id, host_id, profile_id, binding_generation, "
+            "verified_identity_ref, verified_identity_revision, owner_id, "
+            "authority_epoch, fence_counter, idempotency_key, state, acquired_at, "
+            "heartbeat_at, expires_at, release_reason "
+            "FROM fenced_leases_staged"
+        )
+        self.connection.execute("DROP TABLE fenced_leases_staged")
+        self.connection.execute(
+            "CREATE UNIQUE INDEX fenced_live_scope_idx ON fenced_leases("
+            "host_id, profile_id, binding_generation) "
+            "WHERE state IN ('ACQUIRED', 'HEARTBEATING')"
+        )
+        self.connection.execute(
+            "CREATE UNIQUE INDEX fenced_identity_idx ON fenced_leases("
+            "authority_epoch, fence_counter)"
+        )
 
     @contextmanager
     def transaction(self, immediate=True):

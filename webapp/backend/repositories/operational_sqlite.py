@@ -5,22 +5,133 @@ imported by Flask routes, the scheduler, or the Phase 3 immutable generation
 reader. The exact operational path is guarded so a P3 generation cannot be
 opened for writes accidentally.
 """
-from contextlib import contextmanager
-from datetime import datetime, timezone
 import hashlib
 import json
 import os
-from pathlib import Path
 import secrets
 import sqlite3
+from contextlib import contextmanager
+from datetime import datetime, timezone
+from pathlib import Path
 
-
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 OPERATIONAL_FILENAME = "p4_operational.sqlite3"
 OPERATIONAL_DIRNAME = "operational"
 BACKUP_DIRNAME = "backups"
 
 SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS schema_meta (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS jobs (
+  job_id TEXT PRIMARY KEY,
+  kind TEXT NOT NULL,
+  target_json TEXT NOT NULL,
+  requested_by TEXT NOT NULL,
+  idempotency_key TEXT NOT NULL UNIQUE,
+  parent_job_id TEXT REFERENCES jobs(job_id),
+  status TEXT NOT NULL CHECK (status IN
+    ('queued','claimed','running','dispatched','succeeded','failed','cancelled','unknown')),
+  attempt INTEGER NOT NULL DEFAULT 0,
+  owner_id TEXT,
+  lease_name TEXT,
+  created_at TEXT NOT NULL,
+  claimed_at TEXT,
+  started_at TEXT,
+  dispatched_at TEXT,
+  finished_at TEXT,
+  lease_until TEXT,
+  remote_action_id TEXT,
+  result_json TEXT,
+  error_json TEXT
+);
+
+CREATE INDEX IF NOT EXISTS jobs_status_idx ON jobs(status, created_at);
+CREATE INDEX IF NOT EXISTS jobs_owner_idx ON jobs(owner_id, lease_name, lease_until);
+
+CREATE TABLE IF NOT EXISTS leases (
+  lease_name TEXT PRIMARY KEY,
+  owner_id TEXT NOT NULL,
+  acquired_at TEXT NOT NULL,
+  heartbeat_at TEXT NOT NULL,
+  expires_at TEXT NOT NULL,
+  release_reason TEXT
+);
+
+CREATE TABLE IF NOT EXISTS authority_state (
+  singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+  authority_epoch TEXT NOT NULL,
+  fence_counter INTEGER NOT NULL CHECK (fence_counter >= 0),
+  quarantined INTEGER NOT NULL CHECK (quarantined IN (0, 1))
+);
+
+CREATE TABLE IF NOT EXISTS fenced_leases (
+  lease_id TEXT PRIMARY KEY,
+  host_id TEXT NOT NULL,
+  profile_id TEXT NOT NULL,
+  binding_generation INTEGER NOT NULL CHECK (binding_generation > 0),
+  verified_identity_ref TEXT NOT NULL,
+  owner_id TEXT NOT NULL,
+  authority_epoch TEXT NOT NULL,
+  fence_counter INTEGER NOT NULL CHECK (fence_counter > 0),
+  idempotency_key TEXT NOT NULL UNIQUE,
+  state TEXT NOT NULL CHECK
+    (state IN ('ACQUIRED','HEARTBEATING','RELEASED','EXPIRED','QUARANTINED')),
+  acquired_at TEXT NOT NULL,
+  heartbeat_at TEXT NOT NULL,
+  expires_at TEXT NOT NULL,
+  release_reason TEXT
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS fenced_live_scope_idx
+  ON fenced_leases(host_id, profile_id, binding_generation, verified_identity_ref)
+  WHERE state IN ('ACQUIRED', 'HEARTBEATING');
+
+CREATE UNIQUE INDEX IF NOT EXISTS fenced_identity_idx
+  ON fenced_leases(authority_epoch, fence_counter);
+
+CREATE TABLE IF NOT EXISTS checkpoints (
+  checkpoint_id TEXT PRIMARY KEY,
+  kind TEXT NOT NULL,
+  p3_generation_id TEXT,
+  p3_source_hash TEXT,
+  active_group TEXT,
+  live_snapshot_hash TEXT,
+  pending_jobs_json TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  data_json TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS manual_overrides (
+  override_id TEXT PRIMARY KEY,
+  target_id TEXT NOT NULL,
+  source TEXT NOT NULL,
+  requested_state TEXT,
+  observed_state TEXT,
+  precedence INTEGER NOT NULL,
+  request_id TEXT,
+  created_at TEXT NOT NULL,
+  expires_at TEXT,
+  resolved_at TEXT,
+  resolution TEXT,
+  evidence_json TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS manual_override_active_idx
+  ON manual_overrides(target_id, resolved_at, expires_at, precedence);
+
+CREATE TABLE IF NOT EXISTS worker_events (
+  event_id TEXT PRIMARY KEY,
+  owner_id TEXT NOT NULL,
+  job_id TEXT REFERENCES jobs(job_id),
+  event_type TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  data_json TEXT NOT NULL
+);
+"""
+LEGACY_SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS schema_meta (
   key TEXT PRIMARY KEY,
   value TEXT NOT NULL
@@ -101,6 +212,7 @@ CREATE TABLE IF NOT EXISTS worker_events (
 );
 """
 SCHEMA_CHECKSUM = hashlib.sha256(SCHEMA_SQL.encode("utf-8")).hexdigest()
+LEGACY_SCHEMA_CHECKSUM = hashlib.sha256(LEGACY_SCHEMA_SQL.encode("utf-8")).hexdigest()
 
 
 class OperationalPathError(ValueError):
@@ -121,6 +233,10 @@ class OperationalTransactionError(RuntimeError):
 
 def _utc_now():
     return datetime.now(timezone.utc).isoformat()
+
+
+def _new_authority_epoch():
+    return secrets.token_hex(16)
 
 
 def _resolved(path):
@@ -249,6 +365,21 @@ def _expected_schema_identity():
 EXPECTED_SCHEMA_IDENTITY = _expected_schema_identity()
 
 
+def _expected_legacy_schema_identity():
+    connection = sqlite3.connect(":memory:")
+    try:
+        connection.executescript(LEGACY_SCHEMA_SQL)
+        connection.execute("PRAGMA foreign_keys = ON")
+        return _schema_identity(connection)
+    finally:
+        connection.close()
+
+
+EXPECTED_LEGACY_SCHEMA_IDENTITY = _expected_legacy_schema_identity()
+_ACTIVE_CONNECTIONS = {}
+_BOOTSTRAP_REQUIRED = {}
+
+
 def _integrity_ok(connection):
     result = connection.execute("PRAGMA integrity_check").fetchone()
     if not result or result[0] != "ok":
@@ -259,10 +390,26 @@ def _integrity_ok(connection):
 class OperationalSQLiteRepository:
     """Connection and transaction primitives for the mutable P4 database."""
 
-    def __init__(self, connection, runtime_dir):
+    def __init__(self, connection, runtime_dir, track_lifecycle=True):
         self.connection = connection
         self.runtime_dir = _resolved(runtime_dir)
         self.path = operational_path(runtime_dir)
+        self._track_lifecycle = track_lifecycle
+        self._closed = False
+        if track_lifecycle:
+            _BOOTSTRAP_REQUIRED.setdefault(self.path, True)
+            _ACTIVE_CONNECTIONS[self.path] = _ACTIVE_CONNECTIONS.get(self.path, 0) + 1
+        self._bootstrap_required = _BOOTSTRAP_REQUIRED.get(self.path, False)
+
+    @property
+    def requires_fresh_bootstrap(self):
+        return _BOOTSTRAP_REQUIRED.get(self.path, self._bootstrap_required)
+
+    @requires_fresh_bootstrap.setter
+    def requires_fresh_bootstrap(self, value):
+        self._bootstrap_required = bool(value)
+        if self._track_lifecycle:
+            _BOOTSTRAP_REQUIRED[self.path] = self._bootstrap_required
 
     @staticmethod
     def _connect(path):
@@ -288,9 +435,10 @@ class OperationalSQLiteRepository:
         path.parent.mkdir(parents=True, exist_ok=True)
         backup_directory(runtime_dir).mkdir(parents=True, exist_ok=True)
         connection = cls._connect(path)
+        repository = cls(connection, runtime_dir)
         try:
             connection.executescript(SCHEMA_SQL)
-            with cls(connection, runtime_dir).transaction():
+            with repository.transaction():
                 connection.execute(
                     "INSERT INTO schema_meta(key, value) VALUES (?, ?)",
                     ("schema_version", str(SCHEMA_VERSION)),
@@ -299,14 +447,20 @@ class OperationalSQLiteRepository:
                     "INSERT INTO schema_meta(key, value) VALUES (?, ?)",
                     ("schema_checksum", SCHEMA_CHECKSUM),
                 )
+                connection.execute(
+                    "INSERT INTO authority_state "
+                    "(singleton, authority_epoch, fence_counter, quarantined) "
+                    "VALUES (1, ?, 0, 0)",
+                    (_new_authority_epoch(),),
+                )
         except Exception:
-            connection.close()
+            repository.close()
             try:
                 path.unlink()
             except OSError:
                 pass
             raise
-        repository = cls(connection, runtime_dir)
+        repository.requires_fresh_bootstrap = False
         repository._validate_schema()
         return repository
 
@@ -318,6 +472,7 @@ class OperationalSQLiteRepository:
             raise OperationalPathError("operational database does not exist")
         repository = cls(cls._connect(path), runtime_dir)
         try:
+            repository._migrate_schema()
             repository._validate_schema()
         except Exception:
             repository.close()
@@ -333,6 +488,7 @@ class OperationalSQLiteRepository:
             raise OperationalPathError("operational database does not exist")
         repository = cls(cls._connect(checked), runtime_dir)
         try:
+            repository._migrate_schema()
             repository._validate_schema()
         except Exception:
             repository.close()
@@ -356,6 +512,69 @@ class OperationalSQLiteRepository:
             raise OperationalSchemaError("actual operational schema does not match expected schema")
         if not _integrity_ok(self.connection):
             raise OperationalIntegrityError("operational SQLite integrity check failed")
+
+    def _migrate_schema(self):
+        try:
+            values = dict(
+                self.connection.execute(
+                    "SELECT key, value FROM schema_meta"
+                ).fetchall()
+            )
+        except sqlite3.DatabaseError as error:
+            raise OperationalSchemaError("schema metadata is missing") from error
+        if values.get("schema_version") != "1":
+            return
+        if values.get("schema_checksum") != LEGACY_SCHEMA_CHECKSUM:
+            raise OperationalSchemaError("legacy operational schema checksum mismatch")
+        if _schema_identity(self.connection) != EXPECTED_LEGACY_SCHEMA_IDENTITY:
+            raise OperationalSchemaError("legacy operational schema is not trusted")
+        if not _integrity_ok(self.connection):
+            raise OperationalIntegrityError("legacy operational SQLite integrity check failed")
+        with self.transaction():
+            self.connection.execute(
+                "CREATE TABLE IF NOT EXISTS authority_state ( "
+                "singleton INTEGER PRIMARY KEY CHECK (singleton = 1), "
+                "authority_epoch TEXT NOT NULL, "
+                "fence_counter INTEGER NOT NULL CHECK (fence_counter >= 0), "
+                "quarantined INTEGER NOT NULL CHECK (quarantined IN (0, 1)) )"
+            )
+            self.connection.execute(
+                "CREATE TABLE IF NOT EXISTS fenced_leases ( "
+                "lease_id TEXT PRIMARY KEY, host_id TEXT NOT NULL, "
+                "profile_id TEXT NOT NULL, "
+                "binding_generation INTEGER NOT NULL CHECK (binding_generation > 0), "
+                "verified_identity_ref TEXT NOT NULL, owner_id TEXT NOT NULL, "
+                "authority_epoch TEXT NOT NULL, "
+                "fence_counter INTEGER NOT NULL CHECK (fence_counter > 0), "
+                "idempotency_key TEXT NOT NULL UNIQUE, "
+                "state TEXT NOT NULL CHECK (state IN "
+                "('ACQUIRED','HEARTBEATING','RELEASED','EXPIRED','QUARANTINED')), "
+                "acquired_at TEXT NOT NULL, heartbeat_at TEXT NOT NULL, "
+                "expires_at TEXT NOT NULL, release_reason TEXT )"
+            )
+            self.connection.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS fenced_live_scope_idx ON fenced_leases("
+                "host_id, profile_id, binding_generation, verified_identity_ref) "
+                "WHERE state IN ('ACQUIRED', 'HEARTBEATING')"
+            )
+            self.connection.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS fenced_identity_idx ON fenced_leases("
+                "authority_epoch, fence_counter)"
+            )
+            self.connection.execute(
+                "INSERT INTO authority_state "
+                "(singleton, authority_epoch, fence_counter, quarantined) "
+                "VALUES (1, ?, 0, 0)",
+                (_new_authority_epoch(),),
+            )
+            self.connection.execute(
+                "UPDATE schema_meta SET value=? WHERE key='schema_version'",
+                (str(SCHEMA_VERSION),),
+            )
+            self.connection.execute(
+                "UPDATE schema_meta SET value=? WHERE key='schema_checksum'",
+                (SCHEMA_CHECKSUM,),
+            )
 
     @contextmanager
     def transaction(self, immediate=True):
@@ -509,7 +728,7 @@ class OperationalSQLiteRepository:
         temporary = operational_path(runtime_dir).with_suffix(".restore.tmp")
         temporary.parent.mkdir(parents=True, exist_ok=True)
         try:
-            source_repository = cls(source, runtime_dir)
+            source_repository = cls(source, runtime_dir, track_lifecycle=False)
             source_repository._validate_schema()
             try:
                 temporary.unlink()
@@ -525,8 +744,9 @@ class OperationalSQLiteRepository:
         try:
             candidate = cls._connect(temporary)
             try:
-                candidate_repository = cls(candidate, runtime_dir)
+                candidate_repository = cls(candidate, runtime_dir, track_lifecycle=False)
                 candidate_repository._validate_schema()
+                candidate_repository.quarantine_restored_authority()
             finally:
                 candidate.close()
             os.replace(temporary, operational_path(runtime_dir))
@@ -535,10 +755,36 @@ class OperationalSQLiteRepository:
                 temporary.unlink()
             except FileNotFoundError:
                 pass
-        return cls.open(runtime_dir)
+        repository = cls.open(runtime_dir)
+        repository.quarantine_restored_authority()
+        return repository
+
+    def quarantine_restored_authority(self):
+        """Invalidate restored authority rows and require coordinator activation."""
+        with self.transaction():
+            self.connection.execute(
+                "UPDATE authority_state SET authority_epoch=?, fence_counter=0, "
+                "quarantined=1 WHERE singleton=1",
+                (_new_authority_epoch(),),
+            )
+            self.connection.execute(
+                "UPDATE fenced_leases SET state='QUARANTINED', "
+                "release_reason='operational_restore' "
+                "WHERE state IN ('ACQUIRED', 'HEARTBEATING')"
+            )
 
     def rows(self, query, args=()):
         return self.connection.execute(query, args).fetchall()
 
     def close(self):
+        if self._closed:
+            return
         self.connection.close()
+        self._closed = True
+        if self._track_lifecycle:
+            count = _ACTIVE_CONNECTIONS[self.path] - 1
+            if count:
+                _ACTIVE_CONNECTIONS[self.path] = count
+            else:
+                del _ACTIVE_CONNECTIONS[self.path]
+                _BOOTSTRAP_REQUIRED[self.path] = True

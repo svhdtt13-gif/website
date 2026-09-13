@@ -7,16 +7,19 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "webapp" / "backend"))
 
 from repositories.portable_store import (
-    SCHEMA_SQL,
+    SCHEMA_V2_CHECKSUM,
+    SCHEMA_V2_SQL,
     SCHEMA_VERSION,
     BindingError,
     PortableDomainStore,
     ProfileRequiredError,
+    SchemaError,
 )
 from services.shadow_import import (
     FileSystemGoldenSource,
@@ -46,22 +49,16 @@ class PortableDomainStoreTests(unittest.TestCase):
                                 account_ref, 1, "ACTIVE", NOW)
 
     def create_v2_fixture(self):
-        v2_schema = SCHEMA_SQL.replace("    verified_identity_ref TEXT,\n", "")
-        v2_checksum = hashlib.sha256(v2_schema.encode("utf-8")).hexdigest()
         connection = sqlite3.connect(self.path)
         try:
-            connection.executescript(v2_schema)
+            connection.executescript(SCHEMA_V2_SQL)
             connection.execute(
-                "UPDATE schema_meta SET value=? WHERE key='store_kind'",
-                ("portable_domain_store",),
-            )
-            connection.execute(
-                "UPDATE schema_meta SET value=? WHERE key='schema_version'",
-                ("2",),
-            )
-            connection.execute(
-                "UPDATE schema_meta SET value=? WHERE key='schema_checksum'",
-                (v2_checksum,),
+                "INSERT INTO schema_meta(key, value) VALUES (?, ?), (?, ?), (?, ?)",
+                (
+                    "store_kind", "portable_domain_store",
+                    "schema_version", "2",
+                    "schema_checksum", SCHEMA_V2_CHECKSUM,
+                ),
             )
             connection.execute(
                 "INSERT INTO hosts VALUES (?, ?, ?, ?, ?)",
@@ -80,6 +77,10 @@ class PortableDomainStoreTests(unittest.TestCase):
             connection.close()
 
     def test_empty_database_migrates_deterministically_and_reopens(self):
+        self.assertEqual(
+            SCHEMA_V2_CHECKSUM,
+            "0e07cb21f4b7e013aba89a85a9d580ba2bafeba4b13e28de1781028e5f8d04ec",
+        )
         meta = dict(self.store.connection.execute("SELECT key, value FROM schema_meta"))
         self.assertEqual(meta["schema_version"], str(SCHEMA_VERSION))
         self.assertEqual(meta["store_kind"], "portable_domain_store")
@@ -127,6 +128,145 @@ class PortableDomainStoreTests(unittest.TestCase):
             )
         finally:
             migrated.close()
+
+    def test_tampered_v2_schema_fails_before_identity_migration(self):
+        self.store.close()
+        self.path.unlink()
+        self.create_v2_fixture()
+        connection = sqlite3.connect(self.path)
+        try:
+            connection.execute("ALTER TABLE remote_profiles ADD COLUMN tampered TEXT")
+            connection.commit()
+        finally:
+            connection.close()
+
+        with self.assertRaises(SchemaError):
+            PortableDomainStore.open(self.path)
+
+    def test_wrong_v2_checksum_fails_before_identity_migration(self):
+        self.store.close()
+        self.path.unlink()
+        self.create_v2_fixture()
+        connection = sqlite3.connect(self.path)
+        try:
+            connection.execute(
+                "UPDATE schema_meta SET value='wrong' WHERE key='schema_checksum'"
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        with self.assertRaises(SchemaError):
+            PortableDomainStore.open(self.path)
+
+    def test_unsupported_v1_claim_fails_before_any_upgrade(self):
+        self.store.close()
+        self.path.unlink()
+        self.create_v2_fixture()
+        connection = sqlite3.connect(self.path)
+        try:
+            connection.execute(
+                "UPDATE schema_meta SET value='1' WHERE key='schema_version'"
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        with self.assertRaises(SchemaError):
+            PortableDomainStore.open(self.path)
+
+        connection = sqlite3.connect(self.path)
+        try:
+            self.assertEqual(
+                connection.execute(
+                    "SELECT value FROM schema_meta WHERE key='schema_version'"
+                ).fetchone()[0],
+                "1",
+            )
+            self.assertIsNone(
+                connection.execute(
+                    "SELECT 1 FROM pragma_table_info('remote_profiles') "
+                    "WHERE name='verified_identity_ref'"
+                ).fetchone()
+            )
+        finally:
+            connection.close()
+
+    def test_partial_v2_metadata_fails_before_identity_migration(self):
+        self.store.close()
+        self.path.unlink()
+        self.create_v2_fixture()
+        connection = sqlite3.connect(self.path)
+        try:
+            connection.execute(
+                "DELETE FROM schema_meta WHERE key='schema_checksum'"
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        with self.assertRaises(SchemaError):
+            PortableDomainStore.open(self.path)
+
+    def test_missing_v2_version_fails_closed_before_identity_migration(self):
+        self.store.close()
+        self.path.unlink()
+        self.create_v2_fixture()
+        connection = sqlite3.connect(self.path)
+        try:
+            connection.execute(
+                "DELETE FROM schema_meta WHERE key='schema_version'"
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        with self.assertRaises(SchemaError):
+            PortableDomainStore.open(self.path)
+
+        connection = sqlite3.connect(self.path)
+        try:
+            self.assertIsNone(
+                connection.execute(
+                    "SELECT 1 FROM pragma_table_info('remote_profiles') "
+                    "WHERE name='verified_identity_ref'"
+                ).fetchone()
+            )
+        finally:
+            connection.close()
+
+    def test_v2_migration_rolls_back_when_migration_fails(self):
+        self.store.close()
+        self.path.unlink()
+        self.create_v2_fixture()
+
+        def fail_migration(connection):
+            connection.execute(
+                "ALTER TABLE remote_profiles ADD COLUMN transient TEXT"
+            )
+            raise sqlite3.DatabaseError("migration failure")
+
+        with patch.dict(
+            "repositories.portable_store.MIGRATIONS", {3: fail_migration}
+        ), self.assertRaises(sqlite3.DatabaseError):
+            PortableDomainStore.open(self.path)
+
+        connection = sqlite3.connect(self.path)
+        try:
+            self.assertIsNone(
+                connection.execute(
+                    "SELECT 1 FROM pragma_table_info('remote_profiles') "
+                    "WHERE name='transient'"
+                ).fetchone()
+            )
+            self.assertEqual(
+                connection.execute(
+                    "SELECT value FROM schema_meta WHERE key='schema_version'"
+                ).fetchone()[0],
+                "2",
+            )
+        finally:
+            connection.close()
 
     def test_verified_identity_requires_explicit_non_secret_reference(self):
         with self.assertRaises(BindingError):

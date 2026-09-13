@@ -120,9 +120,90 @@ CREATE TABLE IF NOT EXISTS profile_audit_events (
 );
 """
 
-SCHEMA_CHECKSUM = hashlib.sha256(
-    " ".join(line.strip() for line in SCHEMA_SQL.splitlines() if line.strip()).encode()
-).hexdigest()
+def _canonical_sql(sql: str) -> str:
+    return " ".join(line.strip() for line in sql.splitlines() if line.strip())
+
+
+SCHEMA_CHECKSUM = hashlib.sha256(_canonical_sql(SCHEMA_SQL).encode()).hexdigest()
+SCHEMA_V2_SQL = SCHEMA_SQL.replace("    verified_identity_ref TEXT,\n", "")
+if SCHEMA_V2_SQL == SCHEMA_SQL:
+    raise RuntimeError("portable v2 schema source is missing its v3 delta")
+SCHEMA_V2_CHECKSUM = hashlib.sha256(_canonical_sql(SCHEMA_V2_SQL).encode()).hexdigest()
+
+
+def _schema_identity(connection: sqlite3.Connection) -> str:
+    objects = []
+    rows = connection.execute(
+        "SELECT type, name, tbl_name, sql FROM sqlite_master "
+        "WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name"
+    ).fetchall()
+    for object_type, name, table_name, sql in rows:
+        item = {
+            "type": object_type,
+            "name": name,
+            "table": table_name,
+            "sql": " ".join((sql or "").split()).lower(),
+        }
+        if object_type == "table":
+            item["columns"] = [
+                tuple(row) for row in connection.execute(
+                    "PRAGMA table_info('" + name.replace("'", "''") + "')"
+                )
+            ]
+            item["foreign_keys"] = [
+                tuple(row) for row in connection.execute(
+                    "PRAGMA foreign_key_list('" + name.replace("'", "''") + "')"
+                )
+            ]
+            item["indexes"] = [
+                {
+                    "name": row[1],
+                    "unique": row[2],
+                    "origin": row[3],
+                    "partial": row[4],
+                    "columns": [
+                        tuple(index_row) for index_row in connection.execute(
+                            "PRAGMA index_info('" + row[1].replace("'", "''") + "')"
+                        )
+                    ],
+                }
+                for row in connection.execute(
+                    "PRAGMA index_list('" + name.replace("'", "''") + "')"
+                )
+                if not row[1].startswith("sqlite_")
+            ]
+        objects.append(item)
+    return json.dumps(objects, sort_keys=True, separators=(",", ":"))
+
+
+def _expected_schema_identity(schema_sql: str) -> str:
+    connection = sqlite3.connect(":memory:")
+    try:
+        connection.executescript(schema_sql)
+        connection.execute("PRAGMA foreign_keys = ON")
+        return _schema_identity(connection)
+    finally:
+        connection.close()
+
+
+SCHEMA_V2_IDENTITY = _expected_schema_identity(SCHEMA_V2_SQL)
+SCHEMA_IDENTITY = _expected_schema_identity(SCHEMA_SQL)
+
+
+def _expected_migrated_v3_identity() -> str:
+    connection = sqlite3.connect(":memory:")
+    try:
+        connection.executescript(SCHEMA_V2_SQL)
+        connection.execute(
+            "ALTER TABLE remote_profiles ADD COLUMN verified_identity_ref TEXT"
+        )
+        connection.execute("PRAGMA foreign_keys = ON")
+        return _schema_identity(connection)
+    finally:
+        connection.close()
+
+
+MIGRATED_V3_IDENTITY = _expected_migrated_v3_identity()
 
 
 def _migrate_v3(connection: sqlite3.Connection) -> None:
@@ -211,9 +292,13 @@ class PortableDomainStore:
             raise PortableStoreError("portable store does not exist")
         connection = sqlite3.connect(target)
         store = cls(connection, target)
-        store._configure()
-        store.migrate()
-        store._verify()
+        try:
+            store._configure()
+            store.migrate()
+            store._verify()
+        except (PortableStoreError, sqlite3.DatabaseError, ValueError):
+            store.close()
+            raise
         return store
 
     def _configure(self) -> None:
@@ -223,17 +308,36 @@ class PortableDomainStore:
 
     def migrate(self) -> None:
         current = 0
-        if self.connection.execute(
+        has_schema_meta = self.connection.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='schema_meta'"
-        ).fetchone():
+        ).fetchone() is not None
+        if has_schema_meta:
             raw_version = self.connection.execute(
                 "SELECT value FROM schema_meta WHERE key='schema_version'"
             ).fetchone()
-            current = int(raw_version[0]) if raw_version else 0
+            if raw_version is None:
+                raise SchemaError("portable schema metadata is incomplete")
+            try:
+                current = int(raw_version[0])
+            except (TypeError, ValueError) as error:
+                raise SchemaError("portable schema version is invalid") from error
+            if current == 0 and self.connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE name != 'schema_meta' "
+                "AND name NOT LIKE 'sqlite_%' LIMIT 1"
+            ).fetchone():
+                raise SchemaError("portable schema metadata is incomplete")
+        elif self.connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' LIMIT 1"
+        ).fetchone():
+            raise SchemaError("portable schema metadata is missing")
         if current > SCHEMA_VERSION:
             raise SchemaError("portable schema version is newer than this code")
+        if current == 1:
+            raise SchemaError("portable schema version 1 is not supported")
         for target in range(current + 1, SCHEMA_VERSION + 1):
-            with self.transaction():
+            with self.transaction(immediate=True):
+                if target == SCHEMA_VERSION and current == 2:
+                    self._verify_v2_before_migration()
                 migration = MIGRATIONS[target]
                 if callable(migration):
                     migration(self.connection)
@@ -251,6 +355,8 @@ class PortableDomainStore:
                     "INSERT OR REPLACE INTO schema_meta(key, value) VALUES ('schema_checksum', ?)",
                     (SCHEMA_CHECKSUM,),
                 )
+                if target == SCHEMA_VERSION:
+                    self._verify()
         if current == SCHEMA_VERSION:
             with self.transaction():
                 self.connection.execute(
@@ -271,8 +377,25 @@ class PortableDomainStore:
             raise SchemaError("unsupported portable schema version")
         if meta.get("schema_checksum") != SCHEMA_CHECKSUM:
             raise SchemaError("portable store schema checksum mismatch")
+        if _schema_identity(self.connection) not in {
+            SCHEMA_IDENTITY, MIGRATED_V3_IDENTITY
+        }:
+            raise SchemaError("portable store schema identity mismatch")
         if self.connection.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
             raise SchemaError("portable store integrity check failed")
+
+    def _verify_v2_before_migration(self) -> None:
+        meta = dict(self.connection.execute("SELECT key, value FROM schema_meta"))
+        if (
+            meta.get("store_kind") != STORE_KIND
+            or meta.get("schema_version") != "2"
+            or meta.get("schema_checksum") != SCHEMA_V2_CHECKSUM
+        ):
+            raise SchemaError("portable v2 metadata is not trusted")
+        if _schema_identity(self.connection) != SCHEMA_V2_IDENTITY:
+            raise SchemaError("portable v2 schema identity mismatch")
+        if self.connection.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+            raise SchemaError("portable v2 integrity check failed")
 
     @contextmanager
     def transaction(self, immediate: bool = False) -> Iterator[sqlite3.Connection]:
@@ -280,8 +403,7 @@ class PortableDomainStore:
         self._transaction_depth += 1
         try:
             if outer:
-                if immediate:
-                    self.connection.execute("BEGIN IMMEDIATE")
+                self.connection.execute("BEGIN IMMEDIATE" if immediate else "BEGIN")
                 with self.connection:
                     yield self.connection
             else:
@@ -437,8 +559,10 @@ class PortableDomainStore:
         if not isinstance(binding_generation, int) or binding_generation < 1:
             raise BindingError("binding_generation must be positive")
         rows = self.connection.execute(
-            "SELECT b.host_id, b.profile_id, b.binding_generation, b.state, "
-            "h.origin_ref, p.account_ref, p.verified_identity_ref, p.status "
+            "SELECT b.binding_id, b.host_id, b.profile_id, b.binding_generation, "
+            "b.state, b.updated_at AS binding_updated_at, h.origin_ref, "
+            "p.account_ref, p.verified_identity_ref, p.status, "
+            "p.updated_at AS profile_updated_at "
             "FROM host_profile_bindings AS b "
             "JOIN hosts AS h ON h.host_id=b.host_id "
             "JOIN remote_profiles AS p ON p.profile_id=b.profile_id "

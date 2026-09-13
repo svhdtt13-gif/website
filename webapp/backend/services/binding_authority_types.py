@@ -49,5 +49,18 @@ class BindingLease:
     expires_at: datetime
 
 
+@dataclass(frozen=True, slots=True)
+class RejectionEvidence:
+    reason_class: str
+    correlation_id: str
+
+
+@dataclass(slots=True)
 class AuthorityRejected(RuntimeError):
-    pass
+    evidence: RejectionEvidence
+
+    def __str__(self) -> str:
+        return (
+            f"authority rejected: {self.evidence.reason_class} "
+            f"(correlation_id={self.evidence.correlation_id})"
+        )

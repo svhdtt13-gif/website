@@ -5,6 +5,7 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from threading import Barrier, Thread
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "webapp" / "backend"))
@@ -17,6 +18,7 @@ from services.binding_authority import (
     BindingAuthorityCoordinator,
     BindingScope,
     FenceIdentity,
+    RejectionEvidence,
 )
 
 START = datetime(2026, 9, 12, 5, 0, tzinfo=timezone.utc)
@@ -83,9 +85,27 @@ class BindingAuthorityTests(unittest.TestCase):
         )[0]
         self.assertEqual(tuple(row), ("agent-a", 1))
 
-    def test_expiry_allocates_new_counter_and_rejects_stale_holder(self):
+    def test_expiry_requires_explicit_reconciliation_before_takeover(self):
         old = self.coordinator.acquire(self.scope, "agent-a", "idem-a")
         self.clock.advance(31)
+
+        with self.assertRaises(AuthorityRejected) as raised:
+            self.coordinator.acquire(
+                self.scope, "agent-b", "idem-b", request_id="expiry-check"
+            )
+
+        self.assertEqual(
+            raised.exception.evidence.reason_class,
+            "expired_lease_requires_reconciliation",
+        )
+        self.assertEqual(
+            self.operational.rows(
+                "SELECT state FROM fenced_leases WHERE lease_id=?",
+                (old.lease_id,),
+            )[0][0],
+            "ACQUIRED",
+        )
+        self.coordinator.reconcile_expired(old, request_id="expiry-reconcile")
         current = self.coordinator.acquire(self.scope, "agent-b", "idem-b")
 
         self.assertEqual(current.fence.authority_epoch, old.fence.authority_epoch)
@@ -121,6 +141,39 @@ class BindingAuthorityTests(unittest.TestCase):
             self.coordinator.check_eligibility(old, "agent-a", "idem-a")
         current = restarted.acquire(self.scope, "agent-b", "idem-b")
         self.assertEqual(current.fence.fence_counter, 1)
+
+    def test_reopen_after_process_connections_close_requires_fresh_bootstrap(self):
+        self.operational.close()
+        self.operational = OperationalSQLiteRepository.open(self.runtime)
+        restarted = BindingAuthorityCoordinator(
+            self.portable_path,
+            self.operational,
+            self.clock,
+            AuthorityConfig(lease_ttl=timedelta(seconds=30)),
+        )
+
+        with self.assertRaises(AuthorityRejected) as raised:
+            restarted.acquire(self.scope, "agent-a", "idem-a")
+        self.assertEqual(
+            raised.exception.evidence.reason_class,
+            "fresh_authority_bootstrap_required",
+        )
+        restarted.establish_fresh_authority()
+        self.assertEqual(
+            restarted.acquire(self.scope, "agent-a", "idem-a").fence.fence_counter,
+            1,
+        )
+
+    def test_all_connections_share_fresh_bootstrap_gate(self):
+        self.operational.close()
+        first = OperationalSQLiteRepository.open(self.runtime)
+        second = OperationalSQLiteRepository.open(self.runtime)
+        try:
+            self.assertTrue(first.requires_fresh_bootstrap)
+            self.assertTrue(second.requires_fresh_bootstrap)
+        finally:
+            second.close()
+            self.operational = first
 
     def test_heartbeat_and_release_are_scoped_to_current_lease(self):
         lease = self.coordinator.acquire(self.scope, "agent-a", "idem-a")
@@ -182,6 +235,140 @@ class BindingAuthorityTests(unittest.TestCase):
         with self.assertRaises(AuthorityRejected):
             self.coordinator.acquire(self.scope, "agent-a", "idem-a")
 
+    def test_rejection_evidence_is_structured_and_sanitized(self):
+        for request_id in ("/tmp/session-secret-token", "profile-a", "ses_abc123"):
+            with self.assertRaises(AuthorityRejected) as raised:
+                self.coordinator.acquire(
+                    BindingScope("host-a", "profile-a", 2, "identity-a"),
+                    "agent-a",
+                    "idem-a",
+                    request_id=request_id,
+                )
+
+            evidence = raised.exception.evidence
+            self.assertIsInstance(evidence, RejectionEvidence)
+            self.assertEqual(evidence.reason_class, "portable_binding_unavailable")
+            self.assertRegex(evidence.correlation_id, r"^corr-[0-9a-f]{16}$")
+            serialized = str(raised.exception).lower()
+            for secret in ("/tmp", "session", "secret", "token", "profile-a", "ses_abc123"):
+                self.assertNotIn(secret, serialized)
+
+    def test_acquire_rolls_back_when_portable_binding_changes_before_commit(self):
+        original_revalidate = self.coordinator._revalidate_snapshot
+
+        def mutate_identity(scope, snapshot, correlation_id):
+            self.assertEqual(
+                self.operational.rows("SELECT COUNT(*) FROM fenced_leases")[0][0],
+                1,
+            )
+            portable = PortableDomainStore.open(self.portable_path)
+            portable.record_verified_identity(
+                "profile-a", "identity-b", START.isoformat()
+            )
+            portable.close()
+            original_revalidate(scope, snapshot, correlation_id)
+
+        with patch.object(
+            self.coordinator, "_revalidate_snapshot", side_effect=mutate_identity
+        ), \
+                self.assertRaises(AuthorityRejected):
+            self.coordinator.acquire(self.scope, "agent-a", "idem-a")
+
+        self.assertEqual(
+            self.operational.rows("SELECT COUNT(*) FROM fenced_leases")[0][0],
+            0,
+        )
+
+    def test_acquire_rolls_back_when_binding_generation_changes_before_commit(self):
+        original_revalidate = self.coordinator._revalidate_snapshot
+
+        def mutate_generation(scope, snapshot, correlation_id):
+            portable = PortableDomainStore.open(self.portable_path)
+            with portable.transaction(immediate=True):
+                portable.connection.execute(
+                    "UPDATE host_profile_bindings SET binding_generation=2 "
+                    "WHERE host_id='host-a' AND profile_id='profile-a' "
+                    "AND binding_generation=1"
+                )
+            portable.close()
+            original_revalidate(scope, snapshot, correlation_id)
+
+        with patch.object(
+            self.coordinator, "_revalidate_snapshot", side_effect=mutate_generation
+        ), self.assertRaises(AuthorityRejected):
+            self.coordinator.acquire(self.scope, "agent-a", "idem-a")
+
+        self.assertEqual(
+            self.operational.rows("SELECT COUNT(*) FROM fenced_leases")[0][0],
+            0,
+        )
+
+    def test_heartbeat_rolls_back_when_portable_binding_changes_before_commit(self):
+        lease = self.coordinator.acquire(self.scope, "agent-a", "idem-a")
+        original_revalidate = self.coordinator._revalidate_snapshot
+
+        def mutate_identity(scope, snapshot, correlation_id):
+            self.assertEqual(
+                self.operational.rows(
+                    "SELECT state FROM fenced_leases WHERE lease_id=?",
+                    (lease.lease_id,),
+                )[0][0],
+                "HEARTBEATING",
+            )
+            portable = PortableDomainStore.open(self.portable_path)
+            portable.record_verified_identity(
+                "profile-a", "identity-b", START.isoformat()
+            )
+            portable.close()
+            original_revalidate(scope, snapshot, correlation_id)
+
+        with patch.object(
+            self.coordinator, "_revalidate_snapshot", side_effect=mutate_identity
+        ), \
+                self.assertRaises(AuthorityRejected):
+            self.coordinator.heartbeat(lease, "agent-a")
+
+        self.assertEqual(
+            self.operational.rows(
+                "SELECT state FROM fenced_leases WHERE lease_id=?",
+                (lease.lease_id,),
+            )[0][0],
+            "ACQUIRED",
+        )
+
+    def test_release_rolls_back_when_portable_binding_changes_before_commit(self):
+        lease = self.coordinator.acquire(self.scope, "agent-a", "idem-a")
+        original_revalidate = self.coordinator._revalidate_snapshot
+
+        def mutate_identity(scope, snapshot, correlation_id):
+            self.assertEqual(
+                self.operational.rows(
+                    "SELECT state FROM fenced_leases WHERE lease_id=?",
+                    (lease.lease_id,),
+                )[0][0],
+                "RELEASED",
+            )
+            portable = PortableDomainStore.open(self.portable_path)
+            portable.record_verified_identity(
+                "profile-a", "identity-b", START.isoformat()
+            )
+            portable.close()
+            original_revalidate(scope, snapshot, correlation_id)
+
+        with patch.object(
+            self.coordinator, "_revalidate_snapshot", side_effect=mutate_identity
+        ), \
+                self.assertRaises(AuthorityRejected):
+            self.coordinator.release(lease, "agent-a", "planned_shutdown")
+
+        self.assertEqual(
+            self.operational.rows(
+                "SELECT state FROM fenced_leases WHERE lease_id=?",
+                (lease.lease_id,),
+            )[0][0],
+            "ACQUIRED",
+        )
+
     def test_offline_binding_is_rejected_without_activation(self):
         portable = PortableDomainStore.open(self.portable_path)
         with portable.transaction():
@@ -193,6 +380,21 @@ class BindingAuthorityTests(unittest.TestCase):
 
         with self.assertRaises(AuthorityRejected):
             self.coordinator.acquire(self.scope, "agent-a", "idem-a")
+
+    def test_malformed_persisted_timestamp_is_structured_rejection(self):
+        lease = self.coordinator.acquire(self.scope, "agent-a", "idem-a")
+        self.operational.connection.execute(
+            "UPDATE fenced_leases SET expires_at='not-a-timestamp' WHERE lease_id=?",
+            (lease.lease_id,),
+        )
+
+        with self.assertRaises(AuthorityRejected) as raised:
+            self.coordinator.heartbeat(lease, "agent-a")
+
+        self.assertEqual(
+            raised.exception.evidence.reason_class,
+            "lease_timestamp_invalid",
+        )
 
     def test_generation_mismatch_is_rejected(self):
         wrong_scope = BindingScope("host-a", "profile-a", 2, "identity-a")
@@ -206,6 +408,26 @@ class BindingAuthorityTests(unittest.TestCase):
         with self.assertRaises(AuthorityRejected):
             self.coordinator.acquire(self.scope, "agent-b", "idem-a")
         self.assertEqual(self.coordinator.acquire(self.scope, "agent-a", "idem-a"), lease)
+
+    def test_idempotency_key_cannot_replay_released_or_expired_authority(self):
+        released = self.coordinator.acquire(self.scope, "agent-a", "idem-a")
+        self.coordinator.release(released, "agent-a", "planned_shutdown")
+        with self.assertRaises(AuthorityRejected) as released_error:
+            self.coordinator.acquire(self.scope, "agent-a", "idem-a")
+        self.assertEqual(
+            released_error.exception.evidence.reason_class,
+            "lease_not_current",
+        )
+
+        expired = self.coordinator.acquire(self.scope, "agent-a", "idem-b")
+        self.clock.advance(31)
+        with self.assertRaises(AuthorityRejected) as expired_error:
+            self.coordinator.acquire(self.scope, "agent-a", "idem-b")
+        self.assertEqual(
+            expired_error.exception.evidence.reason_class,
+            "lease_expired_requires_reconciliation",
+        )
+        self.assertEqual(expired.state, "ACQUIRED")
 
     def test_caller_cannot_supply_authority_timestamp_or_ttl(self):
         with self.assertRaises(TypeError):

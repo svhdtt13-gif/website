@@ -68,6 +68,11 @@ class BindingAuthorityCoordinator:
                 "WHERE status IN ('requested', 'claimable', 'claimed')"
             )
             self.operational.quarantine_execution_state("coordinator_restart")
+            self.operational.connection.execute(
+                "UPDATE authority_bound_dispatch_intents SET status='quarantined', "
+                "quarantine_reason='coordinator_restart' WHERE status IN "
+                "('prepared', 'unknown')"
+            )
         self.operational.requires_fresh_bootstrap = False
         return FenceIdentity(epoch, 0)
 

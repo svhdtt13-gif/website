@@ -220,6 +220,9 @@ class DispatchPreparationService:
         self.coordinator._current_lease_row(
             lease, owner_id, self.coordinator._now(correlation_id), correlation_id
         )
+        self.coordinator._revalidate_snapshot(
+            lease.scope, snapshot, correlation_id
+        )
         return row
 
     @staticmethod

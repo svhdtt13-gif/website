@@ -17,6 +17,7 @@ from services.authority_bound_targets import AuthorityBoundTargetService
 from services.authority_execution import AuthorityExecutionService
 from services.binding_authority import (
     AuthorityConfig,
+    AuthorityRejected,
     BindingAuthorityCoordinator,
     BindingScope,
 )
@@ -116,6 +117,44 @@ class DispatchPreparationReviewBlockerTests(unittest.TestCase):
             "unknown",
         )
 
+    def test_pre_write_binding_drift_rejects_without_terminal_mutation(self):
+        execution = self._execution()
+        prepared = self.preparation.prepare_intent(
+            execution["execution_id"], self.lease, "agent-a"
+        )
+        original = self.coordinator._revalidate_snapshot
+
+        def drift(scope, snapshot, correlation_id):
+            portable = PortableDomainStore.open(self.portable_path)
+            portable.record_verified_identity(
+                "profile-a", "identity-b", START.isoformat()
+            )
+            portable.close()
+            original(scope, snapshot, correlation_id)
+
+        with (
+            patch.object(self.coordinator, "_revalidate_snapshot", side_effect=drift),
+            self.assertRaises(AuthorityRejected),
+        ):
+            self.preparation.record_unknown(
+                prepared["intent_id"],
+                self.lease,
+                "agent-a",
+                "ack_ambiguous",
+                "evidence-1",
+            )
+
+        self.assertEqual(
+            tuple(
+                self.operational.rows(
+                    "SELECT status, unknown_reason, evidence_ref "
+                    "FROM authority_bound_dispatch_intents WHERE intent_id=?",
+                    (prepared["intent_id"],),
+                )[0]
+            ),
+            ("prepared", None, None),
+        )
+
     def test_reconciled_remains_terminal_when_binding_drifts_during_terminal_write(self):
         execution = self._execution()
         prepared = self.preparation.prepare_intent(
@@ -197,6 +236,12 @@ class DispatchPreparationReviewBlockerTests(unittest.TestCase):
         self.assertEqual(
             self.operational.rows(
                 "SELECT COUNT(*) FROM authority_bound_dispatch_intents"
+            )[0][0],
+            1,
+        )
+        self.assertEqual(
+            self.operational.rows(
+                "SELECT COUNT(*) FROM authority_bound_attempts"
             )[0][0],
             1,
         )

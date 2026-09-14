@@ -68,6 +68,17 @@ class DispatchPreparationService:
                 self.store.require_context(
                     existing, target, lease, owner_id, correlation_id
                 )
+                try:
+                    self.coordinator._revalidate_snapshot(
+                        lease.scope, snapshot, correlation_id
+                    )
+                except AuthorityRejected as rejected:
+                    self.store.block(
+                        existing["intent_id"], rejected.evidence.reason_class
+                    )
+                    return self.store.result(
+                        self.store.intent(existing["intent_id"]), "blocked"
+                    )
                 return self.store.result(existing, "idempotent_replay")
 
             now = self.coordinator._now(correlation_id).isoformat()
@@ -122,6 +133,11 @@ class DispatchPreparationService:
                 intent_id, lease, owner_id, snapshot, correlation_id
             )
             if row["status"] == "unknown":
+                if (
+                    row["unknown_reason"] != reason
+                    or row["evidence_ref"] != evidence_ref
+                ):
+                    raise _reject(correlation_id, "unknown_conflict")
                 return self.store.result(row, "idempotent_replay")
             if row["status"] != "prepared":
                 raise _reject(correlation_id, "intent_not_unknownable")
@@ -153,6 +169,11 @@ class DispatchPreparationService:
                 intent_id, lease, owner_id, snapshot, correlation_id
             )
             if row["status"] == "reconciled":
+                if (
+                    row["reconciliation_result"] != result
+                    or row["evidence_ref"] != evidence_ref
+                ):
+                    raise _reject(correlation_id, "reconciliation_conflict")
                 return self.store.result(row, "idempotent_replay")
             if row["status"] != "unknown":
                 raise _reject(correlation_id, "intent_not_reconcilable")

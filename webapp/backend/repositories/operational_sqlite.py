@@ -347,6 +347,7 @@ CREATE TABLE IF NOT EXISTS authority_bound_dispatch_intents (
   blocked_reason TEXT,
   unknown_reason TEXT,
   evidence_ref TEXT,
+  reconciliation_evidence_ref TEXT,
   reconciliation_result TEXT CHECK
     (reconciliation_result IN ('succeeded','failed') OR reconciliation_result IS NULL),
   created_at TEXT NOT NULL,

@@ -6,6 +6,7 @@ from pathlib import Path
 
 from repositories.operational_sqlite import OperationalSQLiteRepository
 
+from services.authority_bound_targets import AuthorityBoundTargetService
 from services.authority_execution_context import (
     require_execution_context,
     validate_reference,
@@ -50,24 +51,42 @@ class DispatchPreparationService:
         correlation_id = _correlation_id(request_id)
         validate_reference(execution_id, "execution_id", correlation_id)
         validate_reference(owner_id, "owner_id", correlation_id)
-        snapshot = self.coordinator._require_snapshot(lease.scope, correlation_id)
 
         with self.operational.transaction():
             execution, attempt, target = self.store.execution_context(
                 execution_id, correlation_id
             )
+            existing = self.store.intent_for_execution(execution_id)
             require_execution_context(
                 execution, attempt, target, lease, owner_id, correlation_id
             )
             self.store.require_claimed(execution, attempt, correlation_id)
-            self.coordinator._current_lease_row(
-                lease, owner_id, self.coordinator._now(correlation_id), correlation_id
-            )
-            existing = self.store.intent_for_execution(execution_id)
             if existing is not None:
                 self.store.require_context(
                     existing, target, lease, owner_id, correlation_id
                 )
+            try:
+                snapshot = self.coordinator._require_snapshot(
+                    lease.scope, correlation_id
+                )
+                self.coordinator._current_lease_row(
+                    lease,
+                    owner_id,
+                    self.coordinator._now(correlation_id),
+                    correlation_id,
+                )
+            except AuthorityRejected as rejected:
+                if existing is None or existing["status"] != "prepared":
+                    raise
+                self.store.block(
+                    existing["intent_id"], rejected.evidence.reason_class
+                )
+                return self.store.result(
+                    self.store.intent(existing["intent_id"]), "blocked"
+                )
+            if existing is not None:
+                if existing["status"] != "prepared":
+                    return self.store.result(existing, "idempotent_replay")
                 try:
                     self.coordinator._revalidate_snapshot(
                         lease.scope, snapshot, correlation_id
@@ -171,7 +190,7 @@ class DispatchPreparationService:
             if row["status"] == "reconciled":
                 if (
                     row["reconciliation_result"] != result
-                    or row["evidence_ref"] != evidence_ref
+                    or row["reconciliation_evidence_ref"] != evidence_ref
                 ):
                     raise _reject(correlation_id, "reconciliation_conflict")
                 return self.store.result(row, "idempotent_replay")
@@ -180,7 +199,8 @@ class DispatchPreparationService:
             now = self.coordinator._now(correlation_id).isoformat()
             self.operational.connection.execute(
                 "UPDATE authority_bound_dispatch_intents SET status='reconciled', "
-                "reconciliation_result=?, evidence_ref=?, reconciled_at=? "
+                "reconciliation_result=?, reconciliation_evidence_ref=?, "
+                "reconciled_at=? "
                 "WHERE intent_id=?",
                 (result, evidence_ref, now, intent_id),
             )
@@ -217,5 +237,11 @@ class DispatchPreparationService:
     def _validate_unknown_fields(reason, evidence_ref, correlation_id):
         if not isinstance(reason, str) or not _UNKNOWN_REASON.fullmatch(reason):
             raise _reject(correlation_id, "unknown_reason_invalid")
-        if not isinstance(evidence_ref, str) or not _EVIDENCE_REFERENCE.fullmatch(evidence_ref):
+        try:
+            AuthorityBoundTargetService._validate_reference(
+                evidence_ref, "evidence_ref", correlation_id
+            )
+        except AuthorityRejected:
+            raise _reject(correlation_id, "evidence_reference_invalid") from None
+        if not _EVIDENCE_REFERENCE.fullmatch(evidence_ref):
             raise _reject(correlation_id, "evidence_reference_invalid")

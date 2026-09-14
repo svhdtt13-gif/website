@@ -140,10 +140,11 @@ class DispatchPreparationTests(unittest.TestCase):
             execution["execution_id"], self.lease, "agent-a"
         )
         self.coordinator.release(self.lease, "agent-a", "test_release")
-        with self.assertRaises(AuthorityRejected):
-            self.preparation.prepare_intent(
-                execution["execution_id"], self.lease, "agent-a"
-            )
+        result = self.preparation.prepare_intent(
+            execution["execution_id"], self.lease, "agent-a"
+        )
+        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(result["blocked_reason"], "lease_not_current")
 
     def test_existing_intent_replay_after_binding_drift_fails_closed(self):
         execution = self._execution()
@@ -153,10 +154,11 @@ class DispatchPreparationTests(unittest.TestCase):
         portable = PortableDomainStore.open(self.portable_path)
         portable.record_verified_identity("profile-a", "identity-b", START.isoformat())
         portable.close()
-        with self.assertRaises(AuthorityRejected):
-            self.preparation.prepare_intent(
-                execution["execution_id"], self.lease, "agent-a"
-            )
+        result = self.preparation.prepare_intent(
+            execution["execution_id"], self.lease, "agent-a"
+        )
+        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(result["blocked_reason"], "verified_identity_mismatch")
 
     def test_revalidation_drift_blocks_new_intent_without_eligibility(self):
         execution = self._execution()
@@ -202,6 +204,10 @@ class DispatchPreparationTests(unittest.TestCase):
         self.assertEqual(replay["status"], "unknown")
         self.assertEqual(reconciled["status"], "reconciled")
         self.assertEqual(reconciled["reconciliation_result"], "succeeded")
+        self.assertEqual(reconciled["evidence_ref"], "evidence-1")
+        self.assertEqual(
+            reconciled["reconciliation_evidence_ref"], "reconcile-1"
+        )
         self.assertEqual(
             self.operational.rows(
                 "SELECT COUNT(*) FROM authority_bound_dispatch_intents"
@@ -225,11 +231,14 @@ class DispatchPreparationTests(unittest.TestCase):
                 unknown["intent_id"], self.lease, "agent-a", "failed", "reconcile-2"
             )
         row = self.operational.rows(
-            "SELECT status, reconciliation_result, evidence_ref "
+            "SELECT status, reconciliation_result, evidence_ref, "
+            "reconciliation_evidence_ref "
             "FROM authority_bound_dispatch_intents WHERE intent_id=?",
             (unknown["intent_id"],),
         )[0]
-        self.assertEqual(tuple(row), ("reconciled", "succeeded", "reconcile-1"))
+        self.assertEqual(
+            tuple(row), ("reconciled", "succeeded", "evidence-1", "reconcile-1")
+        )
 
     def test_sensitive_reconciliation_evidence_is_rejected(self):
         execution = self._execution()
@@ -239,6 +248,14 @@ class DispatchPreparationTests(unittest.TestCase):
         with self.assertRaises(AuthorityRejected):
             self.preparation.record_unknown(
                 prepared["intent_id"], self.lease, "agent-a", "ack_ambiguous", "session-token"
+            )
+        with self.assertRaises(AuthorityRejected):
+            self.preparation.record_unknown(
+                prepared["intent_id"],
+                self.lease,
+                "agent-a",
+                "ack_ambiguous",
+                "evidence-access_token-secret",
             )
 
     def test_restart_and_restore_quarantine_live_intent(self):

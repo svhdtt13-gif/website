@@ -18,6 +18,8 @@ from repositories.operational_sqlite import (
     SCHEMA_V3_SQL,
     SCHEMA_V4_CHECKSUM,
     SCHEMA_V4_SQL,
+    SCHEMA_V5_CHECKSUM,
+    SCHEMA_V5_SQL,
     OperationalSchemaError,
     OperationalSQLiteRepository,
     operational_path,
@@ -72,7 +74,7 @@ class OperationalMigrationTests(unittest.TestCase):
         finally:
             connection.close()
 
-    def test_v2_to_v5_failure_rolls_back_and_reopen_resumes(self):
+    def test_v2_to_v6_failure_rolls_back_and_reopen_resumes(self):
         self.operational.close()
         path = operational_path(self.runtime)
         path.unlink()
@@ -119,11 +121,16 @@ class OperationalMigrationTests(unittest.TestCase):
             self.operational.rows(
                 "SELECT value FROM schema_meta WHERE key='schema_version'"
             )[0][0],
-            "5",
+            "6",
         )
         self.assertIsNotNone(
             self.operational.rows(
                 "SELECT 1 FROM sqlite_master WHERE name='authority_bound_targets'"
+            )[0]
+        )
+        self.assertIsNotNone(
+            self.operational.rows(
+                "SELECT 1 FROM sqlite_master WHERE name='authority_bound_dispatch_intents'"
             )[0]
         )
 
@@ -178,7 +185,7 @@ class OperationalMigrationTests(unittest.TestCase):
         finally:
             connection.close()
 
-    def test_v4_to_v5_migration_installs_execution_identity_tables(self):
+    def test_v4_to_v6_migration_installs_execution_and_dispatch_tables(self):
         self.operational.close()
         path = operational_path(self.runtime)
         path.unlink()
@@ -203,7 +210,7 @@ class OperationalMigrationTests(unittest.TestCase):
             repository.rows(
                 "SELECT value FROM schema_meta WHERE key='schema_version'"
             )[0][0],
-            "5",
+            "6",
         )
         self.assertIsNotNone(
             repository.rows(
@@ -213,6 +220,11 @@ class OperationalMigrationTests(unittest.TestCase):
         self.assertIsNotNone(
             repository.rows(
                 "SELECT 1 FROM sqlite_master WHERE name='authority_bound_attempts'"
+            )[0]
+        )
+        self.assertIsNotNone(
+            repository.rows(
+                "SELECT 1 FROM sqlite_master WHERE name='authority_bound_dispatch_intents'"
             )[0]
         )
 
@@ -258,6 +270,80 @@ class OperationalMigrationTests(unittest.TestCase):
         finally:
             connection.close()
 
+    def test_v5_to_v6_migration_installs_dispatch_schema(self):
+        self.operational.close()
+        path = operational_path(self.runtime)
+        path.unlink()
+        connection = sqlite3.connect(path)
+        try:
+            connection.executescript(SCHEMA_V5_SQL)
+            connection.execute(
+                "INSERT INTO schema_meta(key, value) VALUES (?, ?), (?, ?)",
+                ("schema_version", "5", "schema_checksum", SCHEMA_V5_CHECKSUM),
+            )
+            connection.execute(
+                "INSERT INTO authority_state VALUES (1, ?, 0, 0)",
+                ("epoch-v5",),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        repository = OperationalSQLiteRepository.open(self.runtime)
+        self.operational = repository
+        self.assertEqual(
+            repository.rows(
+                "SELECT value FROM schema_meta WHERE key='schema_version'"
+            )[0][0],
+            "6",
+        )
+        self.assertIsNotNone(
+            repository.rows(
+                "SELECT 1 FROM sqlite_master WHERE name='authority_bound_dispatch_intents'"
+            )[0]
+        )
+
+    def test_v5_to_v6_failure_rolls_back_dispatch_schema_installation(self):
+        self.operational.close()
+        path = operational_path(self.runtime)
+        path.unlink()
+        connection = sqlite3.connect(path)
+        try:
+            connection.executescript(SCHEMA_V5_SQL)
+            connection.execute(
+                "INSERT INTO schema_meta(key, value) VALUES (?, ?), (?, ?)",
+                ("schema_version", "5", "schema_checksum", SCHEMA_V5_CHECKSUM),
+            )
+            connection.execute(
+                "INSERT INTO authority_state VALUES (1, ?, 0, 0)",
+                ("epoch-v5",),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        with patch.object(
+            OperationalSQLiteRepository,
+            "_install_dispatch_schema",
+            side_effect=RuntimeError("dispatch schema unavailable"),
+        ), self.assertRaises(RuntimeError):
+            OperationalSQLiteRepository.open(self.runtime)
+
+        connection = sqlite3.connect(path)
+        try:
+            self.assertEqual(
+                connection.execute(
+                    "SELECT value FROM schema_meta WHERE key='schema_version'"
+                ).fetchone()[0],
+                "5",
+            )
+            self.assertIsNone(
+                connection.execute(
+                    "SELECT 1 FROM sqlite_master WHERE name='authority_bound_dispatch_intents'"
+                ).fetchone()
+            )
+        finally:
+            connection.close()
 
 if __name__ == "__main__":
     unittest.main()

@@ -14,7 +14,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 OPERATIONAL_FILENAME = "p4_operational.sqlite3"
 OPERATIONAL_DIRNAME = "operational"
 BACKUP_DIRNAME = "backups"
@@ -319,7 +319,51 @@ CREATE INDEX IF NOT EXISTS authority_executions_scope_idx
 CREATE INDEX IF NOT EXISTS authority_attempts_execution_idx
   ON authority_bound_attempts(execution_id, attempt_number);
 """
-SCHEMA_SQL = SCHEMA_V4_SQL + EXECUTION_TABLES_SQL
+SCHEMA_V5_SQL = SCHEMA_V4_SQL + EXECUTION_TABLES_SQL
+SCHEMA_V5_CHECKSUM = hashlib.sha256(SCHEMA_V5_SQL.encode("utf-8")).hexdigest()
+
+DISPATCH_INTENTS_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS authority_bound_dispatch_intents (
+  intent_id TEXT PRIMARY KEY,
+  execution_id TEXT NOT NULL UNIQUE REFERENCES authority_bound_executions(execution_id),
+  attempt_id TEXT NOT NULL UNIQUE REFERENCES authority_bound_attempts(attempt_id),
+  target_id TEXT NOT NULL UNIQUE REFERENCES authority_bound_targets(target_id),
+  job_id TEXT NOT NULL UNIQUE,
+  idempotency_key TEXT NOT NULL UNIQUE,
+  operation_kind TEXT NOT NULL,
+  target_ref TEXT NOT NULL,
+  request_fingerprint TEXT NOT NULL,
+  host_id TEXT NOT NULL,
+  profile_id TEXT NOT NULL,
+  binding_generation INTEGER NOT NULL CHECK (binding_generation > 0),
+  verified_identity_ref TEXT NOT NULL,
+  verified_identity_revision INTEGER NOT NULL CHECK (verified_identity_revision > 0),
+  authority_epoch TEXT NOT NULL,
+  fence_counter INTEGER NOT NULL CHECK (fence_counter > 0),
+  owner_id TEXT NOT NULL,
+  lease_id TEXT NOT NULL,
+  status TEXT NOT NULL CHECK
+    (status IN ('prepared','blocked','unknown','reconciled','quarantined')),
+  blocked_reason TEXT,
+  unknown_reason TEXT,
+  evidence_ref TEXT,
+  reconciliation_result TEXT CHECK
+    (reconciliation_result IN ('succeeded','failed') OR reconciliation_result IS NULL),
+  created_at TEXT NOT NULL,
+  prepared_at TEXT,
+  unknown_at TEXT,
+  reconciled_at TEXT,
+  quarantine_reason TEXT
+);
+
+CREATE INDEX IF NOT EXISTS dispatch_intents_status_idx
+  ON authority_bound_dispatch_intents(status, created_at);
+CREATE INDEX IF NOT EXISTS dispatch_intents_scope_idx
+  ON authority_bound_dispatch_intents(host_id, profile_id, binding_generation,
+                                      verified_identity_ref, verified_identity_revision,
+                                      authority_epoch, fence_counter);
+"""
+SCHEMA_SQL = SCHEMA_V5_SQL + DISPATCH_INTENTS_TABLE_SQL
 SCHEMA_CHECKSUM = hashlib.sha256(SCHEMA_SQL.encode("utf-8")).hexdigest()
 
 
@@ -664,6 +708,7 @@ class OperationalSQLiteRepository:
                 self._rebuild_v2_fenced_leases()
                 self._install_authority_target_schema()
                 self._install_execution_schema()
+                self._install_dispatch_schema()
                 self.connection.execute(
                     "UPDATE schema_meta SET value=? WHERE key='schema_version'",
                     (str(SCHEMA_VERSION),),
@@ -685,6 +730,7 @@ class OperationalSQLiteRepository:
                 self._verify_v3_before_migration(values)
                 self._install_authority_target_schema()
                 self._install_execution_schema()
+                self._install_dispatch_schema()
                 self.connection.execute(
                     "UPDATE schema_meta SET value=? WHERE key='schema_version'",
                     (str(SCHEMA_VERSION),),
@@ -705,6 +751,27 @@ class OperationalSQLiteRepository:
                     return
                 self._verify_v4_before_migration(values)
                 self._install_execution_schema()
+                self._install_dispatch_schema()
+                self.connection.execute(
+                    "UPDATE schema_meta SET value=? WHERE key='schema_version'",
+                    (str(SCHEMA_VERSION),),
+                )
+                self.connection.execute(
+                    "UPDATE schema_meta SET value=? WHERE key='schema_checksum'",
+                    (SCHEMA_CHECKSUM,),
+                )
+            return
+        if version == "5":
+            with self.transaction():
+                values = dict(
+                    self.connection.execute(
+                        "SELECT key, value FROM schema_meta"
+                    ).fetchall()
+                )
+                if values.get("schema_version") != "5":
+                    return
+                self._verify_v5_before_migration(values)
+                self._install_dispatch_schema()
                 self.connection.execute(
                     "UPDATE schema_meta SET value=? WHERE key='schema_version'",
                     (str(SCHEMA_VERSION),),
@@ -757,6 +824,7 @@ class OperationalSQLiteRepository:
             )
             self._install_authority_target_schema()
             self._install_execution_schema()
+            self._install_dispatch_schema()
             self.connection.execute(
                 "INSERT INTO authority_state "
                 "(singleton, authority_epoch, fence_counter, quarantined) "
@@ -785,6 +853,12 @@ class OperationalSQLiteRepository:
             if statement:
                 self.connection.execute(statement)
 
+    def _install_dispatch_schema(self):
+        for statement in DISPATCH_INTENTS_TABLE_SQL.split(";"):
+            statement = statement.strip()
+            if statement:
+                self.connection.execute(statement)
+
     def _verify_v2_before_migration(self, values):
         if values.get("schema_checksum") != SCHEMA_V2_CHECKSUM:
             raise OperationalSchemaError("operational v2 schema checksum mismatch")
@@ -808,6 +882,14 @@ class OperationalSQLiteRepository:
             raise OperationalSchemaError("operational v4 schema is not trusted")
         if not _integrity_ok(self.connection):
             raise OperationalIntegrityError("operational v4 SQLite integrity check failed")
+
+    def _verify_v5_before_migration(self, values):
+        if values.get("schema_checksum") != SCHEMA_V5_CHECKSUM:
+            raise OperationalSchemaError("operational v5 schema checksum mismatch")
+        if _schema_identity(self.connection) != _expected_schema_identity(SCHEMA_V5_SQL):
+            raise OperationalSchemaError("operational v5 schema is not trusted")
+        if not _integrity_ok(self.connection):
+            raise OperationalIntegrityError("operational v5 SQLite integrity check failed")
 
     def _rebuild_v2_fenced_leases(self):
         self.connection.execute("DROP INDEX IF EXISTS fenced_live_scope_idx")
@@ -1064,6 +1146,11 @@ class OperationalSQLiteRepository:
                 "WHERE status IN ('requested', 'claimable', 'claimed')"
             )
             self.quarantine_execution_state("operational_restore")
+            self.connection.execute(
+                "UPDATE authority_bound_dispatch_intents SET status='quarantined', "
+                "quarantine_reason='operational_restore' WHERE status IN "
+                "('prepared', 'unknown')"
+            )
 
     def quarantine_execution_state(self, reason):
         self.connection.execute(

@@ -16,6 +16,8 @@ from repositories.operational_sqlite import (
     SCHEMA_V2_SQL,
     SCHEMA_V3_CHECKSUM,
     SCHEMA_V3_SQL,
+    SCHEMA_V4_CHECKSUM,
+    SCHEMA_V4_SQL,
     OperationalSchemaError,
     OperationalSQLiteRepository,
     operational_path,
@@ -70,7 +72,7 @@ class OperationalMigrationTests(unittest.TestCase):
         finally:
             connection.close()
 
-    def test_v2_to_v4_failure_rolls_back_and_reopen_resumes(self):
+    def test_v2_to_v5_failure_rolls_back_and_reopen_resumes(self):
         self.operational.close()
         path = operational_path(self.runtime)
         path.unlink()
@@ -117,7 +119,7 @@ class OperationalMigrationTests(unittest.TestCase):
             self.operational.rows(
                 "SELECT value FROM schema_meta WHERE key='schema_version'"
             )[0][0],
-            "4",
+            "5",
         )
         self.assertIsNotNone(
             self.operational.rows(
@@ -171,6 +173,86 @@ class OperationalMigrationTests(unittest.TestCase):
             self.assertIsNone(
                 connection.execute(
                     "SELECT 1 FROM sqlite_master WHERE name='authority_bound_targets'"
+                ).fetchone()
+            )
+        finally:
+            connection.close()
+
+    def test_v4_to_v5_migration_installs_execution_identity_tables(self):
+        self.operational.close()
+        path = operational_path(self.runtime)
+        path.unlink()
+        connection = sqlite3.connect(path)
+        try:
+            connection.executescript(SCHEMA_V4_SQL)
+            connection.execute(
+                "INSERT INTO schema_meta(key, value) VALUES (?, ?), (?, ?)",
+                ("schema_version", "4", "schema_checksum", SCHEMA_V4_CHECKSUM),
+            )
+            connection.execute(
+                "INSERT INTO authority_state VALUES (1, ?, 0, 0)",
+                ("epoch-v4",),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        repository = OperationalSQLiteRepository.open(self.runtime)
+        self.operational = repository
+        self.assertEqual(
+            repository.rows(
+                "SELECT value FROM schema_meta WHERE key='schema_version'"
+            )[0][0],
+            "5",
+        )
+        self.assertIsNotNone(
+            repository.rows(
+                "SELECT 1 FROM sqlite_master WHERE name='authority_bound_executions'"
+            )[0]
+        )
+        self.assertIsNotNone(
+            repository.rows(
+                "SELECT 1 FROM sqlite_master WHERE name='authority_bound_attempts'"
+            )[0]
+        )
+
+    def test_v4_to_v5_failure_rolls_back_execution_schema_installation(self):
+        self.operational.close()
+        path = operational_path(self.runtime)
+        path.unlink()
+        connection = sqlite3.connect(path)
+        try:
+            connection.executescript(SCHEMA_V4_SQL)
+            connection.execute(
+                "INSERT INTO schema_meta(key, value) VALUES (?, ?), (?, ?)",
+                ("schema_version", "4", "schema_checksum", SCHEMA_V4_CHECKSUM),
+            )
+            connection.execute(
+                "INSERT INTO authority_state VALUES (1, ?, 0, 0)",
+                ("epoch-v4",),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        with patch.object(
+            OperationalSQLiteRepository,
+            "_install_execution_schema",
+            side_effect=RuntimeError("execution schema unavailable"),
+        ), self.assertRaises(RuntimeError):
+            OperationalSQLiteRepository.open(self.runtime)
+
+        connection = sqlite3.connect(path)
+        try:
+            self.assertEqual(
+                connection.execute(
+                    "SELECT value FROM schema_meta WHERE key='schema_version'"
+                ).fetchone()[0],
+                "4",
+            )
+            self.assertIsNone(
+                connection.execute(
+                    "SELECT 1 FROM sqlite_master WHERE name='authority_bound_executions'"
                 ).fetchone()
             )
         finally:

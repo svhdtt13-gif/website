@@ -67,6 +67,7 @@ class BindingAuthorityCoordinator:
                 "quarantine_reason='coordinator_restart' "
                 "WHERE status IN ('requested', 'claimable', 'claimed')"
             )
+            self.operational.quarantine_execution_state("coordinator_restart")
         self.operational.requires_fresh_bootstrap = False
         return FenceIdentity(epoch, 0)
 

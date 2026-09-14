@@ -166,7 +166,6 @@ class DispatchPreparationService:
                 "unknown_reason=?, evidence_ref=?, unknown_at=? WHERE intent_id=?",
                 (reason, evidence_ref, now, intent_id),
             )
-            self._revalidate_or_block(intent_id, lease, snapshot, owner_id, correlation_id)
             return self.store.result(self.store.intent(intent_id), "unknown_recorded")
 
     def reconcile_unknown(
@@ -204,7 +203,6 @@ class DispatchPreparationService:
                 "WHERE intent_id=?",
                 (result, evidence_ref, now, intent_id),
             )
-            self._revalidate_or_block(intent_id, lease, snapshot, owner_id, correlation_id)
             return self.store.result(self.store.intent(intent_id), "reconciled")
 
     def _guard_intent(self, intent_id, lease, owner_id, snapshot, correlation_id):
@@ -223,15 +221,6 @@ class DispatchPreparationService:
             lease, owner_id, self.coordinator._now(correlation_id), correlation_id
         )
         return row
-
-    def _revalidate_or_block(self, intent_id, lease, snapshot, owner_id, correlation_id):
-        try:
-            self.coordinator._revalidate_snapshot(lease.scope, snapshot, correlation_id)
-            self.coordinator._current_lease_row(
-                lease, owner_id, self.coordinator._now(correlation_id), correlation_id
-            )
-        except AuthorityRejected as rejected:
-            self.store.block(intent_id, rejected.evidence.reason_class)
 
     @staticmethod
     def _validate_unknown_fields(reason, evidence_ref, correlation_id):

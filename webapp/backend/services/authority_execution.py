@@ -61,6 +61,12 @@ class AuthorityExecutionService:
                 require_execution_context(
                     existing, attempt, target, lease, owner_id, correlation_id
                 )
+                self.coordinator._current_lease_row(
+                    lease, owner_id, self.coordinator._now(correlation_id), correlation_id
+                )
+                self.coordinator._revalidate_snapshot(
+                    lease.scope, snapshot, correlation_id
+                )
                 return self._result(existing, attempt, "idempotent_replay")
 
             execution_id = "execution-" + secrets.token_hex(16)

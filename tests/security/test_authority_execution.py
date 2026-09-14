@@ -4,6 +4,7 @@ import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "webapp" / "backend"))
@@ -103,6 +104,42 @@ class AuthorityExecutionTests(unittest.TestCase):
             self.operational.rows("SELECT COUNT(*) FROM authority_bound_attempts")[0][0],
             1,
         )
+
+    def test_idempotent_replay_after_lease_release_fails_closed(self):
+        execution = self._create()
+        self.coordinator.release(self.lease, "agent-a", "test_release")
+        with self.assertRaises(AuthorityRejected):
+            self.executions.create_execution(
+                execution["target_id"], self.lease, "agent-a"
+            )
+
+    def test_idempotent_replay_after_lease_expiry_fails_closed(self):
+        execution = self._create()
+        self.clock.current += timedelta(seconds=31)
+        with self.assertRaises(AuthorityRejected):
+            self.executions.create_execution(
+                execution["target_id"], self.lease, "agent-a"
+            )
+
+    def test_idempotent_replay_revalidates_binding_snapshot_before_eligibility(self):
+        execution = self._create()
+        original = self.coordinator._revalidate_snapshot
+
+        def drift(scope, snapshot, correlation_id):
+            portable = PortableDomainStore.open(self.portable_path)
+            portable.record_verified_identity(
+                "profile-a", "identity-b", START.isoformat()
+            )
+            portable.close()
+            original(scope, snapshot, correlation_id)
+
+        with (
+            patch.object(self.coordinator, "_revalidate_snapshot", side_effect=drift),
+            self.assertRaises(AuthorityRejected),
+        ):
+            self.executions.create_execution(
+                execution["target_id"], self.lease, "agent-a"
+            )
 
     def test_validation_requires_the_full_ownership_tuple(self):
         execution = self._create()

@@ -12,6 +12,8 @@ sys.path.insert(0, str(ROOT / "webapp" / "backend"))
 from repositories.operational_sqlite import (
     SCHEMA_V6_CHECKSUM,
     SCHEMA_V6_SQL,
+    SCHEMA_V7_CHECKSUM,
+    SCHEMA_V7_SQL,
     OperationalSchemaError,
     OperationalSQLiteRepository,
     operational_path,
@@ -104,6 +106,44 @@ class ShadowMigrationTests(unittest.TestCase):
         finally:
             connection.close()
 
+    def _write_v7_database(self, populated=False):
+        self._write_v6_database()
+        path = operational_path(self.runtime)
+        connection = sqlite3.connect(path)
+        try:
+            connection.executescript(SCHEMA_V7_SQL[len(SCHEMA_V6_SQL):])
+            connection.execute(
+                "UPDATE schema_meta SET value='7' WHERE key='schema_version'"
+            )
+            connection.execute(
+                "UPDATE schema_meta SET value=? WHERE key='schema_checksum'",
+                (SCHEMA_V7_CHECKSUM,),
+            )
+            if populated:
+                connection.execute(
+                    "INSERT INTO authority_bound_shadow_evaluations ("
+                    "shadow_evaluation_id, intent_id, execution_id, attempt_id, target_id, "
+                    "job_id, intent_idempotency_key, request_idempotency_key, operation_kind, "
+                    "target_ref, host_id, profile_id, binding_generation, verified_identity_ref, "
+                    "verified_identity_revision, authority_epoch, fence_counter, owner_id, lease_id, "
+                    "envelope_version, transport_kind, portable_snapshot_fingerprint, "
+                    "prepared_request_fingerprint, envelope_json, envelope_fingerprint, "
+                    "transport_fingerprint, outcome, reason_class, created_at, evaluated_at) VALUES ("
+                    + ",".join("?" for _ in range(30))
+                    + ")",
+                    (
+                        "shadow-v7", "intent-v6", "execution-v6", "attempt-v6",
+                        "target-v6", "job-v6", "dispatch-v6", "shadow-key-v7",
+                        "refresh", "profile-a", "host-a", "profile-a", 1,
+                        "identity-a", 1, "epoch-v6", 1, "agent-a", "lease-v6",
+                        1, "recording", "snapshot-v7", "request-v6", "{}",
+                        "a" * 64, "a" * 64, "matched", None, "now", "now",
+                    ),
+                )
+            connection.commit()
+        finally:
+            connection.close()
+
     def test_v6_to_v7_installs_shadow_evaluations(self):
         self._write_v6_database()
         repository = OperationalSQLiteRepository.open(self.runtime)
@@ -112,7 +152,7 @@ class ShadowMigrationTests(unittest.TestCase):
             repository.rows(
                 "SELECT value FROM schema_meta WHERE key='schema_version'"
             )[0][0],
-            "7",
+            "8",
         )
         self.assertIsNotNone(
             repository.rows(
@@ -131,7 +171,7 @@ class ShadowMigrationTests(unittest.TestCase):
             self.operational.rows(
                 "SELECT value FROM schema_meta WHERE key='schema_version'"
             )[0][0],
-            "7",
+            "8",
         )
         self.assertEqual(
             tuple(
@@ -203,6 +243,104 @@ class ShadowMigrationTests(unittest.TestCase):
                 connection.execute(
                     "SELECT 1 FROM sqlite_master "
                     "WHERE name='authority_bound_shadow_evaluations'"
+                ).fetchone()
+            )
+        finally:
+            connection.close()
+
+    def test_v7_to_v8_preserves_populated_shadow_data_and_reopens(self):
+        self._write_v7_database(populated=True)
+
+        repository = OperationalSQLiteRepository.open(self.runtime)
+        repository.close()
+        self.operational = OperationalSQLiteRepository.open(self.runtime)
+
+        self.assertEqual(
+            self.operational.rows(
+                "SELECT value FROM schema_meta WHERE key='schema_version'"
+            )[0][0],
+            "8",
+        )
+        self.assertEqual(
+            self.operational.rows(
+                "SELECT outcome FROM authority_bound_shadow_evaluations "
+                "WHERE shadow_evaluation_id='shadow-v7'"
+            )[0][0],
+            "matched",
+        )
+        self.assertIsNotNone(
+            self.operational.rows(
+                "SELECT 1 FROM sqlite_master "
+                "WHERE name='authority_bound_canary_candidates'"
+            )[0]
+        )
+
+    def test_v7_checksum_tamper_rejects_before_canary_migration(self):
+        self._write_v7_database()
+        path = operational_path(self.runtime)
+        connection = sqlite3.connect(path)
+        try:
+            connection.execute(
+                "UPDATE schema_meta SET value='tampered' WHERE key='schema_checksum'"
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        with self.assertRaises(OperationalSchemaError):
+            OperationalSQLiteRepository.open(self.runtime)
+
+        connection = sqlite3.connect(path)
+        try:
+            self.assertEqual(
+                connection.execute(
+                    "SELECT value FROM schema_meta WHERE key='schema_version'"
+                ).fetchone()[0],
+                "7",
+            )
+            self.assertIsNone(
+                connection.execute(
+                    "SELECT 1 FROM sqlite_master "
+                    "WHERE name='authority_bound_canary_candidates'"
+                ).fetchone()
+            )
+        finally:
+            connection.close()
+
+    def test_v7_identity_tamper_rejects_before_canary_migration(self):
+        self._write_v7_database()
+        path = operational_path(self.runtime)
+        connection = sqlite3.connect(path)
+        try:
+            connection.execute("DROP INDEX shadow_evaluations_outcome_idx")
+            connection.commit()
+        finally:
+            connection.close()
+
+        with self.assertRaises(OperationalSchemaError):
+            OperationalSQLiteRepository.open(self.runtime)
+
+    def test_v7_to_v8_failure_rolls_back_schema_and_metadata(self):
+        self._write_v7_database()
+        with patch.object(
+            OperationalSQLiteRepository,
+            "_install_canary_schema",
+            side_effect=RuntimeError("canary schema unavailable"),
+        ), self.assertRaises(RuntimeError):
+            OperationalSQLiteRepository.open(self.runtime)
+
+        connection = sqlite3.connect(operational_path(self.runtime))
+        try:
+            self.assertEqual(
+                connection.execute(
+                    "SELECT value FROM schema_meta WHERE key='schema_version'"
+                ).fetchone()[0],
+                "7",
+            )
+            self.assertIsNone(
+                connection.execute(
+                    "SELECT 1 FROM sqlite_master "
+                    "WHERE name='authority_bound_canary_candidates'"
                 ).fetchone()
             )
         finally:

@@ -17,22 +17,25 @@ from services.binding_authority import (
     BindingAuthorityCoordinator,
 )
 from services.shadow_dispatch import DryRunShadowDispatcher
-from services.shadow_dispatch_transport import RecordingShadowTransport
+from services.shadow_dispatch_transport import (
+    NullShadowTransport,
+    RecordingShadowTransport,
+)
 from shadow_dispatch_support import ShadowDispatchFixture
 
 
 class ShadowDispatchAuthorityTests(ShadowDispatchFixture, unittest.TestCase):
-    def test_released_lease_blocks_before_transport_and_persists_reason(self):
+    def test_released_lease_rejects_before_shadow_persistence(self):
         _execution, intent = self.prepared()
         self.coordinator.release(self.lease, "agent-a", "agent_shutdown")
         transport = RecordingShadowTransport()
 
-        result = self.shadow.evaluate(
-            intent["intent_id"], self.lease, "agent-a", "release-request", transport
-        )
+        with self.assertRaises(AuthorityRejected) as rejected:
+            self.shadow.evaluate(
+                intent["intent_id"], self.lease, "agent-a", "release-request", transport
+            )
 
-        self.assertEqual(result["status"], "blocked")
-        self.assertEqual(result["reason_class"], "lease_not_current")
+        self.assertEqual(rejected.exception.evidence.reason_class, "lease_not_current")
         self.assertEqual(transport.records, [])
         self.assertEqual(
             self.operational.rows(
@@ -40,7 +43,15 @@ class ShadowDispatchAuthorityTests(ShadowDispatchFixture, unittest.TestCase):
                 "WHERE intent_id=?",
                 (intent["intent_id"],),
             )[0][0:2],
-            ("blocked", "lease_not_current"),
+            ("prepared", None),
+        )
+        self.assertEqual(
+            self.operational.rows(
+                "SELECT COUNT(*) FROM authority_bound_shadow_evaluations "
+                "WHERE intent_id=?",
+                (intent["intent_id"],),
+            )[0][0],
+            0,
         )
 
     def test_released_lease_cannot_replay_existing_shadow_evaluation(self):
@@ -73,17 +84,20 @@ class ShadowDispatchAuthorityTests(ShadowDispatchFixture, unittest.TestCase):
             )
         self.assertEqual(self.shadow_row(intent["intent_id"])["outcome"], "matched")
 
-    def test_expired_lease_blocks_without_takeover_or_transport(self):
+    def test_expired_lease_rejects_before_shadow_persistence(self):
         _execution, intent = self.prepared()
         self.clock.current += timedelta(seconds=31)
         transport = RecordingShadowTransport()
 
-        result = self.shadow.evaluate(
-            intent["intent_id"], self.lease, "agent-a", "expiry-request", transport
-        )
+        with self.assertRaises(AuthorityRejected) as rejected:
+            self.shadow.evaluate(
+                intent["intent_id"], self.lease, "agent-a", "expiry-request", transport
+            )
 
-        self.assertEqual(result["status"], "blocked")
-        self.assertEqual(result["reason_class"], "lease_expired_requires_reconciliation")
+        self.assertEqual(
+            rejected.exception.evidence.reason_class,
+            "lease_expired_requires_reconciliation",
+        )
         self.assertEqual(transport.records, [])
         self.assertEqual(
             self.operational.rows(
@@ -91,23 +105,132 @@ class ShadowDispatchAuthorityTests(ShadowDispatchFixture, unittest.TestCase):
             )[0][0],
             "ACQUIRED",
         )
+        self.assertEqual(
+            self.operational.rows(
+                "SELECT COUNT(*) FROM authority_bound_shadow_evaluations "
+                "WHERE intent_id=?",
+                (intent["intent_id"],),
+            )[0][0],
+            0,
+        )
 
-    def test_identity_drift_blocks_current_intent(self):
+    def test_identity_drift_rejects_before_shadow_persistence(self):
         _execution, intent = self.prepared()
         portable = self._open_portable()
         portable.record_verified_identity("profile-a", "identity-b", self.clock.now().isoformat())
         portable.close()
         transport = RecordingShadowTransport()
 
-        result = self.shadow.evaluate(
-            intent["intent_id"], self.lease, "agent-a", "identity-request", transport
+        with self.assertRaises(AuthorityRejected) as rejected:
+            self.shadow.evaluate(
+                intent["intent_id"], self.lease, "agent-a", "identity-request", transport
+            )
+
+        self.assertEqual(
+            rejected.exception.evidence.reason_class,
+            "verified_identity_mismatch",
+        )
+        self.assertEqual(transport.records, [])
+        self.assertEqual(
+            self.operational.rows(
+                "SELECT COUNT(*) FROM authority_bound_shadow_evaluations "
+                "WHERE intent_id=?",
+                (intent["intent_id"],),
+            )[0][0],
+            0,
         )
 
-        self.assertEqual(result["status"], "blocked")
-        self.assertEqual(result["reason_class"], "verified_identity_mismatch")
-        self.assertEqual(transport.records, [])
+    def test_portable_drift_rejects_blocked_shadow_replay_before_return(self):
+        _execution, intent = self.prepared()
+        with self.operational.transaction():
+            self.operational.connection.execute(
+                "UPDATE authority_bound_dispatch_intents SET status='blocked' "
+                "WHERE intent_id=?",
+                (intent["intent_id"],),
+            )
+        self.shadow.evaluate(
+            intent["intent_id"], self.lease, "agent-a", "drift-replay",
+            NullShadowTransport(),
+        )
 
-    def test_binding_state_drift_blocks_current_intent(self):
+        portable = self._open_portable()
+        try:
+            with portable.transaction():
+                portable.connection.execute(
+                    "UPDATE host_profile_bindings SET state='RETIRED' "
+                    "WHERE binding_id=?",
+                    ("binding-a",),
+                )
+        finally:
+            portable.close()
+
+        with self.assertRaises(AuthorityRejected) as rejected:
+            self.shadow.evaluate(
+                intent["intent_id"], self.lease, "agent-a", "drift-replay",
+                NullShadowTransport(),
+            )
+        self.assertEqual(
+            rejected.exception.evidence.reason_class,
+            "binding_not_authoritative",
+        )
+        self.assertEqual(self.shadow_row(intent["intent_id"])["outcome"], "blocked")
+
+    def test_stale_authority_rejects_non_prepared_before_shadow_persistence(self):
+        _execution, intent = self.prepared()
+        with self.operational.transaction():
+            self.operational.connection.execute(
+                "UPDATE authority_bound_dispatch_intents SET status='blocked' "
+                "WHERE intent_id=?",
+                (intent["intent_id"],),
+            )
+        self.clock.current += timedelta(seconds=31)
+
+        with self.assertRaises(AuthorityRejected) as rejected:
+            self.shadow.evaluate(
+                intent["intent_id"], self.lease, "agent-a", "stale-nonprepared",
+                NullShadowTransport(),
+            )
+        self.assertEqual(
+            rejected.exception.evidence.reason_class,
+            "lease_expired_requires_reconciliation",
+        )
+        self.assertEqual(
+            self.operational.rows(
+                "SELECT COUNT(*) FROM authority_bound_shadow_evaluations "
+                "WHERE intent_id=?",
+                (intent["intent_id"],),
+            )[0][0],
+            0,
+        )
+
+    def test_authority_rejection_precedes_global_conflict_classification(self):
+        _execution, first = self.prepared("first-conflict")
+        self.shadow.evaluate(
+            first["intent_id"], self.lease, "agent-a", "authority-wins",
+            NullShadowTransport(),
+        )
+        _execution, second = self.prepared("second-conflict")
+        self.clock.current += timedelta(seconds=31)
+
+        with self.assertRaises(AuthorityRejected) as rejected:
+            self.shadow.evaluate(
+                second["intent_id"], self.lease, "agent-a", "authority-wins",
+                NullShadowTransport(),
+            )
+        self.assertEqual(
+            rejected.exception.evidence.reason_class,
+            "lease_expired_requires_reconciliation",
+        )
+        self.assertEqual(
+            self.operational.rows(
+                "SELECT COUNT(*) FROM authority_bound_shadow_evaluations "
+                "WHERE intent_id=?",
+                (second["intent_id"],),
+            )[0][0],
+            0,
+        )
+
+    def test_binding_state_drift_rejects_before_shadow_persistence(self):
         _execution, intent = self.prepared()
         portable = self._open_portable()
         try:
@@ -120,12 +243,24 @@ class ShadowDispatchAuthorityTests(ShadowDispatchFixture, unittest.TestCase):
             portable.close()
         transport = RecordingShadowTransport()
 
-        result = self.shadow.evaluate(
-            intent["intent_id"], self.lease, "agent-a", "binding-request", transport
-        )
+        with self.assertRaises(AuthorityRejected) as rejected:
+            self.shadow.evaluate(
+                intent["intent_id"], self.lease, "agent-a", "binding-request", transport
+            )
 
-        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(
+            rejected.exception.evidence.reason_class,
+            "binding_not_authoritative",
+        )
         self.assertEqual(transport.records, [])
+        self.assertEqual(
+            self.operational.rows(
+                "SELECT COUNT(*) FROM authority_bound_shadow_evaluations "
+                "WHERE intent_id=?",
+                (intent["intent_id"],),
+            )[0][0],
+            0,
+        )
 
     def test_epoch_and_fence_mismatch_reject_before_shadow_persistence(self):
         for column in ("authority_epoch", "fence_counter"):

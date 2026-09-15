@@ -63,16 +63,13 @@ class DryRunShadowDispatcher:
                 raise _reject(correlation_id, "intent_not_found")
             existing = self._shadow_for_intent(intent_id)
             if existing is not None:
-                self._require_replay_key(existing, request_idempotency_key, transport, correlation_id)
                 execution, attempt, target = self.store.execution_context(
                     intent["execution_id"], correlation_id
                 )
-                self._guard_lineage(
+                self._guard_authority(
                     intent, execution, attempt, target, lease, owner_id, correlation_id
                 )
-                self.coordinator._current_lease_row(
-                    lease, owner_id, self.coordinator._now(correlation_id), correlation_id
-                )
+                self._require_replay_key(existing, request_idempotency_key, transport, correlation_id)
                 if existing["outcome"] in {"blocked", "mismatched", "quarantined"}:
                     return self._result(existing, "idempotent_replay")
                 try:
@@ -87,12 +84,14 @@ class DryRunShadowDispatcher:
             execution, attempt, target = self.store.execution_context(
                 intent["execution_id"], correlation_id
             )
+            self._guard_authority(
+                intent, execution, attempt, target, lease, owner_id, correlation_id
+            )
             conflicting = self._shadow_for_request_key(
                 request_idempotency_key, intent_id
             )
             if conflicting is not None:
                 raise _reject(correlation_id, "shadow_idempotency_conflict")
-            self._guard_lineage(intent, execution, attempt, target, lease, owner_id, correlation_id)
             envelope = build_shadow_envelope(execution, target, correlation_id)
             if intent["status"] != "prepared":
                 return self._persist(
@@ -142,11 +141,19 @@ class DryRunShadowDispatcher:
         execution, attempt, target = self.store.execution_context(
             intent["execution_id"], correlation_id
         )
-        self._guard_lineage(
+        snapshot = self._guard_authority(
             intent, execution, attempt, target, lease, owner_id, correlation_id
         )
         if intent["status"] != "prepared":
             raise _reject(correlation_id, "intent_not_prepared")
+        return snapshot
+
+    def _guard_authority(
+        self, intent, execution, attempt, target, lease, owner_id, correlation_id
+    ):
+        self._guard_lineage(
+            intent, execution, attempt, target, lease, owner_id, correlation_id
+        )
         snapshot = self.coordinator._require_snapshot(lease.scope, correlation_id)
         self.coordinator._current_lease_row(
             lease, owner_id, self.coordinator._now(correlation_id), correlation_id

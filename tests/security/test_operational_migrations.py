@@ -74,7 +74,7 @@ class OperationalMigrationTests(unittest.TestCase):
         finally:
             connection.close()
 
-    def test_v2_to_v6_failure_rolls_back_and_reopen_resumes(self):
+    def test_v2_to_v7_failure_rolls_back_and_reopen_resumes(self):
         self.operational.close()
         path = operational_path(self.runtime)
         path.unlink()
@@ -121,7 +121,7 @@ class OperationalMigrationTests(unittest.TestCase):
             self.operational.rows(
                 "SELECT value FROM schema_meta WHERE key='schema_version'"
             )[0][0],
-            "6",
+            "7",
         )
         self.assertIsNotNone(
             self.operational.rows(
@@ -185,7 +185,7 @@ class OperationalMigrationTests(unittest.TestCase):
         finally:
             connection.close()
 
-    def test_v4_to_v6_migration_installs_execution_and_dispatch_tables(self):
+    def test_v4_to_v7_migration_installs_execution_and_dispatch_tables(self):
         self.operational.close()
         path = operational_path(self.runtime)
         path.unlink()
@@ -210,7 +210,7 @@ class OperationalMigrationTests(unittest.TestCase):
             repository.rows(
                 "SELECT value FROM schema_meta WHERE key='schema_version'"
             )[0][0],
-            "6",
+            "7",
         )
         self.assertIsNotNone(
             repository.rows(
@@ -270,7 +270,7 @@ class OperationalMigrationTests(unittest.TestCase):
         finally:
             connection.close()
 
-    def test_v5_to_v6_migration_installs_dispatch_schema(self):
+    def test_v5_to_v7_migration_installs_dispatch_schema(self):
         self.operational.close()
         path = operational_path(self.runtime)
         path.unlink()
@@ -295,7 +295,7 @@ class OperationalMigrationTests(unittest.TestCase):
             repository.rows(
                 "SELECT value FROM schema_meta WHERE key='schema_version'"
             )[0][0],
-            "6",
+            "7",
         )
         self.assertIsNotNone(
             repository.rows(

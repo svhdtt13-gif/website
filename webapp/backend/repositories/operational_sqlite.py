@@ -14,7 +14,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 OPERATIONAL_FILENAME = "p4_operational.sqlite3"
 OPERATIONAL_DIRNAME = "operational"
 BACKUP_DIRNAME = "backups"
@@ -364,7 +364,50 @@ CREATE INDEX IF NOT EXISTS dispatch_intents_scope_idx
                                       verified_identity_ref, verified_identity_revision,
                                       authority_epoch, fence_counter);
 """
-SCHEMA_SQL = SCHEMA_V5_SQL + DISPATCH_INTENTS_TABLE_SQL
+SCHEMA_V6_SQL = SCHEMA_V5_SQL + DISPATCH_INTENTS_TABLE_SQL
+SCHEMA_V6_CHECKSUM = hashlib.sha256(SCHEMA_V6_SQL.encode("utf-8")).hexdigest()
+
+SHADOW_EVALUATIONS_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS authority_bound_shadow_evaluations (
+  shadow_evaluation_id TEXT PRIMARY KEY,
+  intent_id TEXT NOT NULL UNIQUE REFERENCES authority_bound_dispatch_intents(intent_id),
+  execution_id TEXT NOT NULL UNIQUE REFERENCES authority_bound_executions(execution_id),
+  attempt_id TEXT NOT NULL UNIQUE REFERENCES authority_bound_attempts(attempt_id),
+  target_id TEXT NOT NULL UNIQUE REFERENCES authority_bound_targets(target_id),
+  job_id TEXT NOT NULL UNIQUE,
+  intent_idempotency_key TEXT NOT NULL UNIQUE,
+  request_idempotency_key TEXT NOT NULL UNIQUE,
+  operation_kind TEXT NOT NULL,
+  target_ref TEXT NOT NULL,
+  host_id TEXT NOT NULL,
+  profile_id TEXT NOT NULL,
+  binding_generation INTEGER NOT NULL CHECK (binding_generation > 0),
+  verified_identity_ref TEXT NOT NULL,
+  verified_identity_revision INTEGER NOT NULL CHECK (verified_identity_revision > 0),
+  authority_epoch TEXT NOT NULL,
+  fence_counter INTEGER NOT NULL CHECK (fence_counter > 0),
+  owner_id TEXT NOT NULL,
+  lease_id TEXT NOT NULL,
+  envelope_version INTEGER NOT NULL CHECK (envelope_version = 1),
+  transport_kind TEXT NOT NULL CHECK (transport_kind IN ('null','recording')),
+  portable_snapshot_fingerprint TEXT,
+  prepared_request_fingerprint TEXT,
+  envelope_json TEXT,
+  envelope_fingerprint TEXT,
+  transport_fingerprint TEXT,
+  outcome TEXT NOT NULL CHECK
+    (outcome IN ('evaluated','matched','mismatched','blocked','quarantined')),
+  reason_class TEXT,
+  created_at TEXT NOT NULL,
+  evaluated_at TEXT,
+  quarantined_at TEXT,
+  quarantine_reason TEXT
+);
+
+CREATE INDEX IF NOT EXISTS shadow_evaluations_outcome_idx
+  ON authority_bound_shadow_evaluations(outcome, created_at);
+"""
+SCHEMA_SQL = SCHEMA_V6_SQL + SHADOW_EVALUATIONS_TABLE_SQL
 SCHEMA_CHECKSUM = hashlib.sha256(SCHEMA_SQL.encode("utf-8")).hexdigest()
 
 
@@ -516,6 +559,7 @@ def _expected_schema_identity(schema_sql=SCHEMA_SQL):
 
 
 EXPECTED_SCHEMA_IDENTITY = _expected_schema_identity()
+EXPECTED_V6_SCHEMA_IDENTITY = _expected_schema_identity(SCHEMA_V6_SQL)
 EXPECTED_V3_SCHEMA_IDENTITY = _expected_schema_identity(SCHEMA_V3_SQL)
 EXPECTED_V2_SCHEMA_IDENTITY = _expected_schema_identity(SCHEMA_V2_SQL)
 
@@ -710,6 +754,7 @@ class OperationalSQLiteRepository:
                 self._install_authority_target_schema()
                 self._install_execution_schema()
                 self._install_dispatch_schema()
+                self._install_shadow_schema()
                 self.connection.execute(
                     "UPDATE schema_meta SET value=? WHERE key='schema_version'",
                     (str(SCHEMA_VERSION),),
@@ -732,6 +777,7 @@ class OperationalSQLiteRepository:
                 self._install_authority_target_schema()
                 self._install_execution_schema()
                 self._install_dispatch_schema()
+                self._install_shadow_schema()
                 self.connection.execute(
                     "UPDATE schema_meta SET value=? WHERE key='schema_version'",
                     (str(SCHEMA_VERSION),),
@@ -753,6 +799,7 @@ class OperationalSQLiteRepository:
                 self._verify_v4_before_migration(values)
                 self._install_execution_schema()
                 self._install_dispatch_schema()
+                self._install_shadow_schema()
                 self.connection.execute(
                     "UPDATE schema_meta SET value=? WHERE key='schema_version'",
                     (str(SCHEMA_VERSION),),
@@ -773,6 +820,27 @@ class OperationalSQLiteRepository:
                     return
                 self._verify_v5_before_migration(values)
                 self._install_dispatch_schema()
+                self._install_shadow_schema()
+                self.connection.execute(
+                    "UPDATE schema_meta SET value=? WHERE key='schema_version'",
+                    (str(SCHEMA_VERSION),),
+                )
+                self.connection.execute(
+                    "UPDATE schema_meta SET value=? WHERE key='schema_checksum'",
+                    (SCHEMA_CHECKSUM,),
+                )
+            return
+        if version == "6":
+            with self.transaction():
+                values = dict(
+                    self.connection.execute(
+                        "SELECT key, value FROM schema_meta"
+                    ).fetchall()
+                )
+                if values.get("schema_version") != "6":
+                    return
+                self._verify_v6_before_migration(values)
+                self._install_shadow_schema()
                 self.connection.execute(
                     "UPDATE schema_meta SET value=? WHERE key='schema_version'",
                     (str(SCHEMA_VERSION),),
@@ -826,6 +894,7 @@ class OperationalSQLiteRepository:
             self._install_authority_target_schema()
             self._install_execution_schema()
             self._install_dispatch_schema()
+            self._install_shadow_schema()
             self.connection.execute(
                 "INSERT INTO authority_state "
                 "(singleton, authority_epoch, fence_counter, quarantined) "
@@ -856,6 +925,12 @@ class OperationalSQLiteRepository:
 
     def _install_dispatch_schema(self):
         for statement in DISPATCH_INTENTS_TABLE_SQL.split(";"):
+            statement = statement.strip()
+            if statement:
+                self.connection.execute(statement)
+
+    def _install_shadow_schema(self):
+        for statement in SHADOW_EVALUATIONS_TABLE_SQL.split(";"):
             statement = statement.strip()
             if statement:
                 self.connection.execute(statement)
@@ -891,6 +966,14 @@ class OperationalSQLiteRepository:
             raise OperationalSchemaError("operational v5 schema is not trusted")
         if not _integrity_ok(self.connection):
             raise OperationalIntegrityError("operational v5 SQLite integrity check failed")
+
+    def _verify_v6_before_migration(self, values):
+        if values.get("schema_checksum") != SCHEMA_V6_CHECKSUM:
+            raise OperationalSchemaError("operational v6 schema checksum mismatch")
+        if _schema_identity(self.connection) != EXPECTED_V6_SCHEMA_IDENTITY:
+            raise OperationalSchemaError("operational v6 schema is not trusted")
+        if not _integrity_ok(self.connection):
+            raise OperationalIntegrityError("operational v6 SQLite integrity check failed")
 
     def _rebuild_v2_fenced_leases(self):
         self.connection.execute("DROP INDEX IF EXISTS fenced_live_scope_idx")
@@ -1151,6 +1234,12 @@ class OperationalSQLiteRepository:
                 "UPDATE authority_bound_dispatch_intents SET status='quarantined', "
                 "quarantine_reason='operational_restore' WHERE status IN "
                 "('prepared', 'unknown')"
+            )
+            self.connection.execute(
+                "UPDATE authority_bound_shadow_evaluations SET outcome='quarantined', "
+                "quarantine_reason='operational_restore', quarantined_at=? "
+                "WHERE outcome IN ('evaluated', 'matched')",
+                (_utc_now(),),
             )
 
     def quarantine_execution_state(self, reason):

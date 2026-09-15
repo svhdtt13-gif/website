@@ -79,6 +79,12 @@ class BindingAuthorityCoordinator:
                 "WHERE outcome IN ('evaluated', 'matched')",
                 (self.clock.now().isoformat(),),
             )
+            self.operational.connection.execute(
+                "UPDATE authority_bound_canary_candidates SET state='quarantined', "
+                "quarantine_reason='coordinator_restart', quarantined_at=? "
+                "WHERE state='armed'",
+                (self.clock.now().isoformat(),),
+            )
         self.operational.requires_fresh_bootstrap = False
         return FenceIdentity(epoch, 0)
 

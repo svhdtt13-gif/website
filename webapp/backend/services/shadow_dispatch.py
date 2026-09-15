@@ -99,16 +99,9 @@ class DryRunShadowDispatcher:
                     transport.kind, "blocked", "intent_not_prepared",
                 )
 
-            try:
-                snapshot = self._guard_current(
-                    intent, lease, owner_id, correlation_id
-                )
-            except AuthorityRejected as rejected:
-                self.store.block(intent_id, rejected.evidence.reason_class)
-                return self._persist(
-                    intent, execution, attempt, target, request_idempotency_key,
-                    transport.kind, "blocked", rejected.evidence.reason_class,
-                )
+            snapshot = self._guard_current(
+                intent, lease, owner_id, correlation_id
+            )
 
             snapshot_digest = snapshot_fingerprint(snapshot)
             if intent["request_fingerprint"] != envelope.fingerprint:

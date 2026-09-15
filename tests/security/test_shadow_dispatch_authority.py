@@ -3,6 +3,7 @@ import sys
 import unittest
 from datetime import timedelta
 from pathlib import Path
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "webapp" / "backend"))
@@ -226,6 +227,55 @@ class ShadowDispatchAuthorityTests(ShadowDispatchFixture, unittest.TestCase):
                 "SELECT COUNT(*) FROM authority_bound_shadow_evaluations "
                 "WHERE intent_id=?",
                 (second["intent_id"],),
+            )[0][0],
+            0,
+        )
+
+    def test_drift_before_second_guard_rejects_without_block_or_persistence(self):
+        _execution, intent = self.prepared()
+        original = self.shadow._guard_current
+
+        def drift_then_guard(*args):
+            portable = self._open_portable()
+            try:
+                with portable.transaction():
+                    portable.connection.execute(
+                        "UPDATE host_profile_bindings SET state='RETIRED' "
+                        "WHERE binding_id=?",
+                        ("binding-a",),
+                    )
+            finally:
+                portable.close()
+            return original(*args)
+
+        transport = RecordingShadowTransport()
+        with (
+            patch.object(self.shadow, "_guard_current", side_effect=drift_then_guard),
+            self.assertRaises(AuthorityRejected) as rejected,
+        ):
+            self.shadow.evaluate(
+                intent["intent_id"], self.lease, "agent-a", "second-guard-drift",
+                transport,
+            )
+
+        self.assertEqual(
+            rejected.exception.evidence.reason_class,
+            "binding_not_authoritative",
+        )
+        self.assertEqual(transport.records, [])
+        self.assertEqual(
+            self.operational.rows(
+                "SELECT status, blocked_reason FROM authority_bound_dispatch_intents "
+                "WHERE intent_id=?",
+                (intent["intent_id"],),
+            )[0][0:2],
+            ("prepared", None),
+        )
+        self.assertEqual(
+            self.operational.rows(
+                "SELECT COUNT(*) FROM authority_bound_shadow_evaluations "
+                "WHERE intent_id=?",
+                (intent["intent_id"],),
             )[0][0],
             0,
         )

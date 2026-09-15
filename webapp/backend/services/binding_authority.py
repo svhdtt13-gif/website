@@ -73,6 +73,12 @@ class BindingAuthorityCoordinator:
                 "quarantine_reason='coordinator_restart' WHERE status IN "
                 "('prepared', 'unknown')"
             )
+            self.operational.connection.execute(
+                "UPDATE authority_bound_shadow_evaluations SET outcome='quarantined', "
+                "quarantine_reason='coordinator_restart', quarantined_at=? "
+                "WHERE outcome IN ('evaluated', 'matched')",
+                (self.clock.now().isoformat(),),
+            )
         self.operational.requires_fresh_bootstrap = False
         return FenceIdentity(epoch, 0)
 

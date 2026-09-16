@@ -14,7 +14,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 OPERATIONAL_FILENAME = "p4_operational.sqlite3"
 OPERATIONAL_DIRNAME = "operational"
 BACKUP_DIRNAME = "backups"
@@ -407,7 +407,62 @@ CREATE TABLE IF NOT EXISTS authority_bound_shadow_evaluations (
 CREATE INDEX IF NOT EXISTS shadow_evaluations_outcome_idx
   ON authority_bound_shadow_evaluations(outcome, created_at);
 """
-SCHEMA_SQL = SCHEMA_V6_SQL + SHADOW_EVALUATIONS_TABLE_SQL
+SCHEMA_V7_SQL = SCHEMA_V6_SQL + SHADOW_EVALUATIONS_TABLE_SQL
+SCHEMA_V7_CHECKSUM = hashlib.sha256(SCHEMA_V7_SQL.encode("utf-8")).hexdigest()
+
+CANARY_CANDIDATES_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS authority_bound_canary_candidates (
+  canary_candidate_id TEXT PRIMARY KEY,
+  shadow_evaluation_id TEXT NOT NULL UNIQUE
+    REFERENCES authority_bound_shadow_evaluations(shadow_evaluation_id),
+  intent_id TEXT NOT NULL UNIQUE REFERENCES authority_bound_dispatch_intents(intent_id),
+  execution_id TEXT NOT NULL UNIQUE REFERENCES authority_bound_executions(execution_id),
+  attempt_id TEXT NOT NULL UNIQUE REFERENCES authority_bound_attempts(attempt_id),
+  target_id TEXT NOT NULL UNIQUE REFERENCES authority_bound_targets(target_id),
+  job_id TEXT NOT NULL UNIQUE REFERENCES authority_bound_targets(job_id),
+  intent_idempotency_key TEXT NOT NULL UNIQUE,
+  shadow_idempotency_key TEXT NOT NULL UNIQUE,
+  canary_idempotency_key TEXT NOT NULL UNIQUE,
+  operation_kind TEXT NOT NULL,
+  destination_ref TEXT NOT NULL,
+  host_id TEXT NOT NULL,
+  profile_id TEXT NOT NULL,
+  binding_generation INTEGER NOT NULL CHECK (binding_generation > 0),
+  verified_identity_ref TEXT NOT NULL,
+  verified_identity_revision INTEGER NOT NULL CHECK (verified_identity_revision > 0),
+  authority_epoch TEXT NOT NULL,
+  fence_counter INTEGER NOT NULL CHECK (fence_counter > 0),
+  owner_id TEXT NOT NULL,
+  lease_id TEXT NOT NULL,
+  portable_snapshot_fingerprint TEXT NOT NULL,
+  shadow_envelope_fingerprint TEXT NOT NULL,
+  contract_version TEXT NOT NULL,
+  transport_kind TEXT NOT NULL CHECK
+    (transport_kind IN ('null','recording','contract_probe')),
+  transport_contract_version TEXT NOT NULL,
+  pre_send_identity TEXT NOT NULL UNIQUE,
+  envelope_json TEXT NOT NULL,
+  envelope_fingerprint TEXT NOT NULL,
+  state TEXT NOT NULL CHECK
+    (state IN ('armed','blocked','unknown','reconciled','quarantined')),
+  reason_class TEXT,
+  created_at TEXT NOT NULL,
+  armed_at TEXT,
+  ambiguity_evidence_ref TEXT,
+  ambiguity_reason_class TEXT,
+  unknown_at TEXT,
+  reconciliation_evidence_ref TEXT,
+  reconciliation_result TEXT CHECK
+    (reconciliation_result IN ('succeeded','failed') OR reconciliation_result IS NULL),
+  reconciled_at TEXT,
+  quarantined_at TEXT,
+  quarantine_reason TEXT
+);
+
+CREATE INDEX IF NOT EXISTS canary_candidates_state_idx
+  ON authority_bound_canary_candidates(state, created_at);
+"""
+SCHEMA_SQL = SCHEMA_V7_SQL + CANARY_CANDIDATES_TABLE_SQL
 SCHEMA_CHECKSUM = hashlib.sha256(SCHEMA_SQL.encode("utf-8")).hexdigest()
 
 
@@ -559,6 +614,7 @@ def _expected_schema_identity(schema_sql=SCHEMA_SQL):
 
 
 EXPECTED_SCHEMA_IDENTITY = _expected_schema_identity()
+EXPECTED_V7_SCHEMA_IDENTITY = _expected_schema_identity(SCHEMA_V7_SQL)
 EXPECTED_V6_SCHEMA_IDENTITY = _expected_schema_identity(SCHEMA_V6_SQL)
 EXPECTED_V3_SCHEMA_IDENTITY = _expected_schema_identity(SCHEMA_V3_SQL)
 EXPECTED_V2_SCHEMA_IDENTITY = _expected_schema_identity(SCHEMA_V2_SQL)
@@ -755,6 +811,7 @@ class OperationalSQLiteRepository:
                 self._install_execution_schema()
                 self._install_dispatch_schema()
                 self._install_shadow_schema()
+                self._install_canary_schema()
                 self.connection.execute(
                     "UPDATE schema_meta SET value=? WHERE key='schema_version'",
                     (str(SCHEMA_VERSION),),
@@ -778,6 +835,7 @@ class OperationalSQLiteRepository:
                 self._install_execution_schema()
                 self._install_dispatch_schema()
                 self._install_shadow_schema()
+                self._install_canary_schema()
                 self.connection.execute(
                     "UPDATE schema_meta SET value=? WHERE key='schema_version'",
                     (str(SCHEMA_VERSION),),
@@ -800,6 +858,7 @@ class OperationalSQLiteRepository:
                 self._install_execution_schema()
                 self._install_dispatch_schema()
                 self._install_shadow_schema()
+                self._install_canary_schema()
                 self.connection.execute(
                     "UPDATE schema_meta SET value=? WHERE key='schema_version'",
                     (str(SCHEMA_VERSION),),
@@ -821,6 +880,7 @@ class OperationalSQLiteRepository:
                 self._verify_v5_before_migration(values)
                 self._install_dispatch_schema()
                 self._install_shadow_schema()
+                self._install_canary_schema()
                 self.connection.execute(
                     "UPDATE schema_meta SET value=? WHERE key='schema_version'",
                     (str(SCHEMA_VERSION),),
@@ -841,6 +901,27 @@ class OperationalSQLiteRepository:
                     return
                 self._verify_v6_before_migration(values)
                 self._install_shadow_schema()
+                self._install_canary_schema()
+                self.connection.execute(
+                    "UPDATE schema_meta SET value=? WHERE key='schema_version'",
+                    (str(SCHEMA_VERSION),),
+                )
+                self.connection.execute(
+                    "UPDATE schema_meta SET value=? WHERE key='schema_checksum'",
+                    (SCHEMA_CHECKSUM,),
+                )
+            return
+        if version == "7":
+            with self.transaction():
+                values = dict(
+                    self.connection.execute(
+                        "SELECT key, value FROM schema_meta"
+                    ).fetchall()
+                )
+                if values.get("schema_version") != "7":
+                    return
+                self._verify_v7_before_migration(values)
+                self._install_canary_schema()
                 self.connection.execute(
                     "UPDATE schema_meta SET value=? WHERE key='schema_version'",
                     (str(SCHEMA_VERSION),),
@@ -895,6 +976,7 @@ class OperationalSQLiteRepository:
             self._install_execution_schema()
             self._install_dispatch_schema()
             self._install_shadow_schema()
+            self._install_canary_schema()
             self.connection.execute(
                 "INSERT INTO authority_state "
                 "(singleton, authority_epoch, fence_counter, quarantined) "
@@ -931,6 +1013,12 @@ class OperationalSQLiteRepository:
 
     def _install_shadow_schema(self):
         for statement in SHADOW_EVALUATIONS_TABLE_SQL.split(";"):
+            statement = statement.strip()
+            if statement:
+                self.connection.execute(statement)
+
+    def _install_canary_schema(self):
+        for statement in CANARY_CANDIDATES_TABLE_SQL.split(";"):
             statement = statement.strip()
             if statement:
                 self.connection.execute(statement)
@@ -974,6 +1062,14 @@ class OperationalSQLiteRepository:
             raise OperationalSchemaError("operational v6 schema is not trusted")
         if not _integrity_ok(self.connection):
             raise OperationalIntegrityError("operational v6 SQLite integrity check failed")
+
+    def _verify_v7_before_migration(self, values):
+        if values.get("schema_checksum") != SCHEMA_V7_CHECKSUM:
+            raise OperationalSchemaError("operational v7 schema checksum mismatch")
+        if _schema_identity(self.connection) != EXPECTED_V7_SCHEMA_IDENTITY:
+            raise OperationalSchemaError("operational v7 schema is not trusted")
+        if not _integrity_ok(self.connection):
+            raise OperationalIntegrityError("operational v7 SQLite integrity check failed")
 
     def _rebuild_v2_fenced_leases(self):
         self.connection.execute("DROP INDEX IF EXISTS fenced_live_scope_idx")
@@ -1239,6 +1335,12 @@ class OperationalSQLiteRepository:
                 "UPDATE authority_bound_shadow_evaluations SET outcome='quarantined', "
                 "quarantine_reason='operational_restore', quarantined_at=? "
                 "WHERE outcome IN ('evaluated', 'matched')",
+                (_utc_now(),),
+            )
+            self.connection.execute(
+                "UPDATE authority_bound_canary_candidates SET state='quarantined', "
+                "quarantine_reason='operational_restore', quarantined_at=? "
+                "WHERE state='armed'",
                 (_utc_now(),),
             )
 

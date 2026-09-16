@@ -448,6 +448,13 @@ CREATE TABLE IF NOT EXISTS authority_bound_canary_candidates (
   reason_class TEXT,
   created_at TEXT NOT NULL,
   armed_at TEXT,
+  ambiguity_evidence_ref TEXT,
+  ambiguity_reason_class TEXT,
+  unknown_at TEXT,
+  reconciliation_evidence_ref TEXT,
+  reconciliation_result TEXT CHECK
+    (reconciliation_result IN ('succeeded','failed') OR reconciliation_result IS NULL),
+  reconciled_at TEXT,
   quarantined_at TEXT,
   quarantine_reason TEXT
 );

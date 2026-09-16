@@ -152,7 +152,7 @@ class ShadowMigrationTests(unittest.TestCase):
             repository.rows(
                 "SELECT value FROM schema_meta WHERE key='schema_version'"
             )[0][0],
-            "8",
+            "9",
         )
         self.assertIsNotNone(
             repository.rows(
@@ -171,7 +171,7 @@ class ShadowMigrationTests(unittest.TestCase):
             self.operational.rows(
                 "SELECT value FROM schema_meta WHERE key='schema_version'"
             )[0][0],
-            "8",
+            "9",
         )
         self.assertEqual(
             tuple(
@@ -259,7 +259,7 @@ class ShadowMigrationTests(unittest.TestCase):
             self.operational.rows(
                 "SELECT value FROM schema_meta WHERE key='schema_version'"
             )[0][0],
-            "8",
+            "9",
         )
         self.assertEqual(
             self.operational.rows(

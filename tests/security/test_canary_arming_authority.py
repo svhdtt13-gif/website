@@ -8,6 +8,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "webapp" / "backend"))
 
+from unittest.mock import patch
+
 from repositories.operational_sqlite import (
     OperationalSQLiteRepository,
     backup_directory,
@@ -165,6 +167,224 @@ class CanaryArmingAuthorityTests(ShadowDispatchFixture, unittest.TestCase):
             {result["outcome"] for result in results},
             {"armed", "idempotent_replay"},
         )
+
+    def _retire_binding(self):
+        portable = PortableDomainStore.open(self.portable_path)
+        try:
+            with portable.transaction():
+                portable.connection.execute(
+                    "UPDATE host_profile_bindings SET state='RETIRED' "
+                    "WHERE binding_id='binding-a'"
+                )
+        finally:
+            portable.close()
+
+    def _upstream_snapshot(self, shadow):
+        intent = dict(
+            self.operational.connection.execute(
+                "SELECT * FROM authority_bound_dispatch_intents WHERE intent_id=?",
+                (shadow["intent_id"],),
+            ).fetchone()
+        )
+        stored = dict(
+            self.operational.connection.execute(
+                "SELECT * FROM authority_bound_shadow_evaluations "
+                "WHERE shadow_evaluation_id=?",
+                (shadow["shadow_evaluation_id"],),
+            ).fetchone()
+        )
+        return intent, stored
+
+    def test_late_guard_drift_before_pre_observe_rejects_without_observation(self):
+        shadow = self._shadow()
+        intent_before, stored_before = self._upstream_snapshot(shadow)
+        transport = RecordingCanaryTransport()
+        original = self.canary.shadow._guard_current
+        calls = []
+
+        def flank(intent, lease, owner_id, correlation_id):
+            calls.append(1)
+            if len(calls) == 2:
+                self._retire_binding()
+            return original(intent, lease, owner_id, correlation_id)
+
+        with patch.object(
+            self.canary.shadow, "_guard_current", side_effect=flank
+        ), self.assertRaises(AuthorityRejected):
+            self.canary.arm(
+                shadow["shadow_evaluation_id"], self.lease, "agent-a", transport
+            )
+
+        self.assertGreaterEqual(len(calls), 2)
+        self.assertEqual(transport.observations, [])
+        self.assertEqual(self.operational.rows(
+            "SELECT COUNT(*) FROM authority_bound_canary_candidates"
+        )[0][0], 0)
+        intent_after, stored_after = self._upstream_snapshot(shadow)
+        self.assertEqual(intent_after, intent_before)
+        self.assertEqual(stored_after, stored_before)
+
+    def test_late_guard_drift_before_persist_rejects_without_row(self):
+        shadow = self._shadow()
+        intent_before, stored_before = self._upstream_snapshot(shadow)
+        transport = RecordingCanaryTransport()
+        original = self.canary.shadow._guard_current
+        calls = []
+
+        def flank(intent, lease, owner_id, correlation_id):
+            calls.append(1)
+            if len(calls) == 3:
+                self._retire_binding()
+            return original(intent, lease, owner_id, correlation_id)
+
+        with patch.object(
+            self.canary.shadow, "_guard_current", side_effect=flank
+        ), self.assertRaises(AuthorityRejected):
+            self.canary.arm(
+                shadow["shadow_evaluation_id"], self.lease, "agent-a", transport
+            )
+
+        self.assertGreaterEqual(len(calls), 3)
+        self.assertEqual(self.operational.rows(
+            "SELECT COUNT(*) FROM authority_bound_canary_candidates"
+        )[0][0], 0)
+        intent_after, stored_after = self._upstream_snapshot(shadow)
+        self.assertEqual(intent_after, intent_before)
+        self.assertEqual(stored_after, stored_before)
+
+    def test_late_guard_lease_expiry_rejects_without_row(self):
+        shadow = self._shadow()
+        transport = RecordingCanaryTransport()
+        original = self.canary.shadow._guard_current
+        calls = []
+
+        def flank(intent, lease, owner_id, correlation_id):
+            calls.append(1)
+            if len(calls) == 2:
+                self.clock.current += timedelta(seconds=31)
+            return original(intent, lease, owner_id, correlation_id)
+
+        with patch.object(
+            self.canary.shadow, "_guard_current", side_effect=flank
+        ), self.assertRaises(AuthorityRejected):
+            self.canary.arm(
+                shadow["shadow_evaluation_id"], self.lease, "agent-a", transport
+            )
+
+        self.assertEqual(self.operational.rows(
+            "SELECT COUNT(*) FROM authority_bound_canary_candidates"
+        )[0][0], 0)
+
+    def test_stale_authority_before_unknown_transition_rejects(self):
+        shadow = self._shadow()
+        transport = RecordingCanaryTransport()
+        armed = self.canary.arm(
+            shadow["shadow_evaluation_id"], self.lease, "agent-a", transport
+        )
+        self.clock.current += timedelta(seconds=31)
+        with self.assertRaises(AuthorityRejected):
+            self.canary.record_ambiguous(
+                armed["canary_candidate_id"], self.lease, "agent-a",
+                "evidence-stale-1", "ambiguous_boundary",
+                armed["pre_send_identity"],
+            )
+        row = self.operational.rows(
+            "SELECT state FROM authority_bound_canary_candidates "
+            "WHERE canary_candidate_id=?",
+            (armed["canary_candidate_id"],),
+        )[0][0]
+        self.assertEqual(row, "armed")
+
+    def test_stale_authority_before_reconciliation_rejects(self):
+        shadow = self._shadow()
+        transport = RecordingCanaryTransport()
+        armed = self.canary.arm(
+            shadow["shadow_evaluation_id"], self.lease, "agent-a", transport
+        )
+        unknown = self.canary.record_ambiguous(
+            armed["canary_candidate_id"], self.lease, "agent-a",
+            "evidence-stale-2", "ambiguous_boundary",
+            armed["pre_send_identity"],
+        )
+        evidence = {
+            "evidence_ref": "evidence-stale-3",
+            "result": "succeeded",
+            "source": "read_only",
+            "canary_idempotency_key": unknown["canary_idempotency_key"],
+            "pre_send_identity": unknown["pre_send_identity"],
+            "envelope_fingerprint": unknown["envelope_fingerprint"],
+        }
+        self.clock.current += timedelta(seconds=31)
+        with self.assertRaises(AuthorityRejected):
+            self.canary.reconcile_unknown(
+                armed["canary_candidate_id"], self.lease, "agent-a", evidence
+            )
+        row = self.operational.rows(
+            "SELECT state FROM authority_bound_canary_candidates "
+            "WHERE canary_candidate_id=?",
+            (armed["canary_candidate_id"],),
+        )[0][0]
+        self.assertEqual(row, "unknown")
+
+    def test_restart_and_restore_never_revive_unknown(self):
+        shadow = self._shadow()
+        transport = RecordingCanaryTransport()
+        armed = self.canary.arm(
+            shadow["shadow_evaluation_id"], self.lease, "agent-a", transport
+        )
+        unknown = self.canary.record_ambiguous(
+            armed["canary_candidate_id"], self.lease, "agent-a",
+            "evidence-revive-1", "ambiguous_boundary",
+            armed["pre_send_identity"],
+        )
+        self.coordinator.establish_fresh_authority()
+        row = self.operational.rows(
+            "SELECT state FROM authority_bound_canary_candidates "
+            "WHERE canary_candidate_id=?",
+            (armed["canary_candidate_id"],),
+        )[0][0]
+        self.assertEqual(row, "unknown")
+        self.assertEqual(unknown["state"], "unknown")
+
+    def test_canary_transitions_create_no_network_side_effect(self):
+        shadow = self._shadow()
+        transport = RecordingCanaryTransport()
+        before = {
+            str(path.relative_to(self.runtime))
+            for path in self.runtime.rglob("*")
+            if path.is_file()
+        }
+        armed = self.canary.arm(
+            shadow["shadow_evaluation_id"], self.lease, "agent-a", transport
+        )
+        unknown = self.canary.record_ambiguous(
+            armed["canary_candidate_id"], self.lease, "agent-a",
+            "evidence-net-1", "ambiguous_boundary",
+            armed["pre_send_identity"],
+        )
+        evidence = {
+            "evidence_ref": "evidence-net-2",
+            "result": "succeeded",
+            "source": "read_only",
+            "canary_idempotency_key": unknown["canary_idempotency_key"],
+            "pre_send_identity": unknown["pre_send_identity"],
+            "envelope_fingerprint": unknown["envelope_fingerprint"],
+        }
+        self.canary.reconcile_unknown(
+            armed["canary_candidate_id"], self.lease, "agent-a", evidence
+        )
+        after = {
+            str(path.relative_to(self.runtime))
+            for path in self.runtime.rglob("*")
+            if path.is_file()
+        }
+        new_files = {
+            path for path in (after - before)
+            if not path.endswith((".sqlite3", ".sqlite3-wal", ".sqlite3-shm",
+                                   ".manifest.json"))
+        }
+        self.assertEqual(new_files, set())
+        self.assertEqual(len(transport.observations), 1)
 
     def test_restart_and_restore_quarantine_armed_candidates(self):
         shadow = self._shadow()

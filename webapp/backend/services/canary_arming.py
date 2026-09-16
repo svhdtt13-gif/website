@@ -195,24 +195,6 @@ class CanaryArmingService:
             candidate = self._candidate_by_id(canary_candidate_id)
             if candidate is None:
                 raise _reject(correlation_id, "canary_candidate_not_found")
-            if candidate["state"] == "unknown":
-                if (
-                    candidate["ambiguity_evidence_ref"] == evidence_ref
-                    and candidate["ambiguity_reason_class"] == reason_class
-                    and (
-                        pre_send_identity is None
-                        or candidate["pre_send_identity"] == pre_send_identity
-                    )
-                ):
-                    return self._result(candidate, "idempotent_replay")
-                raise _reject(correlation_id, "canary_ambiguity_conflict")
-            if candidate["state"] != "armed":
-                raise _reject(correlation_id, "canary_ambiguity_state_invalid")
-            if (
-                pre_send_identity is not None
-                and candidate["pre_send_identity"] != pre_send_identity
-            ):
-                raise _reject(correlation_id, "canary_ambiguity_conflict")
             shadow = self._shadow(candidate["shadow_evaluation_id"])
             if shadow is None:
                 raise _reject(correlation_id, "canary_shadow_not_found")
@@ -229,6 +211,28 @@ class CanaryArmingService:
                 candidate, shadow, intent, execution, attempt, target,
                 snapshot_fingerprint(snapshot), correlation_id,
             )
+            if (
+                pre_send_identity is not None
+                and candidate["pre_send_identity"] != pre_send_identity
+            ):
+                raise _reject(correlation_id, "canary_ambiguity_conflict")
+            if candidate["state"] == "unknown":
+                if (
+                    candidate["ambiguity_evidence_ref"] == evidence_ref
+                    and candidate["ambiguity_reason_class"] == reason_class
+                ):
+                    return self._result(candidate, "idempotent_replay")
+                raise _reject(correlation_id, "canary_ambiguity_conflict")
+            if candidate["state"] != "armed":
+                raise _reject(correlation_id, "canary_ambiguity_state_invalid")
+            late_snapshot = self.shadow._guard_current(
+                intent, lease, owner_id, correlation_id
+            )
+            self._require_candidate_lineage(
+                candidate, shadow, intent, execution, attempt, target,
+                snapshot_fingerprint(late_snapshot), correlation_id,
+            )
+            self._require_upstream_stable(shadow, intent, correlation_id)
             now = self.coordinator._now("canary").isoformat()
             self.operational.connection.execute(
                 "UPDATE authority_bound_canary_candidates SET state='unknown', "
@@ -266,20 +270,6 @@ class CanaryArmingService:
             candidate = self._candidate_by_id(canary_candidate_id)
             if candidate is None:
                 raise _reject(correlation_id, "canary_candidate_not_found")
-            if candidate["state"] == "reconciled":
-                if (
-                    candidate["reconciliation_evidence_ref"]
-                    == normalized.evidence_ref
-                    and candidate["reconciliation_result"] == normalized.result
-                ):
-                    self._require_evidence_binding(
-                        candidate, normalized, correlation_id
-                    )
-                    return self._result(candidate, "idempotent_replay")
-                raise _reject(correlation_id, "canary_reconciliation_conflict")
-            if candidate["state"] != "unknown":
-                raise _reject(correlation_id, "canary_reconciliation_state_invalid")
-            self._require_evidence_binding(candidate, normalized, correlation_id)
             shadow = self._shadow(candidate["shadow_evaluation_id"])
             if shadow is None:
                 raise _reject(correlation_id, "canary_shadow_not_found")
@@ -296,6 +286,26 @@ class CanaryArmingService:
                 candidate, shadow, intent, execution, attempt, target,
                 snapshot_fingerprint(snapshot), correlation_id,
             )
+            self._require_evidence_binding(candidate, normalized, correlation_id)
+            if candidate["state"] == "reconciled":
+                if (
+                    candidate["reconciliation_evidence_ref"]
+                    == normalized.evidence_ref
+                    and candidate["reconciliation_result"] == normalized.result
+                ):
+                    return self._result(candidate, "idempotent_replay")
+                raise _reject(correlation_id, "canary_reconciliation_conflict")
+            if candidate["state"] != "unknown":
+                raise _reject(correlation_id, "canary_reconciliation_state_invalid")
+            late_snapshot = self.shadow._guard_current(
+                intent, lease, owner_id, correlation_id
+            )
+            self._require_candidate_lineage(
+                candidate, shadow, intent, execution, attempt, target,
+                snapshot_fingerprint(late_snapshot), correlation_id,
+            )
+            self._require_evidence_binding(candidate, normalized, correlation_id)
+            self._require_upstream_stable(shadow, intent, correlation_id)
             now = self.coordinator._now("canary").isoformat()
             self.operational.connection.execute(
                 "UPDATE authority_bound_canary_candidates "

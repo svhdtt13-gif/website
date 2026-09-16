@@ -275,6 +275,249 @@ class CanaryArmingAuthorityTests(ShadowDispatchFixture, unittest.TestCase):
             "SELECT COUNT(*) FROM authority_bound_canary_candidates"
         )[0][0], 0)
 
+    def _armed_candidate(self):
+        shadow = self._shadow()
+        transport = RecordingCanaryTransport()
+        armed = self.canary.arm(
+            shadow["shadow_evaluation_id"], self.lease, "agent-a", transport
+        )
+        return shadow, armed
+
+    def _unknown_candidate(self, ref="evidence-order-1"):
+        shadow, armed = self._armed_candidate()
+        unknown = self.canary.record_ambiguous(
+            armed["canary_candidate_id"], self.lease, "agent-a",
+            ref, "ambiguous_boundary", armed["pre_send_identity"],
+        )
+        return shadow, armed, unknown
+
+    def _candidate_row(self, candidate_id):
+        return dict(
+            self.operational.connection.execute(
+                "SELECT * FROM authority_bound_canary_candidates "
+                "WHERE canary_candidate_id=?",
+                (candidate_id,),
+            ).fetchone()
+        )
+
+    def test_unknown_replay_after_lease_expiry_rejects_authority_first(self):
+        _shadow, armed, _unknown = self._unknown_candidate()
+        self.clock.current += timedelta(seconds=31)
+        with self.assertRaises(AuthorityRejected) as rejected:
+            self.canary.record_ambiguous(
+                armed["canary_candidate_id"], self.lease, "agent-a",
+                "evidence-order-1", "ambiguous_boundary",
+                armed["pre_send_identity"],
+            )
+        self.assertEqual(
+            rejected.exception.evidence.reason_class,
+            "lease_expired_requires_reconciliation",
+        )
+        self.assertEqual(
+            self._candidate_row(armed["canary_candidate_id"])["state"], "unknown"
+        )
+
+    def test_unknown_replay_after_portable_drift_rejects_authority_first(self):
+        _shadow, armed, _unknown = self._unknown_candidate()
+        self._retire_binding()
+        with self.assertRaises(AuthorityRejected) as rejected:
+            self.canary.record_ambiguous(
+                armed["canary_candidate_id"], self.lease, "agent-a",
+                "evidence-order-1", "ambiguous_boundary",
+                armed["pre_send_identity"],
+            )
+        self.assertNotEqual(
+            rejected.exception.evidence.reason_class, "canary_ambiguity_conflict"
+        )
+        self.assertEqual(
+            self._candidate_row(armed["canary_candidate_id"])["state"], "unknown"
+        )
+
+    def test_stale_authority_beats_ambiguity_conflict(self):
+        _shadow, armed, _unknown = self._unknown_candidate()
+        self.clock.current += timedelta(seconds=31)
+        with self.assertRaises(AuthorityRejected) as rejected:
+            self.canary.record_ambiguous(
+                armed["canary_candidate_id"], self.lease, "agent-a",
+                "evidence-conflicting", "ambiguous_boundary",
+                armed["pre_send_identity"],
+            )
+        self.assertEqual(
+            rejected.exception.evidence.reason_class,
+            "lease_expired_requires_reconciliation",
+        )
+
+    def test_reconciled_replay_after_stale_authority_rejects(self):
+        shadow = self._shadow()
+        transport = RecordingCanaryTransport()
+        armed = self.canary.arm(
+            shadow["shadow_evaluation_id"], self.lease, "agent-a", transport
+        )
+        unknown = self.canary.record_ambiguous(
+            armed["canary_candidate_id"], self.lease, "agent-a",
+            "evidence-order-2", "ambiguous_boundary",
+            armed["pre_send_identity"],
+        )
+        evidence = {
+            "evidence_ref": "evidence-order-3",
+            "result": "succeeded",
+            "source": "read_only",
+            "canary_idempotency_key": unknown["canary_idempotency_key"],
+            "pre_send_identity": unknown["pre_send_identity"],
+            "envelope_fingerprint": unknown["envelope_fingerprint"],
+        }
+        self.canary.reconcile_unknown(
+            armed["canary_candidate_id"], self.lease, "agent-a", evidence
+        )
+        self.clock.current += timedelta(seconds=31)
+        with self.assertRaises(AuthorityRejected) as rejected:
+            self.canary.reconcile_unknown(
+                armed["canary_candidate_id"], self.lease, "agent-a", evidence
+            )
+        self.assertEqual(
+            rejected.exception.evidence.reason_class,
+            "lease_expired_requires_reconciliation",
+        )
+        self.assertEqual(
+            self._candidate_row(armed["canary_candidate_id"])["state"], "reconciled"
+        )
+
+    def test_stale_authority_beats_reconciliation_conflict(self):
+        _shadow, armed, unknown = self._unknown_candidate(ref="evidence-order-4")
+        self.clock.current += timedelta(seconds=31)
+        conflicting = {
+            "evidence_ref": "evidence-other",
+            "result": "failed",
+            "source": "read_only",
+            "canary_idempotency_key": unknown["canary_idempotency_key"],
+            "pre_send_identity": unknown["pre_send_identity"],
+            "envelope_fingerprint": unknown["envelope_fingerprint"],
+        }
+        with self.assertRaises(AuthorityRejected) as rejected:
+            self.canary.reconcile_unknown(
+                armed["canary_candidate_id"], self.lease, "agent-a", conflicting
+            )
+        self.assertEqual(
+            rejected.exception.evidence.reason_class,
+            "lease_expired_requires_reconciliation",
+        )
+        self.assertEqual(
+            self._candidate_row(armed["canary_candidate_id"])["state"], "unknown"
+        )
+
+    def test_drift_before_unknown_update_leaves_no_mutation(self):
+        shadow = self._shadow()
+        intent_before, stored_before = self._upstream_snapshot(shadow)
+        attempts_before = self.operational.rows(
+            "SELECT COUNT(*) FROM authority_bound_attempts"
+        )[0][0]
+        jobs_before = self.operational.rows(
+            "SELECT COUNT(*) FROM jobs"
+        )[0][0]
+        transport = RecordingCanaryTransport()
+        armed = self.canary.arm(
+            shadow["shadow_evaluation_id"], self.lease, "agent-a", transport
+        )
+        row_before = self._candidate_row(armed["canary_candidate_id"])
+        original = self.canary.shadow._guard_current
+        calls = []
+
+        def flank(intent, lease, owner_id, correlation_id):
+            calls.append(1)
+            if len(calls) == 2:
+                self._retire_binding()
+            return original(intent, lease, owner_id, correlation_id)
+
+        with patch.object(
+            self.canary.shadow, "_guard_current", side_effect=flank
+        ), self.assertRaises(AuthorityRejected):
+            self.canary.record_ambiguous(
+                armed["canary_candidate_id"], self.lease, "agent-a",
+                "evidence-late-1", "ambiguous_boundary",
+                armed["pre_send_identity"],
+            )
+
+        self.assertGreaterEqual(len(calls), 2)
+        row_after = self._candidate_row(armed["canary_candidate_id"])
+        self.assertEqual(row_after["state"], "armed")
+        self.assertEqual(row_after["ambiguity_evidence_ref"], None)
+        self.assertEqual(row_after["unknown_at"], None)
+        self.assertEqual(row_after, row_before)
+        intent_after, stored_after = self._upstream_snapshot(shadow)
+        self.assertEqual(intent_after, intent_before)
+        self.assertEqual(stored_after, stored_before)
+        self.assertEqual(
+            self.operational.rows(
+                "SELECT COUNT(*) FROM authority_bound_attempts"
+            )[0][0],
+            attempts_before,
+        )
+        self.assertEqual(
+            self.operational.rows("SELECT COUNT(*) FROM jobs")[0][0], jobs_before
+        )
+
+    def test_drift_before_reconcile_update_leaves_no_mutation(self):
+        shadow = self._shadow()
+        intent_before, stored_before = self._upstream_snapshot(shadow)
+        attempts_before = self.operational.rows(
+            "SELECT COUNT(*) FROM authority_bound_attempts"
+        )[0][0]
+        jobs_before = self.operational.rows(
+            "SELECT COUNT(*) FROM jobs"
+        )[0][0]
+        transport = RecordingCanaryTransport()
+        armed = self.canary.arm(
+            shadow["shadow_evaluation_id"], self.lease, "agent-a", transport
+        )
+        unknown = self.canary.record_ambiguous(
+            armed["canary_candidate_id"], self.lease, "agent-a",
+            "evidence-late-2", "ambiguous_boundary",
+            armed["pre_send_identity"],
+        )
+        evidence = {
+            "evidence_ref": "evidence-late-3",
+            "result": "succeeded",
+            "source": "read_only",
+            "canary_idempotency_key": unknown["canary_idempotency_key"],
+            "pre_send_identity": unknown["pre_send_identity"],
+            "envelope_fingerprint": unknown["envelope_fingerprint"],
+        }
+        row_before = self._candidate_row(armed["canary_candidate_id"])
+        original = self.canary.shadow._guard_current
+        calls = []
+
+        def flank(intent, lease, owner_id, correlation_id):
+            calls.append(1)
+            if len(calls) == 2:
+                self._retire_binding()
+            return original(intent, lease, owner_id, correlation_id)
+
+        with patch.object(
+            self.canary.shadow, "_guard_current", side_effect=flank
+        ), self.assertRaises(AuthorityRejected):
+            self.canary.reconcile_unknown(
+                armed["canary_candidate_id"], self.lease, "agent-a", evidence
+            )
+
+        self.assertGreaterEqual(len(calls), 2)
+        row_after = self._candidate_row(armed["canary_candidate_id"])
+        self.assertEqual(row_after["state"], "unknown")
+        self.assertEqual(row_after["reconciliation_evidence_ref"], None)
+        self.assertEqual(row_after["reconciled_at"], None)
+        self.assertEqual(row_after, row_before)
+        intent_after, stored_after = self._upstream_snapshot(shadow)
+        self.assertEqual(intent_after, intent_before)
+        self.assertEqual(stored_after, stored_before)
+        self.assertEqual(
+            self.operational.rows(
+                "SELECT COUNT(*) FROM authority_bound_attempts"
+            )[0][0],
+            attempts_before,
+        )
+        self.assertEqual(
+            self.operational.rows("SELECT COUNT(*) FROM jobs")[0][0], jobs_before
+        )
+
     def test_stale_authority_before_unknown_transition_rejects(self):
         shadow = self._shadow()
         transport = RecordingCanaryTransport()

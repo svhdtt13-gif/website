@@ -158,6 +158,59 @@ class CanarySendFaultTests(CanarySendFixture, unittest.TestCase):
         self.assertEqual(fresh_transport.transmissions, 0)
         self.assertEqual(stub.hit_count(), 1)
 
+    def test_timeout_downgrade_with_drift_mutates_nothing(self):
+        armed = self.armed_candidate()
+        stub = self.stub()
+        transport = self.transport(stub)
+        with patch.object(
+            self.sender, "_record_success_outcome",
+            side_effect=RuntimeError("simulated crash before commit"),
+        ), self.assertRaises(RuntimeError):
+            self.sender.send(
+                armed["canary_candidate_id"], self.lease, "agent-a", transport
+            )
+        row_before = self.send_intent_row(armed["pre_send_identity"])
+        self.assertEqual(row_before["state"], "committed")
+
+        original_guarded = self.sender._guarded_intent_state
+        calls = []
+
+        def flank(canary_candidate_id, lease, owner_id, correlation_id):
+            calls.append(1)
+            if len(calls) == 2:
+                self.clock.current += timedelta(seconds=31)
+            return original_guarded(
+                canary_candidate_id, lease, owner_id, correlation_id
+            )
+
+        marked = []
+        original_mark = self.sender._mark_unknown_locked
+
+        def spy_mark(identity, reason_class, correlation_id):
+            marked.append(identity)
+            return original_mark(identity, reason_class, correlation_id)
+
+        fresh_transport = self.transport(stub)
+        with patch.object(
+            self.sender, "_guarded_intent_state", side_effect=flank
+        ), patch.object(
+            self.sender, "_mark_unknown_locked", side_effect=spy_mark
+        ), self.assertRaises(AuthorityRejected) as rejected:
+            self.sender.send(
+                armed["canary_candidate_id"], self.lease, "agent-a",
+                fresh_transport,
+            )
+
+        self.assertEqual(
+            rejected.exception.evidence.reason_class,
+            "lease_expired_requires_reconciliation",
+        )
+        self.assertEqual(marked, [])
+        self.assertEqual(fresh_transport.transmissions, 0)
+        self.assertEqual(stub.hit_count(), 1)
+        row_after = self.send_intent_row(armed["pre_send_identity"])
+        self.assertEqual(row_after, row_before)
+
     def test_error_status_response_marks_unknown(self):
         armed = self.armed_candidate()
         stub = self.stub(StubBehavior(mode="error_status", status=500))
@@ -254,9 +307,13 @@ class CanarySendFaultTests(CanarySendFixture, unittest.TestCase):
                 )
                 original_resolve = service._resolve_committed
 
-                def resolve_and_expire(existing, correlation_id):
+                def resolve_and_expire(
+                    existing, candidate_id, lease, owner_id, correlation_id
+                ):
                     self.clock.current += timedelta(seconds=61)
-                    return original_resolve(existing, correlation_id)
+                    return original_resolve(
+                        existing, candidate_id, lease, owner_id, correlation_id
+                    )
 
                 with patch.object(
                     service, "_resolve_committed", side_effect=resolve_and_expire

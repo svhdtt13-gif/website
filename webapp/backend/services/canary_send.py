@@ -197,7 +197,9 @@ class CanarySingleShotService:
         )
         if current["state"] != "committed":
             return self._result(current, "idempotent_replay")
-        self._resolve_committed(current, correlation_id)
+        self._resolve_committed(
+            current, canary_candidate_id, lease, owner_id, correlation_id
+        )
         final = self._guarded_intent_state(
             canary_candidate_id, lease, owner_id, correlation_id
         )
@@ -225,7 +227,9 @@ class CanarySingleShotService:
                 raise _reject(correlation_id, "canary_send_intent_missing")
             return current
 
-    def _resolve_committed(self, existing, correlation_id):
+    def _resolve_committed(
+        self, existing, canary_candidate_id, lease, owner_id, correlation_id
+    ):
         identity = existing["pre_send_identity"]
         rounds = max(
             1,
@@ -242,6 +246,11 @@ class CanarySingleShotService:
                 raise _reject(correlation_id, "canary_send_intent_missing")
         if current["state"] != "committed":
             return current
+        guarded = self._guarded_intent_state(
+            canary_candidate_id, lease, owner_id, correlation_id
+        )
+        if guarded["state"] != "committed":
+            return guarded
         self._mark_unknown_locked(identity, "committed_unresolved", correlation_id)
         return self._send_intent(identity)
 

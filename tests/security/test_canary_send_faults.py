@@ -62,7 +62,7 @@ class CanarySendFaultTests(CanarySendFixture, unittest.TestCase):
         self.assertEqual(stub.hit_count(), 0)
         row = self.send_intent_row(armed["pre_send_identity"])
         self.assertIsNotNone(row)
-        self.assertEqual(row["state"], "unknown")
+        self.assertEqual(row["state"], "committed")
         candidate = self.candidate_row(armed["canary_candidate_id"])
         self.assertEqual(candidate["state"], "armed")
 
@@ -94,7 +94,7 @@ class CanarySendFaultTests(CanarySendFixture, unittest.TestCase):
         self.assertEqual(stub.hit_count(), 0)
         row = self.send_intent_row(armed["pre_send_identity"])
         self.assertIsNotNone(row)
-        self.assertEqual(row["state"], "unknown")
+        self.assertEqual(row["state"], "committed")
 
     def test_failure_before_connect_sends_zero(self):
         armed = self.armed_candidate()
@@ -172,29 +172,18 @@ class CanarySendFaultTests(CanarySendFixture, unittest.TestCase):
         row_before = self.send_intent_row(armed["pre_send_identity"])
         self.assertEqual(row_before["state"], "committed")
 
-        original_guarded = self.sender._guarded_intent_state
+        original_guard = self.sender.shadow._guard_current
         calls = []
 
-        def flank(canary_candidate_id, lease, owner_id, correlation_id):
+        def flank(intent, lease, owner_id, correlation_id):
             calls.append(1)
-            if len(calls) == 2:
+            if len(calls) == 3:
                 self.clock.current += timedelta(seconds=31)
-            return original_guarded(
-                canary_candidate_id, lease, owner_id, correlation_id
-            )
-
-        marked = []
-        original_mark = self.sender._mark_unknown_locked
-
-        def spy_mark(identity, reason_class, correlation_id):
-            marked.append(identity)
-            return original_mark(identity, reason_class, correlation_id)
+            return original_guard(intent, lease, owner_id, correlation_id)
 
         fresh_transport = self.transport(stub)
         with patch.object(
-            self.sender, "_guarded_intent_state", side_effect=flank
-        ), patch.object(
-            self.sender, "_mark_unknown_locked", side_effect=spy_mark
+            self.sender.shadow, "_guard_current", side_effect=flank
         ), self.assertRaises(AuthorityRejected) as rejected:
             self.sender.send(
                 armed["canary_candidate_id"], self.lease, "agent-a",
@@ -205,7 +194,7 @@ class CanarySendFaultTests(CanarySendFixture, unittest.TestCase):
             rejected.exception.evidence.reason_class,
             "lease_expired_requires_reconciliation",
         )
-        self.assertEqual(marked, [])
+        self.assertGreaterEqual(len(calls), 3)
         self.assertEqual(fresh_transport.transmissions, 0)
         self.assertEqual(stub.hit_count(), 1)
         row_after = self.send_intent_row(armed["pre_send_identity"])

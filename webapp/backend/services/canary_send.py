@@ -126,10 +126,9 @@ class CanarySingleShotService:
             with self.operational.transaction():
                 self._final_guard(candidate, lease, owner_id, correlation_id)
         except Exception:
-            self._mark_unknown_locked(
-                candidate["pre_send_identity"],
-                "authority_stale_before_network",
-                correlation_id,
+            self._guarded_mark_unknown(
+                candidate["canary_candidate_id"], lease, owner_id,
+                "authority_stale_before_network", correlation_id,
             )
             raise
         if self.operational.connection.in_transaction:
@@ -141,10 +140,9 @@ class CanarySingleShotService:
                 candidate["pre_send_identity"],
             )
         except CanaryDestinationRefused:
-            self._mark_unknown_locked(
-                candidate["pre_send_identity"],
-                "destination_refused",
-                correlation_id,
+            self._guarded_mark_unknown(
+                candidate["canary_candidate_id"], lease, owner_id,
+                "destination_refused", correlation_id,
             )
             raise
         except CanarySendAmbiguous as ambiguous:
@@ -246,13 +244,10 @@ class CanarySingleShotService:
                 raise _reject(correlation_id, "canary_send_intent_missing")
         if current["state"] != "committed":
             return current
-        guarded = self._guarded_intent_state(
-            canary_candidate_id, lease, owner_id, correlation_id
+        return self._guarded_mark_unknown(
+            canary_candidate_id, lease, owner_id,
+            "committed_unresolved", correlation_id,
         )
-        if guarded["state"] != "committed":
-            return guarded
-        self._mark_unknown_locked(identity, "committed_unresolved", correlation_id)
-        return self._send_intent(identity)
 
     def _insert_intent(self, candidate, transport, correlation_id):
         now = self.coordinator._now("canary").isoformat()
@@ -290,8 +285,23 @@ class CanarySingleShotService:
                 raise _reject(correlation_id, "canary_send_identity_conflict")
             raise _SendContended(existing) from None
 
-    def _mark_unknown_locked(self, identity, reason_class, correlation_id):
+    def _guarded_mark_unknown(
+        self, canary_candidate_id, lease, owner_id, reason_class, correlation_id
+    ):
         with self.operational.transaction():
+            candidate = self._candidate(canary_candidate_id)
+            if candidate is None:
+                raise _reject(correlation_id, "canary_candidate_not_found")
+            shadow, intent, execution, attempt, target = self._lineage(
+                candidate, correlation_id
+            )
+            snapshot = self.shadow._guard_current(
+                intent, lease, owner_id, correlation_id
+            )
+            self.arming._require_candidate_lineage(
+                candidate, shadow, intent, execution, attempt, target,
+                snapshot_fingerprint(snapshot), correlation_id,
+            )
             updated = self.operational.connection.execute(
                 "UPDATE authority_bound_canary_send_intents SET state='unknown', "
                 "reason_class=?, unknown_at=? "
@@ -299,13 +309,15 @@ class CanarySingleShotService:
                 (
                     reason_class,
                     self.coordinator._now("canary").isoformat(),
-                    identity,
+                    candidate["pre_send_identity"],
                 ),
             ).rowcount
             if updated != 1:
-                current = self._send_intent(identity)
+                current = self._send_intent(candidate["pre_send_identity"])
                 if current is None:
                     raise _reject(correlation_id, "canary_send_intent_missing")
+                return current
+            return self._send_intent(candidate["pre_send_identity"])
 
     def _record_ambiguous_outcome(
         self, candidate, lease, owner_id, status_class, correlation_id

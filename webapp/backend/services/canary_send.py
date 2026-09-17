@@ -327,7 +327,8 @@ class CanarySingleShotService:
             updated = self.operational.connection.execute(
                 "UPDATE authority_bound_canary_send_intents SET state='unknown', "
                 "status_class=?, reason_class=?, unknown_at=? "
-                "WHERE pre_send_identity=? AND state='committed'",
+                "WHERE pre_send_identity=? AND (state='committed' OR "
+                "(state='unknown' AND reason_class='committed_unresolved'))",
                 (
                     status_class,
                     status_class,
@@ -350,7 +351,8 @@ class CanarySingleShotService:
             updated = self.operational.connection.execute(
                 "UPDATE authority_bound_canary_send_intents SET state='succeeded', "
                 "status_class=?, response_fingerprint=?, reason_class=?, "
-                "succeeded_at=? WHERE pre_send_identity=? AND state='committed'",
+                "succeeded_at=? WHERE pre_send_identity=? AND (state='committed' "
+                "OR (state='unknown' AND reason_class='committed_unresolved'))",
                 (
                     status_class, response_fingerprint, "single_shot_succeeded",
                     self.coordinator._now("canary").isoformat(),

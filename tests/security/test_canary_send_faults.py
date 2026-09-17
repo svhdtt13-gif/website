@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import sys
+import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
@@ -22,6 +23,8 @@ from services.canary_send_transport import (
     CanarySendAmbiguous,
     SingleShotCanaryTransport,
 )
+from services.canary_transport import RecordingCanaryTransport
+from services.shadow_dispatch_transport import RecordingShadowTransport
 
 from tests.security.canary_send_support import CanarySendFixture, StubBehavior
 
@@ -361,6 +364,151 @@ class CanarySendFaultTests(CanarySendFixture, unittest.TestCase):
             self.assertNotIn("#", destination_ref)
             self.assertNotIn("token", destination_ref.lower())
         self.assertEqual(rows[0][0], stub.url)
+
+    def _slow_winner_service(self):
+        operational = OperationalSQLiteRepository.open(self.runtime)
+        coordinator = BindingAuthorityCoordinator(
+            self.portable_path, operational, self.clock,
+            AuthorityConfig(lease_ttl=timedelta(seconds=60)),
+        )
+        service = CanarySingleShotService(
+            self.portable_path, operational, coordinator,
+            committed_wait_seconds=5.0,
+        )
+        return operational, service
+
+    def _upstream_pair(self, shadow):
+        intent = dict(
+            self.operational.connection.execute(
+                "SELECT * FROM authority_bound_dispatch_intents WHERE intent_id=?",
+                (shadow["intent_id"],),
+            ).fetchone()
+        )
+        stored = dict(
+            self.operational.connection.execute(
+                "SELECT * FROM authority_bound_shadow_evaluations "
+                "WHERE shadow_evaluation_id=?",
+                (shadow["shadow_evaluation_id"],),
+            ).fetchone()
+        )
+        return intent, stored
+
+    def test_slow_winner_succeeds_after_loser_timeout(self):
+        _execution, intent = self.prepared()
+        shadow = self.shadow.evaluate(
+            intent["intent_id"], self.lease, "agent-a", "shadow-slow-a",
+            RecordingShadowTransport(),
+        )
+        armed = self.canary.arm(
+            shadow["shadow_evaluation_id"], self.lease, "agent-a",
+            RecordingCanaryTransport(),
+        )
+        intent_before, stored_before = self._upstream_pair(shadow)
+        stub = self.stub(StubBehavior(mode="success", delay=2.0))
+
+        def send_winner():
+            operational, service = self._slow_winner_service()
+            try:
+                return service.send(
+                    armed["canary_candidate_id"], self.lease, "agent-a",
+                    SingleShotCanaryTransport(stub.url, timeout=10.0),
+                )
+            finally:
+                operational.close()
+
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            winner_future = executor.submit(send_winner)
+            for _ in range(100):
+                if stub.hit_count() >= 1:
+                    break
+                time.sleep(0.05)
+            self.assertEqual(stub.hit_count(), 1)
+            row = self.send_intent_row(armed["pre_send_identity"])
+            self.assertIsNotNone(row)
+            self.assertEqual(row["state"], "committed")
+            loser_transport = self.transport(stub, timeout=10.0)
+            loser = self.sender.send(
+                armed["canary_candidate_id"], self.lease, "agent-a",
+                loser_transport,
+            )
+            self.assertEqual(loser["state"], "unknown")
+            self.assertEqual(loser["reason_class"], "committed_unresolved")
+            self.assertEqual(loser_transport.transmissions, 0)
+            winner = winner_future.result(timeout=30)
+
+        self.assertEqual(winner["state"], "succeeded")
+        final = self.send_intent_row(armed["pre_send_identity"])
+        self.assertEqual(final["state"], "succeeded")
+        self.assertEqual(final["reason_class"], "single_shot_succeeded")
+        self.assertEqual(stub.hit_count(), 1)
+        self.assertEqual(
+            self.operational.rows(
+                "SELECT COUNT(*) FROM authority_bound_canary_send_intents"
+            )[0][0],
+            1,
+        )
+        candidate = self.candidate_row(armed["canary_candidate_id"])
+        self.assertEqual(candidate["state"], "armed")
+        intent_after, stored_after = self._upstream_pair(shadow)
+        self.assertEqual(intent_after, intent_before)
+        self.assertEqual(stored_after, stored_before)
+
+    def test_slow_winner_ambiguous_after_loser_timeout(self):
+        _execution, intent = self.prepared()
+        shadow = self.shadow.evaluate(
+            intent["intent_id"], self.lease, "agent-a", "shadow-slow-b",
+            RecordingShadowTransport(),
+        )
+        armed = self.canary.arm(
+            shadow["shadow_evaluation_id"], self.lease, "agent-a",
+            RecordingCanaryTransport(),
+        )
+        intent_before, stored_before = self._upstream_pair(shadow)
+        stub = self.stub(StubBehavior(mode="reset_after_read", delay=2.0))
+
+        def send_winner():
+            operational, service = self._slow_winner_service()
+            try:
+                return service.send(
+                    armed["canary_candidate_id"], self.lease, "agent-a",
+                    SingleShotCanaryTransport(stub.url, timeout=10.0),
+                )
+            finally:
+                operational.close()
+
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            winner_future = executor.submit(send_winner)
+            for _ in range(100):
+                if stub.hit_count() >= 1:
+                    break
+                time.sleep(0.05)
+            self.assertEqual(stub.hit_count(), 1)
+            loser_transport = self.transport(stub, timeout=10.0)
+            loser = self.sender.send(
+                armed["canary_candidate_id"], self.lease, "agent-a",
+                loser_transport,
+            )
+            self.assertEqual(loser["state"], "unknown")
+            self.assertEqual(loser["reason_class"], "committed_unresolved")
+            self.assertEqual(loser_transport.transmissions, 0)
+            winner = winner_future.result(timeout=30)
+
+        self.assertEqual(winner["state"], "unknown")
+        final = self.send_intent_row(armed["pre_send_identity"])
+        self.assertEqual(final["state"], "unknown")
+        self.assertNotEqual(final["reason_class"], "committed_unresolved")
+        candidate = self.candidate_row(armed["canary_candidate_id"])
+        self.assertEqual(candidate["state"], "unknown")
+        self.assertEqual(stub.hit_count(), 1)
+        self.assertEqual(
+            self.operational.rows(
+                "SELECT COUNT(*) FROM authority_bound_canary_send_intents"
+            )[0][0],
+            1,
+        )
+        intent_after, stored_after = self._upstream_pair(shadow)
+        self.assertEqual(intent_after, intent_before)
+        self.assertEqual(stored_after, stored_before)
 
     def test_transport_single_use_refuses_second_post(self):
         stub = self.stub()

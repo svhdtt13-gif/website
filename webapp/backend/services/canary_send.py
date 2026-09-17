@@ -114,10 +114,14 @@ class CanarySingleShotService:
                     if candidate["state"] != "armed":
                         raise _reject(correlation_id, "canary_send_not_actionable")
                     self._insert_intent(candidate, transport, correlation_id)
-        except _SendContended as contended:
-            return self._replay_outside(contended.existing, correlation_id)
+        except _SendContended:
+            return self._replay_outside(
+                canary_candidate_id, lease, owner_id, correlation_id
+            )
         if existing is not None:
-            return self._replay_outside(existing, correlation_id)
+            return self._replay_outside(
+                canary_candidate_id, lease, owner_id, correlation_id
+            )
         try:
             with self.operational.transaction():
                 self._final_guard(candidate, lease, owner_id, correlation_id)
@@ -185,13 +189,41 @@ class CanarySingleShotService:
         if fresh_candidate["state"] != "armed":
             raise _reject(correlation_id, "canary_send_not_actionable")
 
-    def _replay_outside(self, existing, correlation_id):
-        if existing["state"] == "succeeded":
-            return self._result(existing, "idempotent_replay")
-        if existing["state"] == "unknown":
-            return self._result(existing, "idempotent_replay")
-        resolved = self._resolve_committed(existing, correlation_id)
-        return self._result(resolved, "idempotent_replay")
+    def _replay_outside(
+        self, canary_candidate_id, lease, owner_id, correlation_id
+    ):
+        current = self._guarded_intent_state(
+            canary_candidate_id, lease, owner_id, correlation_id
+        )
+        if current["state"] != "committed":
+            return self._result(current, "idempotent_replay")
+        self._resolve_committed(current, correlation_id)
+        final = self._guarded_intent_state(
+            canary_candidate_id, lease, owner_id, correlation_id
+        )
+        return self._result(final, "idempotent_replay")
+
+    def _guarded_intent_state(
+        self, canary_candidate_id, lease, owner_id, correlation_id
+    ):
+        with self.operational.transaction():
+            candidate = self._candidate(canary_candidate_id)
+            if candidate is None:
+                raise _reject(correlation_id, "canary_candidate_not_found")
+            shadow, intent, execution, attempt, target = self._lineage(
+                candidate, correlation_id
+            )
+            snapshot = self.shadow._guard_current(
+                intent, lease, owner_id, correlation_id
+            )
+            self.arming._require_candidate_lineage(
+                candidate, shadow, intent, execution, attempt, target,
+                snapshot_fingerprint(snapshot), correlation_id,
+            )
+            current = self._send_intent(candidate["pre_send_identity"])
+            if current is None:
+                raise _reject(correlation_id, "canary_send_intent_missing")
+            return current
 
     def _resolve_committed(self, existing, correlation_id):
         identity = existing["pre_send_identity"]

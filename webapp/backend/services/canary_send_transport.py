@@ -65,6 +65,8 @@ def _allowlisted_destination(destination_url: str) -> str:
         raise CanaryDestinationRefused("destination_not_allowlisted")
     if not parts.port:
         raise CanaryDestinationRefused("destination_port_required")
+    if parts.query or parts.fragment:
+        raise CanaryDestinationRefused("destination_query_forbidden")
     return destination_url
 
 

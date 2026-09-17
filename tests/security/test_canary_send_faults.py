@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import sys
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
 from pathlib import Path
 from unittest.mock import patch
@@ -8,8 +9,14 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "webapp" / "backend"))
 
+from repositories.operational_sqlite import OperationalSQLiteRepository
 from repositories.portable_store import PortableDomainStore
-from services.binding_authority import AuthorityRejected
+from services.binding_authority import (
+    AuthorityConfig,
+    AuthorityRejected,
+    BindingAuthorityCoordinator,
+)
+from services.canary_send import CanarySingleShotService
 from services.canary_send_transport import (
     CanaryDestinationRefused,
     CanarySendAmbiguous,
@@ -169,6 +176,145 @@ class CanarySendFaultTests(CanarySendFixture, unittest.TestCase):
         )
         self.assertEqual(result["state"], "unknown")
         self.assertEqual(stub.hit_count(), 1)
+
+    def test_succeeded_replay_after_expiry_rejects_authority_first(self):
+        armed = self.armed_candidate()
+        stub = self.stub()
+        result = self.sender.send(
+            armed["canary_candidate_id"], self.lease, "agent-a",
+            self.transport(stub),
+        )
+        self.assertEqual(result["state"], "succeeded")
+        self.clock.current += timedelta(seconds=31)
+        fresh_transport = self.transport(stub)
+        with self.assertRaises(AuthorityRejected) as rejected:
+            self.sender.send(
+                armed["canary_candidate_id"], self.lease, "agent-a",
+                fresh_transport,
+            )
+        self.assertEqual(
+            rejected.exception.evidence.reason_class,
+            "lease_expired_requires_reconciliation",
+        )
+        self.assertEqual(fresh_transport.transmissions, 0)
+        self.assertEqual(stub.hit_count(), 1)
+
+    def test_unknown_replay_after_drift_rejects_authority_first(self):
+        armed = self.armed_candidate()
+        transport = SingleShotCanaryTransport("http://127.0.0.1:1/canary", timeout=2.0)
+        result = self.sender.send(
+            armed["canary_candidate_id"], self.lease, "agent-a", transport
+        )
+        self.assertEqual(result["state"], "unknown")
+        self._retire_binding()
+        fresh_transport = self.transport(self.stub())
+        with self.assertRaises(AuthorityRejected) as rejected:
+            self.sender.send(
+                armed["canary_candidate_id"], self.lease, "agent-a",
+                fresh_transport,
+            )
+        self.assertNotEqual(
+            rejected.exception.evidence.reason_class, "canary_send_not_actionable"
+        )
+        self.assertEqual(fresh_transport.transmissions, 0)
+
+    def test_contended_loser_with_drift_during_poll_rejects(self):
+        armed = self.armed_candidate()
+        stub = self.stub(StubBehavior(mode="success", delay=2.0))
+        errors = {}
+
+        def send_winner():
+            operational = OperationalSQLiteRepository.open(self.runtime)
+            try:
+                coordinator = BindingAuthorityCoordinator(
+                    self.portable_path, operational, self.clock,
+                    AuthorityConfig(lease_ttl=timedelta(seconds=60)),
+                )
+                service = CanarySingleShotService(
+                    self.portable_path, operational, coordinator,
+                    committed_wait_seconds=5.0,
+                )
+                return service.send(
+                    armed["canary_candidate_id"], self.lease, "agent-a",
+                    SingleShotCanaryTransport(stub.url, timeout=10.0),
+                )
+            finally:
+                operational.close()
+
+        def send_loser():
+            operational = OperationalSQLiteRepository.open(self.runtime)
+            try:
+                coordinator = BindingAuthorityCoordinator(
+                    self.portable_path, operational, self.clock,
+                    AuthorityConfig(lease_ttl=timedelta(seconds=60)),
+                )
+                service = CanarySingleShotService(
+                    self.portable_path, operational, coordinator,
+                    committed_wait_seconds=5.0,
+                )
+                original_resolve = service._resolve_committed
+
+                def resolve_and_expire(existing, correlation_id):
+                    self.clock.current += timedelta(seconds=61)
+                    return original_resolve(existing, correlation_id)
+
+                with patch.object(
+                    service, "_resolve_committed", side_effect=resolve_and_expire
+                ):
+                    return service.send(
+                        armed["canary_candidate_id"], self.lease, "agent-a",
+                        SingleShotCanaryTransport(stub.url, timeout=10.0),
+                    )
+            except AuthorityRejected as rejected:
+                errors["reason"] = rejected.evidence.reason_class
+                raise
+            finally:
+                operational.close()
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            winner_future = executor.submit(send_winner)
+            for _ in range(100):
+                if self.send_intent_row(armed["pre_send_identity"]) is not None:
+                    break
+                import time as _time
+
+                _time.sleep(0.05)
+            loser_future = executor.submit(send_loser)
+            winner = winner_future.result(timeout=30)
+            with self.assertRaises(AuthorityRejected):
+                loser_future.result(timeout=30)
+
+        self.assertEqual(winner["state"], "succeeded")
+        self.assertEqual(errors.get("reason"), "lease_expired_requires_reconciliation")
+        self.assertEqual(stub.hit_count(), 1)
+        self.assertEqual(
+            self.send_intent_row(armed["pre_send_identity"])["state"], "succeeded"
+        )
+
+    def test_destination_with_query_or_fragment_refused(self):
+        stub = self.stub()
+        with self.assertRaises(CanaryDestinationRefused):
+            SingleShotCanaryTransport(stub.url + "?token=SECRET-VALUE-1")
+        with self.assertRaises(CanaryDestinationRefused):
+            SingleShotCanaryTransport(stub.url + "#section")
+        self.assertEqual(stub.hit_count(), 0)
+
+    def test_persisted_destinations_carry_no_query_or_fragment(self):
+        armed = self.armed_candidate()
+        stub = self.stub()
+        self.sender.send(
+            armed["canary_candidate_id"], self.lease, "agent-a",
+            self.transport(stub),
+        )
+        rows = self.operational.rows(
+            "SELECT destination_ref FROM authority_bound_canary_send_intents"
+        )
+        self.assertTrue(rows)
+        for (destination_ref,) in rows:
+            self.assertNotIn("?", destination_ref)
+            self.assertNotIn("#", destination_ref)
+            self.assertNotIn("token", destination_ref.lower())
+        self.assertEqual(rows[0][0], stub.url)
 
     def test_transport_single_use_refuses_second_post(self):
         stub = self.stub()

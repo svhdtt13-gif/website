@@ -85,6 +85,12 @@ class BindingAuthorityCoordinator:
                 "WHERE state='armed'",
                 (self.clock.now().isoformat(),),
             )
+            self.operational.connection.execute(
+                "UPDATE authority_bound_canary_send_intents SET state='unknown', "
+                "reason_class='coordinator_restart', unknown_at=? "
+                "WHERE state='committed'",
+                (self.clock.now().isoformat(),),
+            )
         self.operational.requires_fresh_bootstrap = False
         return FenceIdentity(epoch, 0)
 

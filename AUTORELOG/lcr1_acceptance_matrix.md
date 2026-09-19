@@ -29,6 +29,7 @@ Scope: receiver/evidence contract only; no live mutation is authorized.
 | LCR1-016 | Process cleanup | Receiver releases connection, mutex, and local resources in all exit paths | Success, error, timeout, and crash cleanup evidence | Mark run unknown; no retry |
 | LCR1-017 | Fence lifetime | LEGACY coordinator creates/acquires the durable `canary_run_id` / `fence_identity` before dispatchable receipt, and closes or abandons it only after observation handoff | Fence lifecycle trace proving AutoCycle cannot resume before closure | Zero mutation / reject attribution |
 | LCR1-017A | AutoCycle enforcement | `Execute-Slot`, `Resolve-Day`, `Toggle-Rows`, `Stop-RowsLocal`, `Stop-RowsViaMenu`, `Kill-Local`, and every action boundary check the canonical fence | Static call-site scan plus stale-fence race test | Zero mutation |
+| LCR1-017B | Fence decision table | `no_active_run` permits normal LEGACY authority; active/observation states block; malformed/stale/conflicting referenced state fails closed; `closed` resumes; `abandoned` remains blocked until explicit `resolve_clear` | State-by-state AutoCycle decision tests and recovery audit | Zero mutation / manual recovery |
 | LCR1-018 | Attribution binding | Receipt and snapshot carry the same run, fence, and non-secret source identity | Cross-artifact lineage test | Result unknown |
 
 ## 3. Request and receipt gates
@@ -37,11 +38,13 @@ Scope: receiver/evidence contract only; no live mutation is authorized.
 |---|---|---|---|---|
 | LCR1-020 | Canonical input | Four-field IS3B2 payload is paired with one immutable LEGACY authorization artifact binding exactly one `group_on` target | Canonical serialization, artifact, and validation tests | Reject before remote I/O |
 | LCR1-020A | IS3B2 protocol | Receiver accepts exactly IS3B2's four fields with `contract_version` equal to the string `is3b2.v1` | Exact request-shape/version test | Reject widened/ad hoc protocol |
-| LCR1-020B | Authorization producer | LEGACY coordinator is the sole artifact writer and commits it before the send is dispatchable; P4/IS3B2 transports but cannot bootstrap authorization | Writer provenance, ACL, commit-order, and missing-artifact tests | Reject before remote I/O |
+| LCR1-020B | Authorization producer | LEGACY coordinator is the sole artifact writer and commits it before the send is dispatchable; P4 `CanarySingleShotService` may export only the authenticated handoff and cannot write or self-authorize the LEGACY artifact | Writer provenance, ACL, commit-order, and missing-artifact tests | Reject before remote I/O |
 | LCR1-020C | Fingerprint trust | Receiver compares the supplied opaque `envelope_fingerprint` to the immutable artifact value and does not recompute it from the four fields | Equality/tamper tests and producer provenance test | Reject before remote I/O |
+| LCR1-020D | Trusted handoff | Existing P4 `CanarySingleShotService` exports one authenticated handoff containing the canonical envelope JSON, both contract versions, identity/key, fingerprint, target, operation, binding, and exporter attestation; it calls `single_post` only after the LEGACY acknowledgement proves the handoff/artifact are committed | Attestation, projection-consistency, acknowledgement-order, and no-ad-hoc-read tests | Reject before remote I/O |
+| LCR1-020E | Handoff conflict | Handoff ID and `pre_send_identity` are unique; same identity/fingerprint replays, while any conflicting projected field is permanent conflict | Duplicate/conflicting publication race | Zero mutation |
 | LCR1-021 | Pre-send receipt | `accepted` is durably persisted before mutation can begin | Ordered crash-seam test | Zero mutation or unknown; never blind retry |
 | LCR1-022 | Same replay | Same identity and same fingerprint returns stored receipt and performs zero mutation | Replay test for every receipt state | Zero additional mutations |
-| LCR1-022A | Dispatching replay | Same identity in `dispatching` returns the stored receipt and performs zero mutation; conflicting fingerprint fails closed | Concurrent dispatching replay test | Zero additional mutations |
+| LCR1-022A | Dispatching replay | Same identity in externally visible `dispatching` returns the stored receipt, projects reconciliation as `unknown`, and performs zero mutation; conflicting fingerprint fails closed | Concurrent dispatching replay test | Zero additional mutations |
 | LCR1-023 | Conflict replay | Same identity with a different fingerprint fails closed without overwrite | Conflict test | Zero mutation |
 | LCR1-024 | Identity binding | Operation and exact target are covered by the immutable LEGACY artifact and producer-bound fingerprint | Tamper test over each request/artifact field | Conflict/fail-closed |
 | LCR1-025 | One target | Batch, group expansion, and multiple target references are rejected | Input boundary tests | Zero mutation |
@@ -94,7 +97,7 @@ Scope: receiver/evidence contract only; no live mutation is authorized.
 | LCR1-070 | Crash before primitive | A crash before primitive entry cannot cause an automatic resend | Crash seam and replay test | Zero resend |
 | LCR1-071 | Crash after entry | A crash after mutation may begin is `unknown`, never retried | Crash seam and receipt test | Zero resend |
 | LCR1-071A | Boundary race | A pre-mutation or pre-terminal snapshot, even with generation greater than the pre-operation floor, cannot satisfy `succeeded` | Snapshot-before-dispatch fault fixture | Result unknown |
-| LCR1-072 | Restart | Restart does not revive an `accepted` or `unknown` request into mutation | Restart/replay test | Zero mutation |
+| LCR1-072 | Restart | Restart does not revive an `accepted`, `dispatching`, or `unknown` request into mutation | Restart/replay test | Zero mutation |
 | LCR1-073 | Lease/fence drift | Binding, owner, epoch, counter, or target drift fails closed before mutation | Authority mutation tests | Zero mutation |
 | LCR1-074 | Restore | Restored receipt/evidence is historical and cannot grant live mutation authority | Restore/quarantine test | Zero mutation |
 | LCR1-075 | Fixed protection | Fixed clients are never selected by the first canary operation family | Target-selection test | Zero mutation |

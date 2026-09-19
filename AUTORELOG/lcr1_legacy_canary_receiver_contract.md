@@ -72,17 +72,31 @@ has a unique `canary_run_id` and `fence_identity` and remains held through all
 of these phases:
 
 ```text
-requested -> acquired -> receipt_accepted -> mutation -> receipt_terminal
-                                      -> materialized_observation -> closed
-                                                                     |-> abandoned
+no_active_run -> requested -> acquired -> receipt_accepted -> mutation
+                                      -> receipt_terminal -> observation_pending -> closed
+                                                                       |-> abandoned
+abandoned -> explicit_resolve_clear -> no_active_run
+closed -> no_active_run
 ```
 
 The receipt and the materialized snapshot must carry the same
-`canary_run_id` and `fence_identity`. AutoCycle may resume only after the run
-is durably `closed` or `abandoned`. `abandoned` is evidence-incomplete/`unknown`
-and is never a retry permission. A missing observation closes the run as
-`abandoned`; it never permits another actor's later state to be attributed to
-this run.
+`canary_run_id` and `fence_identity`. The canonical AutoCycle decision table
+is:
+
+| Durable fence state | AutoCycle decision |
+|---|---|
+| `no_active_run` / no active row | Normal LEGACY authority, subject to existing controls |
+| `requested`, `acquired`, `receipt_accepted`, `mutation`, `receipt_terminal`, or `observation_pending` | Block every mutation-capable path |
+| Malformed, stale, or conflicting evidence for a referenced active run | Fail closed and require manual recovery; never mutate |
+| `closed` | Normal LEGACY authority may resume |
+| `abandoned` | Remains blocking; only explicit coordinator `resolve_clear` may return to `no_active_run` |
+
+An absent fence means normal operation only when there is no active canary run.
+A receipt or handoff that references a missing fence is corrupt active-run
+evidence and fails closed. `abandoned` is evidence-incomplete/`unknown`, is
+never a retry permission, and does not itself allow AutoCycle to resume. A
+missing observation moves the run to `abandoned`; the coordinator must record
+the explicit `resolve_clear` decision before the durable active row is removed.
 
 The LEGACY canary authorization/fence coordinator is the sole lifecycle owner.
 It creates and acquires the durable fence before the receipt can become
@@ -102,15 +116,17 @@ mutation-capable helper (`Toggle-Rows`, `Stop-RowsLocal`,
 `SW` or local `Stop-Process` after any wait, reconnect, or retry. An active
 canary fence causes the AutoCycle path to fail closed with zero mutation. The
 check is made while holding the existing remote-action exclusion for the
-remote/local action boundary; a stale, missing, conflicting, or abandoned
-fence never permits mutation. AutoCycle only observes and enforces this fence;
-it does not own its lifecycle.
+remote/local action boundary. `no_active_run` is the only normal absent-fence
+case; stale, missing, conflicting, or abandoned evidence for a referenced run
+never permits mutation. AutoCycle only observes and enforces this fence; it
+does not own its lifecycle.
 
 The receiver keeps the durable fence active while it releases the remote
 exclusion for the sole LEGACY sync reader to capture the bounded observation.
 The fence is not closed until that observation is captured and linked, or the
 coordinator records the bounded observation as unavailable and abandons the
-run.
+run. AutoCycle cannot resume from `abandoned` until that separate
+`resolve_clear` transition is durably recorded.
 
 The receiver must release all local resources in a `finally` path and exit
 after the single request. It must not start, stop, or restart AutoCycle,
@@ -136,15 +152,66 @@ IS3B2 transport constant `is3b2.v1`; a numeric `1` is not a valid receiver
 value. `envelope_fingerprint` is an opaque producer value. The receiver must
 not pretend to recompute it from the four fields.
 
-Before IS3B2 sends the four-field payload, the LEGACY canary
-authorization/fence coordinator creates the immutable authorization artifact
-in the canonical LEGACY store. It independently validates the exact target,
-allowed operation, requested state, binding, fence, and pre-operation
-observation floor, then commits the artifact before the send is dispatchable.
-The coordinator is the sole artifact writer; the receiver has read-only access
-and cannot create, repair, or replace an artifact. The P4/IS3B2 sender is only
-the transport producer and cannot bootstrap authorization from the payload.
-Until this artifact exists, the receiver rejects the request before remote I/O.
+Before IS3B2 sends the four-field payload, the existing P4
+`CanarySingleShotService` is the sole trusted envelope exporter. After its
+existing lineage/final-authority checks and before
+`SingleShotCanaryTransport.single_post`, it publishes one authenticated,
+append-only `LEGACYCanaryAuthorizationHandoff` to the LEGACY coordinator. The
+exporter takes `candidate["envelope_json"]`,
+`candidate["envelope_fingerprint"]`, `candidate["pre_send_identity"]`, and
+`candidate["canary_idempotency_key"]` from that one persisted canary candidate,
+and takes `operation_kind` plus `target_ref = destination_ref` from the same
+validated `_lineage` result. It does not accept those fields as separate
+operator inputs. The
+handoff crosses this exact projection from one canonical `CanaryEnvelope`:
+
+```text
+handoff_id
+source_envelope_contract_version = is3b1.v1
+transport_contract_version = is3b2.v1
+pre_send_identity
+canary_idempotency_key
+envelope_fingerprint
+canonical_envelope_json
+operation_kind
+target_ref
+binding_generation
+verified_identity_ref
+verified_identity_revision
+authority_epoch
+fence_counter
+exporter_identity
+exporter_attestation
+```
+
+This handoff and its acknowledgement are local authenticated control-plane
+artifacts, not a new remote WebSocket command or a widening of the four-field
+IS3B2 body.
+
+The exporter attests the complete canonical envelope and its projection as one
+record; therefore the identity, opaque fingerprint, exact target, and
+operation cannot be mixed from separate P4 records. The handoff is authenticated
+by the exporter service identity and its detached attestation, and is fenced by
+the unique `handoff_id` plus `pre_send_identity`. The LEGACY coordinator reads
+by the exporter service identity/key pinned in the LEGACY trust registry. The
+coordinator accepts this authenticated handoff channel only; it does not query
+P4 operational SQLite or infer target semantics from the four-field body. It
+verifies the registered exporter identity, detached attestation over the
+canonical envelope plus projection, exact transport version, and projection
+consistency, then commits the handoff before creating the LEGACY authorization
+artifact. It returns a one-time authorization acknowledgement bound to the
+handoff ID, `pre_send_identity`, fingerprint, and artifact fingerprint; the
+exporter must not call `single_post` without that exact acknowledgement.
+Operator-supplied target, operation, or fingerprint values are not a valid
+exporter path.
+
+The LEGACY canary authorization/fence coordinator is the sole artifact writer.
+It independently validates the binding/fence and pre-operation observation
+floor, and the receiver has read-only access: it cannot create, repair, or
+replace either record. A same-identity/same-fingerprint handoff is an
+idempotent replay; a duplicate identity, handoff ID, or fingerprint with any
+different projected field is a permanent conflict. Until one valid handoff and
+one matching artifact exist, the receiver rejects the request before remote I/O.
 
 The operation and target are supplied through one immutable LEGACY-owned
 authorization artifact, keyed by `pre_send_identity`. This is the chosen
@@ -153,13 +220,17 @@ is created before the send and contains at least:
 
 ```json
 {
+  "handoff_id": "...",
   "pre_send_identity": "...",
   "canary_idempotency_key": "...",
   "canary_run_id": "...",
   "fence_identity": "...",
   "source_identity_ref": "non-secret LEGACY source identity",
   "artifact_producer_identity": "non-secret LEGACY coordinator identity",
+  "source_envelope_contract_version": "is3b1.v1",
+  "transport_contract_version": "is3b2.v1",
   "contract_version": "is3b2.v1",
+  "envelope_exporter_identity": "CanarySingleShotService",
   "operation_kind": "group_on",
   "target_ref": "one exact client identity",
   "requested_state": "running",
@@ -173,12 +244,13 @@ The artifact is the only allowed mapping from the four-field IS3B2 payload to
 `operation_kind` and `target_ref`. The receiver must load it by the exact
 `pre_send_identity` and require exact equality for all four supplied values,
 including the string `is3b2.v1` and the opaque `envelope_fingerprint`. It must
-also verify the artifact's canonical-store provenance, immutable producer
-identity, current run/fence, and artifact fingerprint. This is equality and
-trust-path validation, not receiver-side recomputation of the envelope
-fingerprint. It must not look up operation or target data from
+also verify the artifact's canonical-store provenance, immutable producer and
+exporter identity, handoff ID, current run/fence, and artifact fingerprint.
+This is equality and attestation validation, not receiver-side recomputation
+of the envelope fingerprint. It must not look up operation or target data from
 master/config/materialized files ad hoc. A missing, duplicated, expired,
-producer-invalid, or conflicting artifact fails closed before remote I/O.
+producer-invalid, or conflicting handoff/artifact fails closed before remote
+I/O.
 
 The receiver must reject before any remote byte leaves when:
 
@@ -186,9 +258,11 @@ The receiver must reject before any remote byte leaves when:
 - the operation is outside `group_on`;
 - the target is not exactly one approved non-fixed target;
 - the identity, binding, or desired-state check fails;
-- the envelope fingerprint does not match the canonical payload;
+- the opaque envelope fingerprint does not exactly match the authenticated
+  handoff and immutable authorization artifact;
 - the authorization artifact is missing or does not match the identity,
-  fingerprint, contract version, producer, run, fence, operation, or target;
+  fingerprint, handoff, contract version, producer, exporter, run, fence,
+  operation, or target;
 - AutoCycle quiesce/fence evidence is absent;
 - a competing remote owner is present.
 
@@ -198,14 +272,16 @@ The receipt is durable LEGACY-owned state keyed by `pre_send_identity`.
 `envelope_fingerprint` and the identity binding are immutable after insertion.
 `pre_send_identity` is the primary key (or an equivalent UNIQUE constraint) in
 the receipt store. The receipt also binds `canary_run_id`, `fence_identity`,
-`source_identity_ref`, `artifact_producer_identity`, `contract_version`,
-`authorization_artifact_fingerprint`,
+`source_identity_ref`, `handoff_id`, `envelope_exporter_identity`,
+`artifact_producer_identity`, `source_envelope_contract_version`,
+`contract_version`, `authorization_artifact_fingerprint`,
 `pre_operation_observation_generation_floor`, and the exact target. These
 values cannot be changed by a replay.
-The minimum externally visible outcome set is:
+The durable externally visible receipt state set is:
 
 ```text
 accepted
+dispatching
 applied
 not_applied_proven
 unknown
@@ -213,6 +289,11 @@ unknown
 
 `accepted` is written before the legacy primitive can be invoked. It proves
 acceptance and the immutable request binding, not remote success.
+
+`dispatching` is intentionally externally visible because it is durable and
+replay-visible. Its reconciliation projection is always `unknown` until a
+single winner writes a terminal state; no API, restart, or replay may project
+it to success or use it as permission for another invocation.
 
 Terminal evidence fields are append-only and are written only after the
 `dispatching` boundary has been entered. An `applied` receipt is not

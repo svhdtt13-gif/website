@@ -27,18 +27,25 @@ Scope: receiver/evidence contract only; no live mutation is authorized.
 | LCR1-014 | Mutex | `Local\\AutoGhostStory_RemoteWs` is held for the complete remote action boundary | Lock acquisition/release trace | Zero mutation |
 | LCR1-015 | Mutex semantics | Mutex is not treated as proof of ownership without the quiesce/fence check | Negative test with mutex-only evidence | Zero mutation |
 | LCR1-016 | Process cleanup | Receiver releases connection, mutex, and local resources in all exit paths | Success, error, timeout, and crash cleanup evidence | Mark run unknown; no retry |
+| LCR1-017 | Fence lifetime | Durable `canary_run_id` / `fence_identity` remains active through materialized observation and run closure | Fence lifecycle trace proving AutoCycle cannot resume before observation closure | Zero mutation / reject attribution |
+| LCR1-018 | Attribution binding | Receipt and snapshot carry the same run, fence, and non-secret source identity | Cross-artifact lineage test | Result unknown |
 
 ## 3. Request and receipt gates
 
 | ID | Area | Acceptance condition | Evidence required | Failure result |
 |---|---|---|---|---|
-| LCR1-020 | Canonical input | Envelope contains one target, allowed operation, identity, idempotency key, and immutable fingerprint | Canonical serialization and validation tests | Reject before remote I/O |
+| LCR1-020 | Canonical input | Four-field IS3B2 payload is paired with one immutable LEGACY authorization artifact binding exactly one target and allowed operation | Canonical serialization, artifact, and validation tests | Reject before remote I/O |
+| LCR1-020A | IS3B2 protocol | Receiver accepts exactly IS3B2's four fields: `pre_send_identity`, `canary_idempotency_key`, `envelope_fingerprint`, `contract_version` | Exact request-shape test | Reject widened/ad hoc protocol |
+| LCR1-020B | Authorization mapping | Immutable LEGACY artifact keyed by `pre_send_identity` supplies operation, target, run, fence, and requested state | Artifact lookup, fingerprint, and conflict tests | Reject before remote I/O |
 | LCR1-021 | Pre-send receipt | `accepted` is durably persisted before mutation can begin | Ordered crash-seam test | Zero mutation or unknown; never blind retry |
 | LCR1-022 | Same replay | Same identity and same fingerprint returns stored receipt and performs zero mutation | Replay test for every receipt state | Zero additional mutations |
 | LCR1-023 | Conflict replay | Same identity with a different fingerprint fails closed without overwrite | Conflict test | Zero mutation |
 | LCR1-024 | Identity binding | Operation and exact target are covered by the immutable fingerprint | Tamper test over each request field | Conflict/fail-closed |
 | LCR1-025 | One target | Batch, group expansion, and multiple target references are rejected | Input boundary tests | Zero mutation |
 | LCR1-026 | No retry | Receiver has no retry/backoff/polling behavior after dispatch may begin | Static scan plus timeout/reset tests | Unknown, no resend |
+| LCR1-026A | Atomic winner | Primary key/UNIQUE `pre_send_identity` elects exactly one insert winner; only that winner may invoke the primitive | Two receiver processes, same identity, synchronized race | Exactly one invocation |
+| LCR1-026B | Loser replay | Unique-insert loser reads the winner receipt and performs zero mutation | Two-process race with receipt replay assertion | Zero loser invocation |
+| LCR1-026C | Terminal CAS | Terminal update requires exact identity, fingerprint, run/fence, and expected state | CAS race and zero-row update tests | No second invocation |
 | LCR1-027 | Applied terminal | `applied` is written only from a positive legacy primitive result | Primitive-result fixture | No positive result without receipt |
 | LCR1-028 | Not-applied terminal | `not_applied_proven` requires proof the primitive was never entered | Pre-dispatch crash/proof test | Otherwise unknown |
 | LCR1-029 | Ambiguous terminal | Timeout, reset, lost response, or post-dispatch crash yields `unknown` | Fault injection at each boundary | No retry |
@@ -50,7 +57,9 @@ Scope: receiver/evidence contract only; no live mutation is authorized.
 |---|---|---|---|---|
 | LCR1-040 | Source | Extraction is from `tools/AutoCycle.ps1` `Toggle-Rows` action logic, not a parallel implementation | Diff and provenance review | Reject implementation |
 | LCR1-041 | Single action | Extracted primitive invokes one target action once | Invocation counter and wire capture | Reject implementation |
-| LCR1-042 | Wire compatibility | Existing `row_toggle` / approved `scr_start` payload and epoch behavior are preserved | Golden payload tests | Reject implementation |
+| LCR1-042 | Wire compatibility | Extracted one-target primitive preserves the existing `row_toggle` payload and epoch behavior; AutoCycle-only `scr_start` fallback remains outside receiver scope | Golden payload tests | Reject implementation |
+| LCR1-042A | One-target mapping | `group_on` and `group_off` are labels for one exact client, not group expansion | Artifact and target-selection tests | Reject implementation |
+| LCR1-042B | Action selection | Receiver uses exactly one `row_toggle`; it never inherits `scr_start` fallback, menu action, local kill, or second remote action | Static call graph and one-action wire trace | Reject implementation |
 | LCR1-043 | Safety compatibility | Fixed-client, orphan, identity, and epoch protections remain intact | Existing plus extraction regression tests | Zero mutation |
 | LCR1-044 | Wrapper compatibility | AutoCycle retains its existing batch/retry/verification wrapper semantics | AutoCycle regression evidence | Reject extraction |
 | LCR1-045 | Receiver isolation | Receiver does not call the batch wrapper, fallback menu path, or generic actuator | Static call-graph scan | Reject implementation |
@@ -61,10 +70,12 @@ Scope: receiver/evidence contract only; no live mutation is authorized.
 |---|---|---|---|---|
 | LCR1-050 | Sole reader | `continuous_sync_remote.ps1` remains the only LEGACY remote observation reader | Process/WebSocket ownership scan | Reject second reader |
 | LCR1-051 | Snapshot identity | Snapshot persists non-secret `snapshot_id`, `captured_at`, and `source_identity_ref` | Materialized schema fixture | Evidence unavailable |
+| LCR1-051A | Ordering token | Snapshot persists a durable monotonic `observation_generation` or equivalent ordering token | Generation monotonicity and restart tests | Evidence unavailable |
 | LCR1-052 | Target record | Snapshot persists exact `client_id` and `observed_state` | Materialized fixture with target lookup | Evidence unavailable |
 | LCR1-053 | Atomic materialization | Snapshot metadata and target state are published as one consistent materialized view | Crash/partial-write test | Evidence unavailable |
-| LCR1-054 | Freshness | Reconciliation snapshot is captured after receiver completion | Timestamp/order test | Result unknown |
+| LCR1-054 | Freshness | Reconciliation snapshot ordering token is strictly later than the receipt's pre-operation floor | Monotonic ordering test; timestamp is audit-only | Result unknown |
 | LCR1-055 | Exact target | Snapshot target identity equals the receipt target identity | Identity binding test | Result unknown |
+| LCR1-055A | Snapshot lineage | Snapshot `canary_run_id`, `fence_identity`, and `source_identity_ref` match the receipt | Cross-lineage mismatch test | Result unknown |
 | LCR1-056 | Desired state | `succeeded` requires exact observed state equal to requested state | On/off positive fixtures | Result unknown |
 | LCR1-057 | Not-applied proof | `failed` requires `not_applied_proven` plus no possible side effect | Negative-side-effect fixture | Result unknown |
 | LCR1-058 | Stale state | Unchanged, delayed, missing, or stale state never proves failure after dispatch may begin | Stale snapshot test | Result unknown |

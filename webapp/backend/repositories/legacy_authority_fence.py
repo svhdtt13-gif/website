@@ -19,6 +19,8 @@ class _FenceHost(Protocol):
 
     def _artifact(self, identity: str) -> sqlite3.Row: ...
 
+    def _require_live(self) -> None: ...
+
     def get_fence(self, identity: str) -> sqlite3.Row | None: ...
 
     def _transition_fence(self, identity: str, state: FenceState) -> None: ...
@@ -36,6 +38,7 @@ _ALLOWED_TRANSITIONS: Final = {
 
 class FenceLifecycleMixin:
     def request_fence(self: _FenceHost, identity: str) -> None:
+        self._require_live()
         with self._immediate():
             existing = self.get_fence(identity)
             if existing is not None:
@@ -43,14 +46,21 @@ class FenceLifecycleMixin:
                     return
                 raise TransitionError("fence request already progressed")
             artifact = self._artifact(identity)
-            values = (identity, artifact["canary_run_id"], artifact["authority_epoch"], artifact["fence_counter"])
-            self.connection.execute("INSERT INTO fences VALUES (?,?,?,?,?)", (*values, FenceState.REQUESTED.value))
+            values = (
+                identity,
+                artifact["canary_run_id"],
+                artifact["fence_identity"],
+                artifact["authority_epoch"],
+                artifact["fence_counter"],
+            )
+            self.connection.execute("INSERT INTO fences VALUES (?,?,?,?,?,?)", (*values, FenceState.REQUESTED.value))
             self.connection.execute(
-                "INSERT INTO fence_history(pre_send_identity,canary_run_id,authority_epoch,fence_counter,from_state,to_state) VALUES (?,?,?,?,?,?)",
+                "INSERT INTO fence_history(pre_send_identity,canary_run_id,fence_identity,authority_epoch,fence_counter,from_state,to_state) VALUES (?,?,?,?,?,?,?)",
                 (*values, None, FenceState.REQUESTED.value),
             )
 
     def transition_fence(self: _FenceHost, identity: str, state: FenceState) -> None:
+        self._require_live()
         with self._immediate():
             self._transition_fence(identity, state)
 
@@ -67,13 +77,14 @@ class FenceLifecycleMixin:
         ]
 
     def resolve_clear(self: _FenceHost, identity: str) -> None:
+        self._require_live()
         with self._immediate():
             row = self.get_fence(identity)
             if row is None or row["state"] != FenceState.ABANDONED.value:
                 raise TransitionError("only an abandoned fence may resolve_clear")
             self.connection.execute(
-                "INSERT INTO fence_history(pre_send_identity,canary_run_id,authority_epoch,fence_counter,from_state,to_state) VALUES (?,?,?,?,?,?)",
-                (identity, row["canary_run_id"], row["authority_epoch"], row["fence_counter"], row["state"], "resolve_clear"),
+                "INSERT INTO fence_history(pre_send_identity,canary_run_id,fence_identity,authority_epoch,fence_counter,from_state,to_state) VALUES (?,?,?,?,?,?,?)",
+                (identity, row["canary_run_id"], row["fence_identity"], row["authority_epoch"], row["fence_counter"], row["state"], "resolve_clear"),
             )
             self.connection.execute("DELETE FROM fences WHERE pre_send_identity=?", (identity,))
 
@@ -91,6 +102,6 @@ class FenceLifecycleMixin:
         if changed != 1:
             raise TransitionError("fence CAS lost")
         self.connection.execute(
-            "INSERT INTO fence_history(pre_send_identity,canary_run_id,authority_epoch,fence_counter,from_state,to_state) VALUES (?,?,?,?,?,?)",
-            (identity, row["canary_run_id"], row["authority_epoch"], row["fence_counter"], row["state"], state.value),
+            "INSERT INTO fence_history(pre_send_identity,canary_run_id,fence_identity,authority_epoch,fence_counter,from_state,to_state) VALUES (?,?,?,?,?,?,?)",
+            (identity, row["canary_run_id"], row["fence_identity"], row["authority_epoch"], row["fence_counter"], row["state"], state.value),
         )

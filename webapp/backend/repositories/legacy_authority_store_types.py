@@ -7,3 +7,7 @@ class LegacyAuthorityStoreError(ValueError):
 
 class ReceiptConflictError(LegacyAuthorityStoreError):
     pass
+
+
+class StoreQuarantinedError(LegacyAuthorityStoreError):
+    pass

@@ -8,7 +8,7 @@ from typing import Final
 SOURCE_CONTRACT_VERSION: Final = "is3b1.v1"
 TRANSPORT_CONTRACT_VERSION: Final = "is3b2.v1"
 OPERATION_KIND: Final = "group_on"
-REQUESTED_STATE: Final = "on"
+REQUESTED_STATE: Final = "running"
 
 _SECRET_MARKERS: Final = (
     "authorization",
@@ -79,7 +79,7 @@ def _canonical_envelope(value: str) -> None:
         raise LegacyValidationError("canonical_envelope_json contains secret material")
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class Handoff:
     handoff_id: str
     canary_run_id: str
@@ -128,13 +128,35 @@ class Handoff:
         if self.fence_counter < 1:
             raise LegacyValidationError("fence_counter must be positive")
 
+    def projection(self) -> tuple[str | int, ...]:
+        return (
+            self.handoff_id,
+            self.canary_run_id,
+            self.source_envelope_contract_version,
+            self.transport_contract_version,
+            self.pre_send_identity,
+            self.canary_idempotency_key,
+            self.envelope_fingerprint,
+            self.canonical_envelope_json,
+            self.operation_kind,
+            self.target_ref,
+            self.binding_generation,
+            self.verified_identity_ref,
+            self.verified_identity_revision,
+            self.authority_epoch,
+            self.fence_counter,
+            self.exporter_identity,
+            self.exporter_attestation,
+        )
 
-@dataclass(frozen=True)
+
+@dataclass(frozen=True, slots=True)
 class AuthorizationArtifact:
     handoff_id: str
     pre_send_identity: str
     canary_idempotency_key: str
     canary_run_id: str
+    fence_identity: str
     authority_epoch: str
     fence_counter: int
     source_identity_ref: str
@@ -156,6 +178,7 @@ class AuthorizationArtifact:
             ("pre_send_identity", self.pre_send_identity),
             ("canary_idempotency_key", self.canary_idempotency_key),
             ("canary_run_id", self.canary_run_id),
+            ("fence_identity", self.fence_identity),
             ("authority_epoch", self.authority_epoch),
             ("envelope_fingerprint", self.envelope_fingerprint),
             ("authorization_artifact_fingerprint", self.authorization_artifact_fingerprint),
@@ -175,7 +198,7 @@ class AuthorizationArtifact:
         if not versions:
             raise LegacyValidationError("authorization artifact contract versions are invalid")
         if self.operation_kind != OPERATION_KIND or self.requested_state != REQUESTED_STATE:
-            raise LegacyValidationError("authorization artifact permits only group_on to on")
+            raise LegacyValidationError("authorization artifact permits only group_on to running")
         _target_reference(self.target_ref)
         if self.fence_counter < 1 or self.pre_operation_observation_generation_floor < 0:
             raise LegacyValidationError("artifact counters must be non-negative and fenced")
@@ -188,7 +211,6 @@ class AuthorizationArtifact:
             self.canary_run_id,
             self.authority_epoch,
             self.fence_counter,
-            self.source_identity_ref,
             self.envelope_exporter_identity,
             self.source_envelope_contract_version,
             self.transport_contract_version,
@@ -203,7 +225,6 @@ class AuthorizationArtifact:
             handoff.canary_run_id,
             handoff.authority_epoch,
             handoff.fence_counter,
-            handoff.verified_identity_ref,
             handoff.exporter_identity,
             handoff.source_envelope_contract_version,
             handoff.transport_contract_version,
@@ -214,18 +235,42 @@ class AuthorizationArtifact:
         if bindings != expected:
             raise LegacyValidationError("authorization artifact does not bind to handoff")
 
+    def projection(self) -> tuple[str | int, ...]:
+        return (
+            self.handoff_id,
+            self.pre_send_identity,
+            self.canary_idempotency_key,
+            self.canary_run_id,
+            self.fence_identity,
+            self.authority_epoch,
+            self.fence_counter,
+            self.source_identity_ref,
+            self.artifact_producer_identity,
+            self.source_envelope_contract_version,
+            self.transport_contract_version,
+            self.contract_version,
+            self.envelope_exporter_identity,
+            self.operation_kind,
+            self.target_ref,
+            self.requested_state,
+            self.pre_operation_observation_generation_floor,
+            self.envelope_fingerprint,
+            self.authorization_artifact_fingerprint,
+        )
+
 
 @dataclass(frozen=True, slots=True)
 class Receipt:
     pre_send_identity: str
     envelope_fingerprint: str
     canary_run_id: str
+    fence_identity: str
     authority_epoch: str
     fence_counter: int
     state: ReceiptState
-    observation_generation_floor: int
-    observation_boundary_id: str | None = None
-    observation_generation: int | None = None
+    pre_operation_observation_generation_floor: int
+    post_dispatch_observation_boundary_id: str | None = None
+    post_dispatch_observation_generation_floor: int | None = None
 
 
 @dataclass(frozen=True, slots=True)

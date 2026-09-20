@@ -17,6 +17,7 @@ from repositories.legacy_authority_schema import (
 from repositories.legacy_authority_store_types import (
     LegacyAuthorityStoreError,
     ReceiptConflictError,
+    StoreQuarantinedError,
 )
 from repositories.legacy_authority_types import (
     AuthorizationArtifact,
@@ -25,8 +26,25 @@ from repositories.legacy_authority_types import (
 )
 
 STORE_KIND: Final = "legacy_canary_authority"
-SCHEMA_VERSION: Final = 1
+SCHEMA_VERSION: Final = 2
 DB_FILENAME: Final = "legacy_canary.sqlite3"
+
+_HANDOFF_COLUMNS: Final = (
+    "handoff_id", "canary_run_id", "source_envelope_contract_version",
+    "transport_contract_version", "pre_send_identity", "canary_idempotency_key",
+    "envelope_fingerprint", "canonical_envelope_json", "operation_kind", "target_ref",
+    "binding_generation", "verified_identity_ref", "verified_identity_revision",
+    "authority_epoch", "fence_counter", "exporter_identity", "exporter_attestation",
+)
+_ARTIFACT_COLUMNS: Final = (
+    "handoff_id", "pre_send_identity", "canary_idempotency_key", "canary_run_id",
+    "fence_identity", "authority_epoch", "fence_counter", "source_identity_ref",
+    "artifact_producer_identity", "source_envelope_contract_version",
+    "transport_contract_version", "contract_version", "envelope_exporter_identity",
+    "operation_kind", "target_ref", "requested_state",
+    "pre_operation_observation_generation_floor", "envelope_fingerprint",
+    "authorization_artifact_fingerprint",
+)
 
 
 def legacy_store_path(runtime_root: PurePath) -> Path:
@@ -42,9 +60,10 @@ def _deny_cross_database(action: int, _arg1: str | None, _arg2: str | None, _db:
 
 
 class LegacyAuthorityStore(FenceLifecycleMixin, ReceiptLifecycleMixin):
-    def __init__(self, connection: sqlite3.Connection, path: Path) -> None:
+    def __init__(self, connection: sqlite3.Connection, path: Path, quarantined: bool = False) -> None:
         self.connection = connection
         self.path = path
+        self._quarantined = quarantined
 
     @staticmethod
     def _connect(path: Path) -> sqlite3.Connection:
@@ -69,7 +88,13 @@ class LegacyAuthorityStore(FenceLifecycleMixin, ReceiptLifecycleMixin):
             connection.executescript(SCHEMA_SQL)
             connection.executemany(
                 "INSERT INTO schema_meta(key, value) VALUES (?, ?)",
-                (("store_kind", STORE_KIND), ("schema_version", str(SCHEMA_VERSION)), ("schema_checksum", SCHEMA_CHECKSUM)),
+                (
+                    ("store_kind", STORE_KIND),
+                    ("schema_version", str(SCHEMA_VERSION)),
+                    ("schema_checksum", SCHEMA_CHECKSUM),
+                    ("restore_state", "canonical"),
+                    ("restore_marker", ""),
+                ),
             )
             store._validate()
         except (sqlite3.DatabaseError, LegacyAuthorityStoreError):
@@ -86,6 +111,27 @@ class LegacyAuthorityStore(FenceLifecycleMixin, ReceiptLifecycleMixin):
         except (sqlite3.DatabaseError, LegacyAuthorityStoreError):
             store.close()
             raise
+        store._quarantined = store.schema_metadata()["restore_state"] == "quarantined"
+        return store
+
+    @classmethod
+    def open_restored(cls, path: Path, restore_marker: str) -> LegacyAuthorityStore:
+        if not restore_marker or restore_marker != restore_marker.strip():
+            raise LegacyValidationError("restore_marker must be a non-empty canonical value")
+        store = cls.open(path)
+        if store._quarantined:
+            store.close()
+            raise StoreQuarantinedError("LEGACY authority store is already quarantined")
+        with store._immediate():
+            store.connection.execute(
+                "UPDATE schema_meta SET value=? WHERE key='restore_state'",
+                ("quarantined",),
+            )
+            store.connection.execute(
+                "UPDATE schema_meta SET value=? WHERE key='restore_marker'",
+                (restore_marker,),
+            )
+        store._quarantined = True
         return store
 
     @staticmethod
@@ -98,8 +144,16 @@ class LegacyAuthorityStore(FenceLifecycleMixin, ReceiptLifecycleMixin):
         self.connection.close()
 
     def _validate(self) -> None:
-        if self.schema_metadata() != {"store_kind": STORE_KIND, "schema_version": str(SCHEMA_VERSION), "schema_checksum": SCHEMA_CHECKSUM}:
+        metadata = self.schema_metadata()
+        required_metadata = {
+            "store_kind": STORE_KIND,
+            "schema_version": str(SCHEMA_VERSION),
+            "schema_checksum": SCHEMA_CHECKSUM,
+        }
+        if any(metadata.get(key) != value for key, value in required_metadata.items()):
             raise LegacyAuthorityStoreError("LEGACY authority schema metadata mismatch")
+        if metadata.get("restore_state") not in ("canonical", "quarantined"):
+            raise LegacyAuthorityStoreError("LEGACY authority restore state mismatch")
         if schema_identity(self.connection) != SCHEMA_IDENTITY:
             raise LegacyAuthorityStoreError("LEGACY authority schema identity mismatch")
         if self.connection.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
@@ -115,13 +169,14 @@ class LegacyAuthorityStore(FenceLifecycleMixin, ReceiptLifecycleMixin):
         self.connection.execute("BEGIN IMMEDIATE")
         try:
             yield
-        except (sqlite3.DatabaseError, LegacyAuthorityStoreError):
+        except BaseException:  # noqa: RUF100  # noqa: BROAD_EXCEPT_OK - rollback must cover system-level failures too
             self.connection.rollback()
             raise
         else:
             self.connection.commit()
 
     def add_authorization(self, handoff: Handoff, artifact: AuthorizationArtifact) -> None:
+        self._require_live()
         artifact.require_handoff(handoff)
         with self._immediate():
             existing_handoff = self.connection.execute(
@@ -131,14 +186,12 @@ class LegacyAuthorityStore(FenceLifecycleMixin, ReceiptLifecycleMixin):
             if existing_handoff is not None:
                 existing_artifact = self.connection.execute(
                     "SELECT * FROM authorization_artifacts WHERE pre_send_identity=?",
-                    (handoff.pre_send_identity,),
+                    (existing_handoff["pre_send_identity"],),
                 ).fetchone()
                 if (
-                    existing_handoff["handoff_id"] == handoff.handoff_id
-                    and existing_handoff["pre_send_identity"] == handoff.pre_send_identity
-                    and existing_handoff["envelope_fingerprint"] == handoff.envelope_fingerprint
+                    tuple(existing_handoff[column] for column in _HANDOFF_COLUMNS) == handoff.projection()
                     and existing_artifact is not None
-                    and existing_artifact["authorization_artifact_fingerprint"] == artifact.authorization_artifact_fingerprint
+                    and tuple(existing_artifact[column] for column in _ARTIFACT_COLUMNS) == artifact.projection()
                 ):
                     return
                 raise ReceiptConflictError("handoff or artifact identity conflict")
@@ -171,18 +224,19 @@ class LegacyAuthorityStore(FenceLifecycleMixin, ReceiptLifecycleMixin):
             )
             self.connection.execute(
                 "INSERT INTO authorization_artifacts (pre_send_identity, handoff_id, "
-                "canary_idempotency_key, canary_run_id, authority_epoch, fence_counter, "
+                "canary_idempotency_key, canary_run_id, fence_identity, authority_epoch, fence_counter, "
                 "source_identity_ref, artifact_producer_identity, "
                 "source_envelope_contract_version, transport_contract_version, "
                 "contract_version, envelope_exporter_identity, operation_kind, target_ref, "
                 "requested_state, pre_operation_observation_generation_floor, "
                 "envelope_fingerprint, authorization_artifact_fingerprint) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     artifact.pre_send_identity,
                     artifact.handoff_id,
                     artifact.canary_idempotency_key,
                     artifact.canary_run_id,
+                    artifact.fence_identity,
                     artifact.authority_epoch,
                     artifact.fence_counter,
                     artifact.source_identity_ref,
@@ -205,3 +259,7 @@ class LegacyAuthorityStore(FenceLifecycleMixin, ReceiptLifecycleMixin):
         if row is None:
             raise TransitionError("authorization artifact is missing")
         return row
+
+    def _require_live(self) -> None:
+        if self._quarantined:
+            raise StoreQuarantinedError("LEGACY authority store is quarantined")

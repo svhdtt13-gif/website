@@ -3,6 +3,7 @@ from __future__ import annotations
 import sys
 import tempfile
 import unittest
+from dataclasses import asdict
 from pathlib import Path, PureWindowsPath
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -44,9 +45,10 @@ def valid_artifact() -> AuthorizationArtifact:
         pre_send_identity="send-1",
         canary_idempotency_key="idem-1",
         canary_run_id="run-1",
+        fence_identity="fence:run-1:11",
         authority_epoch="epoch-1",
         fence_counter=11,
-        source_identity_ref="identity:one",
+        source_identity_ref="legacy-source:one",
         artifact_producer_identity="producer:one",
         source_envelope_contract_version="is3b1.v1",
         transport_contract_version="is3b2.v1",
@@ -54,7 +56,7 @@ def valid_artifact() -> AuthorizationArtifact:
         envelope_exporter_identity="exporter:one",
         operation_kind="group_on",
         target_ref="client:one",
-        requested_state="on",
+        requested_state="running",
         pre_operation_observation_generation_floor=41,
         envelope_fingerprint="sha256:envelope-1",
         authorization_artifact_fingerprint="sha256:artifact-1",
@@ -80,7 +82,7 @@ class LegacyAuthorityValidationTests(unittest.TestCase):
                 legacy_store_path(path)
 
     def test_handoff_rejects_secret_material_and_wrong_contract(self) -> None:
-        values = valid_handoff().__dict__
+        values = asdict(valid_handoff())
         cases = (
             {**values, "verified_identity_ref": "token:secret-value"},
             {**values, "source_envelope_contract_version": "is3b1.v2"},
@@ -93,11 +95,27 @@ class LegacyAuthorityValidationTests(unittest.TestCase):
 
     def test_artifact_rejects_binding_mismatch(self) -> None:
         handoff = valid_handoff()
-        values = valid_artifact().__dict__
+        values = asdict(valid_artifact())
         artifact = AuthorizationArtifact(**{**values, "target_ref": "client:two"})
 
         with self.assertRaises(LegacyValidationError):
             artifact.require_handoff(handoff)
+
+    def test_requested_state_accepts_running_and_rejects_on(self) -> None:
+        AuthorizationArtifact(**asdict(valid_artifact()))
+
+        with self.assertRaises(LegacyValidationError):
+            AuthorizationArtifact(**{**asdict(valid_artifact()), "requested_state": "on"})
+        with self.assertRaises(LegacyValidationError):
+            AuthorizationArtifact(**{**asdict(valid_artifact()), "operation_kind": "group_off"})
+
+    def test_source_identity_is_independent_from_verified_target_identity(self) -> None:
+        handoff = valid_handoff()
+        artifact = valid_artifact()
+
+        artifact.require_handoff(handoff)
+
+        self.assertNotEqual(artifact.source_identity_ref, handoff.verified_identity_ref)
 
 
 if __name__ == "__main__":

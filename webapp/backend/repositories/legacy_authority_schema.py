@@ -10,7 +10,7 @@ CREATE TABLE schema_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE handoffs (
  handoff_id TEXT PRIMARY KEY, source_envelope_contract_version TEXT NOT NULL,
  transport_contract_version TEXT NOT NULL, pre_send_identity TEXT NOT NULL UNIQUE, canary_idempotency_key TEXT NOT NULL,
- envelope_fingerprint TEXT NOT NULL, canonical_envelope_json TEXT NOT NULL, operation_kind TEXT NOT NULL,
+ envelope_fingerprint TEXT NOT NULL UNIQUE, canonical_envelope_json TEXT NOT NULL, operation_kind TEXT NOT NULL,
  target_ref TEXT NOT NULL, binding_generation INTEGER NOT NULL, verified_identity_ref TEXT NOT NULL,
  verified_identity_revision INTEGER NOT NULL, authority_epoch TEXT NOT NULL, fence_counter INTEGER NOT NULL,
  exporter_identity TEXT NOT NULL, exporter_attestation TEXT NOT NULL, UNIQUE(authority_epoch, fence_counter)

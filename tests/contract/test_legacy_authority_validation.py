@@ -3,7 +3,7 @@ from __future__ import annotations
 import sys
 import tempfile
 import unittest
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path, PureWindowsPath
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -20,7 +20,6 @@ from repositories.legacy_authority_types import (
 def valid_handoff() -> Handoff:
     return Handoff(
         handoff_id="handoff-1",
-        canary_run_id="run-1",
         source_envelope_contract_version="is3b1.v1",
         transport_contract_version="is3b2.v1",
         pre_send_identity="send-1",
@@ -116,6 +115,37 @@ class LegacyAuthorityValidationTests(unittest.TestCase):
         artifact.require_handoff(handoff)
 
         self.assertNotEqual(artifact.source_identity_ref, handoff.verified_identity_ref)
+
+    def test_handoff_projection_is_the_frozen_sixteen_field_p4_shape(self) -> None:
+        handoff = valid_handoff()
+
+        self.assertEqual(
+            handoff.projection(),
+            (
+                "handoff-1",
+                "is3b1.v1",
+                "is3b2.v1",
+                "send-1",
+                "idem-1",
+                "sha256:envelope-1",
+                '{"operation_kind":"group_on","target_ref":"client:one"}',
+                "group_on",
+                "client:one",
+                7,
+                "identity:one",
+                3,
+                "epoch-1",
+                11,
+                "exporter:one",
+                "attestation:one",
+            ),
+        )
+        self.assertNotIn("run-1", handoff.projection())
+
+    def test_coordinator_owned_run_identity_pairs_with_p4_handoff(self) -> None:
+        artifact = replace(valid_artifact(), canary_run_id="legacy-run-42")
+
+        artifact.require_handoff(valid_handoff())
 
 
 if __name__ == "__main__":

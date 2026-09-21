@@ -82,7 +82,6 @@ def _canonical_envelope(value: str) -> None:
 @dataclass(frozen=True, slots=True)
 class Handoff:
     handoff_id: str
-    canary_run_id: str
     source_envelope_contract_version: str
     transport_contract_version: str
     pre_send_identity: str
@@ -102,7 +101,6 @@ class Handoff:
     def __post_init__(self) -> None:
         for field, value in (
             ("handoff_id", self.handoff_id),
-            ("canary_run_id", self.canary_run_id),
             ("pre_send_identity", self.pre_send_identity),
             ("canary_idempotency_key", self.canary_idempotency_key),
             ("envelope_fingerprint", self.envelope_fingerprint),
@@ -131,7 +129,6 @@ class Handoff:
     def projection(self) -> tuple[str | int, ...]:
         return (
             self.handoff_id,
-            self.canary_run_id,
             self.source_envelope_contract_version,
             self.transport_contract_version,
             self.pre_send_identity,
@@ -208,7 +205,6 @@ class AuthorizationArtifact:
             self.handoff_id,
             self.pre_send_identity,
             self.canary_idempotency_key,
-            self.canary_run_id,
             self.authority_epoch,
             self.fence_counter,
             self.envelope_exporter_identity,
@@ -222,7 +218,6 @@ class AuthorizationArtifact:
             handoff.handoff_id,
             handoff.pre_send_identity,
             handoff.canary_idempotency_key,
-            handoff.canary_run_id,
             handoff.authority_epoch,
             handoff.fence_counter,
             handoff.exporter_identity,

@@ -23,7 +23,6 @@ from repositories.legacy_authority_types import (
 def valid_handoff() -> Handoff:
     return Handoff(
         handoff_id="handoff-1",
-        canary_run_id="run-1",
         source_envelope_contract_version="is3b1.v1",
         transport_contract_version="is3b2.v1",
         pre_send_identity="send-1",

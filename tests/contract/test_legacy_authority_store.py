@@ -31,7 +31,6 @@ class InjectedFailure(RuntimeError):
 def valid_handoff() -> Handoff:
     return Handoff(
         handoff_id="handoff-1",
-        canary_run_id="run-1",
         source_envelope_contract_version="is3b1.v1",
         transport_contract_version="is3b2.v1",
         pre_send_identity="send-1",
@@ -93,7 +92,7 @@ class LegacyAuthorityStoreTests(unittest.TestCase):
         metadata = self.store.schema_metadata()
 
         self.assertEqual(metadata["store_kind"], "legacy_canary_authority")
-        self.assertEqual(metadata["schema_version"], "2")
+        self.assertEqual(metadata["schema_version"], "3")
         self.assertEqual(len(metadata["schema_checksum"]), 64)
         with self.assertRaises(sqlite3.DatabaseError):
             self.store.connection.execute("ATTACH DATABASE ':memory:' AS forbidden")
@@ -197,7 +196,7 @@ class LegacyAuthorityStoreTests(unittest.TestCase):
         before_artifact = tuple(self.store.connection.execute("SELECT * FROM authorization_artifacts").fetchone())
         cases = (
             (
-                replace(handoff, canary_run_id="run-2"),
+                handoff,
                 replace(artifact, canary_run_id="run-2"),
             ),
             (

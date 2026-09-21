@@ -26,11 +26,11 @@ from repositories.legacy_authority_types import (
 )
 
 STORE_KIND: Final = "legacy_canary_authority"
-SCHEMA_VERSION: Final = 2
+SCHEMA_VERSION: Final = 3
 DB_FILENAME: Final = "legacy_canary.sqlite3"
 
 _HANDOFF_COLUMNS: Final = (
-    "handoff_id", "canary_run_id", "source_envelope_contract_version",
+    "handoff_id", "source_envelope_contract_version",
     "transport_contract_version", "pre_send_identity", "canary_idempotency_key",
     "envelope_fingerprint", "canonical_envelope_json", "operation_kind", "target_ref",
     "binding_generation", "verified_identity_ref", "verified_identity_revision",
@@ -196,15 +196,14 @@ class LegacyAuthorityStore(FenceLifecycleMixin, ReceiptLifecycleMixin):
                     return
                 raise ReceiptConflictError("handoff or artifact identity conflict")
             self.connection.execute(
-                "INSERT INTO handoffs (handoff_id, canary_run_id, source_envelope_contract_version, "
+                "INSERT INTO handoffs (handoff_id, source_envelope_contract_version, "
                 "transport_contract_version, pre_send_identity, canary_idempotency_key, "
                 "envelope_fingerprint, canonical_envelope_json, operation_kind, target_ref, "
                 "binding_generation, verified_identity_ref, verified_identity_revision, "
                 "authority_epoch, fence_counter, exporter_identity, exporter_attestation) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     handoff.handoff_id,
-                    handoff.canary_run_id,
                     handoff.source_envelope_contract_version,
                     handoff.transport_contract_version,
                     handoff.pre_send_identity,

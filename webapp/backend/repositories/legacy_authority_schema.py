@@ -8,7 +8,7 @@ from typing import Final
 SCHEMA_SQL: Final = """
 CREATE TABLE schema_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE handoffs (
- handoff_id TEXT PRIMARY KEY, canary_run_id TEXT NOT NULL, source_envelope_contract_version TEXT NOT NULL,
+ handoff_id TEXT PRIMARY KEY, source_envelope_contract_version TEXT NOT NULL,
  transport_contract_version TEXT NOT NULL, pre_send_identity TEXT NOT NULL UNIQUE, canary_idempotency_key TEXT NOT NULL,
  envelope_fingerprint TEXT NOT NULL, canonical_envelope_json TEXT NOT NULL, operation_kind TEXT NOT NULL,
  target_ref TEXT NOT NULL, binding_generation INTEGER NOT NULL, verified_identity_ref TEXT NOT NULL,
@@ -22,7 +22,7 @@ CREATE TABLE authorization_artifacts (
  transport_contract_version TEXT NOT NULL, contract_version TEXT NOT NULL, envelope_exporter_identity TEXT NOT NULL,
  operation_kind TEXT NOT NULL, target_ref TEXT NOT NULL, requested_state TEXT NOT NULL,
  pre_operation_observation_generation_floor INTEGER NOT NULL, envelope_fingerprint TEXT NOT NULL,
- authorization_artifact_fingerprint TEXT NOT NULL UNIQUE, UNIQUE(authority_epoch, fence_counter)
+  authorization_artifact_fingerprint TEXT NOT NULL UNIQUE, UNIQUE(canary_run_id), UNIQUE(authority_epoch, fence_counter)
 );
 CREATE TABLE fences (
  pre_send_identity TEXT PRIMARY KEY REFERENCES authorization_artifacts(pre_send_identity), canary_run_id TEXT NOT NULL,

@@ -152,6 +152,21 @@ class LegacyAuthorityRestoreTests(unittest.TestCase):
                 store.append_observation_boundary(applied, "boundary-43", 43)
             store.close()
 
+    def test_abandoned_applied_receipt_rejects_late_observation_boundary(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            store = LegacyAuthorityStore.create(legacy_store_path(Path(temporary)))
+            store.add_authorization(valid_handoff(), valid_artifact())
+            applied = self._applied_receipt(store)
+            store.mark_observation_pending("send-1")
+            store.transition_fence("send-1", FenceState.ABANDONED)
+
+            with self.assertRaises(TransitionError):
+                store.append_observation_boundary(applied, "boundary-43", 43)
+            receipt = store.get_receipt("send-1")
+            self.assertIsNone(receipt.post_dispatch_observation_boundary_id)
+            self.assertIsNone(receipt.post_dispatch_observation_generation_floor)
+            store.close()
+
     def test_reopen_never_restores_mutation_permission(self) -> None:
         for terminal_state in (None, ReceiptState.APPLIED, ReceiptState.NOT_APPLIED_PROVEN, ReceiptState.UNKNOWN):
             with self.subTest(terminal_state=terminal_state), tempfile.TemporaryDirectory() as temporary:

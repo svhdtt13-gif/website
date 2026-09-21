@@ -111,8 +111,11 @@ class ReceiptLifecycleMixin:
             if existing is None:
                 raise TransitionError("receipt is missing")
             fence = self.get_fence(receipt.pre_send_identity)
-            if fence is None or fence["state"] == FenceState.CLOSED.value:
-                raise TransitionError("observation boundary cannot append after fence closure")
+            if fence is None or fence["state"] not in (
+                FenceState.RECEIPT_TERMINAL.value,
+                FenceState.OBSERVATION_PENDING.value,
+            ):
+                raise TransitionError("observation boundary requires an open post-terminal fence")
             if existing["post_dispatch_observation_boundary_id"] is not None:
                 if existing["post_dispatch_observation_boundary_id"] == boundary_id and existing["post_dispatch_observation_generation_floor"] == generation_floor:
                     return self._receipt(existing)

@@ -17,7 +17,6 @@ from services.binding_authority import (
     AuthorityRejected,
     BindingAuthorityCoordinator,
 )
-from services.canary_send import CanarySingleShotService
 from services.canary_send_transport import (
     CanaryDestinationRefused,
     CanarySendAmbiguous,
@@ -270,13 +269,15 @@ class CanarySendFaultTests(CanarySendFixture, unittest.TestCase):
 
         def send_winner():
             operational = OperationalSQLiteRepository.open(self.runtime)
+            service = None
             try:
                 coordinator = BindingAuthorityCoordinator(
                     self.portable_path, operational, self.clock,
                     AuthorityConfig(lease_ttl=timedelta(seconds=60)),
                 )
-                service = CanarySingleShotService(
-                    self.portable_path, operational, coordinator,
+                service = self.trusted_sender(
+                    operational,
+                    coordinator,
                     committed_wait_seconds=5.0,
                 )
                 return service.send(
@@ -284,17 +285,21 @@ class CanarySendFaultTests(CanarySendFixture, unittest.TestCase):
                     SingleShotCanaryTransport(stub.url, timeout=10.0),
                 )
             finally:
+                if service is not None:
+                    self.close_trusted_sender(service)
                 operational.close()
 
         def send_loser():
             operational = OperationalSQLiteRepository.open(self.runtime)
+            service = None
             try:
                 coordinator = BindingAuthorityCoordinator(
                     self.portable_path, operational, self.clock,
                     AuthorityConfig(lease_ttl=timedelta(seconds=60)),
                 )
-                service = CanarySingleShotService(
-                    self.portable_path, operational, coordinator,
+                service = self.trusted_sender(
+                    operational,
+                    coordinator,
                     committed_wait_seconds=5.0,
                 )
                 original_resolve = service._resolve_committed
@@ -318,6 +323,8 @@ class CanarySendFaultTests(CanarySendFixture, unittest.TestCase):
                 errors["reason"] = rejected.evidence.reason_class
                 raise
             finally:
+                if service is not None:
+                    self.close_trusted_sender(service)
                 operational.close()
 
         with ThreadPoolExecutor(max_workers=2) as executor:
@@ -371,8 +378,9 @@ class CanarySendFaultTests(CanarySendFixture, unittest.TestCase):
             self.portable_path, operational, self.clock,
             AuthorityConfig(lease_ttl=timedelta(seconds=60)),
         )
-        service = CanarySingleShotService(
-            self.portable_path, operational, coordinator,
+        service = self.trusted_sender(
+            operational,
+            coordinator,
             committed_wait_seconds=5.0,
         )
         return operational, service
@@ -414,6 +422,7 @@ class CanarySendFaultTests(CanarySendFixture, unittest.TestCase):
                     SingleShotCanaryTransport(stub.url, timeout=10.0),
                 )
             finally:
+                self.close_trusted_sender(service)
                 operational.close()
 
         with ThreadPoolExecutor(max_workers=1) as executor:
@@ -474,6 +483,7 @@ class CanarySendFaultTests(CanarySendFixture, unittest.TestCase):
                     SingleShotCanaryTransport(stub.url, timeout=10.0),
                 )
             finally:
+                self.close_trusted_sender(service)
                 operational.close()
 
         with ThreadPoolExecutor(max_workers=1) as executor:

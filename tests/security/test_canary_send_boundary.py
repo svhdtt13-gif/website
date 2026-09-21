@@ -24,11 +24,31 @@ from services.canary_send_transport import (
     CanaryDestinationRefused,
     SingleShotCanaryTransport,
 )
+from services.legacy_handoff_trust import HandoffTrustError
 
 from tests.security.canary_send_support import TEST_CREDENTIAL, CanarySendFixture
 
 
 class CanarySendBoundaryTests(CanarySendFixture, unittest.TestCase):
+    def test_default_construction_without_trusted_context_fails_closed(self):
+        armed = self.armed_candidate()
+        stub = self.stub()
+        transport = self.transport(stub)
+        sender = CanarySingleShotService(
+            self.portable_path,
+            self.operational,
+            self.coordinator,
+            arming=self.canary,
+        )
+
+        with self.assertRaises(HandoffTrustError):
+            sender.send(
+                armed["canary_candidate_id"], self.lease, "agent-a", transport
+            )
+
+        self.assertEqual(transport.transmissions, 0)
+        self.assertEqual(stub.hit_count(), 0)
+
     def test_success_records_sanitized_metadata(self):
         armed = self.armed_candidate()
         stub = self.stub()
@@ -215,20 +235,25 @@ class CanarySendBoundaryTests(CanarySendFixture, unittest.TestCase):
 
         def send_once(_index):
             operational = OperationalSQLiteRepository.open(self.runtime)
+            service = None
             try:
                 coordinator = BindingAuthorityCoordinator(
                     self.portable_path, operational, self.clock,
                     AuthorityConfig(lease_ttl=timedelta(seconds=30)),
                 )
-                service = CanarySingleShotService(
-                    self.portable_path, operational, coordinator,
+                service = self.trusted_sender(
+                    operational,
+                    coordinator,
                     committed_wait_seconds=5.0,
+                    context_provider=self.context_provider,
                 )
                 return service.send(
                     armed["canary_candidate_id"], self.lease, "agent-a",
                     SingleShotCanaryTransport(stub.url),
                 )
             finally:
+                if service is not None:
+                    self.close_trusted_sender(service)
                 operational.close()
 
         with ThreadPoolExecutor(max_workers=10) as executor:
@@ -241,6 +266,8 @@ class CanarySendBoundaryTests(CanarySendFixture, unittest.TestCase):
             )[0][0],
             1,
         )
+        self.assertEqual(self.legacy_artifact_count(), 1)
+        self.assertEqual(self.context_provider.allocations, 1)
         states = {result["state"] for result in results}
         self.assertEqual(states, {"succeeded"})
         self.assertIn("idempotent_replay", {result["outcome"] for result in results})

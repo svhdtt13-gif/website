@@ -29,6 +29,8 @@ from services.authority_bound_targets import AuthorityBoundTargetService
 from services.binding_authority import _correlation_id, _reject
 from services.binding_authority_types import BindingLease
 from services.canary_arming import CanaryArmingService
+from services.canary_envelope import build_canary_envelope
+from services.canary_handoff_export import CanaryHandoffExporter
 from services.canary_send_transport import (
     CANARY_SEND_CONTRACT_VERSION,
     CanaryDestinationRefused,
@@ -36,6 +38,8 @@ from services.canary_send_transport import (
     SingleShotCanaryTransport,
 )
 from services.dispatch_intent_store import DispatchIntentStore
+from services.legacy_canary_coordinator import LegacyCanaryCoordinator
+from services.legacy_handoff_trust import HandoffTrustError, TrustedAckVerifier
 from services.shadow_dispatch_envelope import snapshot_fingerprint
 
 _COMMITTED_POLL_ROUNDS: int = 40
@@ -64,6 +68,9 @@ class CanarySingleShotService:
         coordinator,
         arming: CanaryArmingService | None = None,
         committed_wait_seconds: float = 2.0,
+        handoff_exporter: CanaryHandoffExporter | None = None,
+        legacy_coordinator: LegacyCanaryCoordinator | None = None,
+        ack_verifier: TrustedAckVerifier | None = None,
     ):
         self.operational = operational
         self.coordinator = coordinator
@@ -73,6 +80,9 @@ class CanarySingleShotService:
         )
         self.shadow = self.arming.shadow
         self.committed_wait_seconds = committed_wait_seconds
+        self.handoff_exporter = handoff_exporter
+        self.legacy_coordinator = legacy_coordinator
+        self.ack_verifier = ack_verifier
 
     def send(
         self,
@@ -124,7 +134,9 @@ class CanarySingleShotService:
             )
         try:
             with self.operational.transaction():
-                self._final_guard(candidate, lease, owner_id, correlation_id)
+                fresh_envelope = self._final_guard(
+                    candidate, lease, owner_id, correlation_id
+                )
         except Exception:
             self._guarded_mark_unknown(
                 candidate["canary_candidate_id"], lease, owner_id,
@@ -132,7 +144,28 @@ class CanarySingleShotService:
             )
             raise
         if self.operational.connection.in_transaction:
-            raise RuntimeError("network boundary entered with open transaction")
+            raise HandoffTrustError("network boundary entered with open transaction")
+        if (
+            self.handoff_exporter is None
+            or self.legacy_coordinator is None
+            or self.ack_verifier is None
+        ):
+            raise HandoffTrustError("trusted handoff context is unavailable")
+        handoff = self.handoff_exporter.export(fresh_envelope)
+        ack = self.legacy_coordinator.authorize(handoff)
+        self.ack_verifier.verify(ack)
+        if (
+            ack.handoff_id,
+            ack.pre_send_identity,
+            ack.envelope_fingerprint,
+        ) != (
+            handoff.handoff_id,
+            handoff.pre_send_identity,
+            handoff.envelope_fingerprint,
+        ):
+            raise HandoffTrustError("authorization ACK binding is invalid")
+        if self.operational.connection.in_transaction:
+            raise HandoffTrustError("network boundary entered with open transaction")
         try:
             status_class, response_fingerprint = transport.single_post(
                 _send_body(candidate),
@@ -186,6 +219,34 @@ class CanarySingleShotService:
         self.arming._require_upstream_stable(shadow, intent, correlation_id)
         if fresh_candidate["state"] != "armed":
             raise _reject(correlation_id, "canary_send_not_actionable")
+        fresh_envelope = build_canary_envelope(
+            shadow, intent, execution, attempt, target, correlation_id
+        )
+        expected = (
+            fresh_envelope.canonical_json,
+            fresh_envelope.fingerprint,
+            fresh_envelope.operation_kind,
+            fresh_envelope.destination_ref,
+            fresh_envelope.binding_generation,
+            fresh_envelope.verified_identity_ref,
+            fresh_envelope.verified_identity_revision,
+            fresh_envelope.authority_epoch,
+            fresh_envelope.fence_counter,
+        )
+        actual = (
+            fresh_candidate["envelope_json"],
+            fresh_candidate["envelope_fingerprint"],
+            fresh_candidate["operation_kind"],
+            fresh_candidate["destination_ref"],
+            fresh_candidate["binding_generation"],
+            fresh_candidate["verified_identity_ref"],
+            fresh_candidate["verified_identity_revision"],
+            fresh_candidate["authority_epoch"],
+            fresh_candidate["fence_counter"],
+        )
+        if actual != expected:
+            raise _reject(correlation_id, "canary_fresh_envelope_mismatch")
+        return fresh_envelope
 
     def _replay_outside(
         self, canary_candidate_id, lease, owner_id, correlation_id

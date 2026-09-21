@@ -71,6 +71,11 @@ class CanarySendSafetyTests(unittest.TestCase):
         imports = _imports(_tree(TRANSPORT_FILE))
         self.assertTrue({"repositories", "sqlite3"}.isdisjoint(imports))
 
+    def test_legacy_coordinator_does_not_import_operational_repository(self):
+        coordinator_file = SERVICES / "legacy_canary_coordinator.py"
+        source = coordinator_file.read_text(encoding="utf-8")
+        self.assertNotIn("OperationalSQLiteRepository", source)
+
     def test_no_retry_or_backoff_identifiers(self):
         for path in (TRANSPORT_FILE, SERVICE_FILE):
             names = _names(_tree(path))

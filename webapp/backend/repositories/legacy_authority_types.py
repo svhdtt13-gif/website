@@ -302,6 +302,7 @@ class Receipt:
     source_identity_ref: str = ""
     target_ref: str = ""
     requested_state: str = ""
+    fence_state: FenceState | None = None
 
 
 @dataclass(frozen=True, slots=True)

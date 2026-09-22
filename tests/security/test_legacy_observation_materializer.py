@@ -9,7 +9,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "webapp" / "backend"))
 
-from repositories.legacy_authority_types import Receipt, ReceiptState
+from repositories.legacy_authority_types import FenceState, Receipt, ReceiptState
 from services.legacy_observation_materializer import (
     ObservationEvidence,
     ObservationMaterializer,
@@ -33,6 +33,7 @@ def applied_receipt() -> Receipt:
         source_identity_ref="legacy-source:one",
         target_ref="client:one",
         requested_state="running",
+        fence_state=FenceState.OBSERVATION_PENDING,
     )
 
 
@@ -100,9 +101,71 @@ class LegacyObservationMaterializerTests(unittest.TestCase):
             )
             self.materializer.require_evidence(mismatched)
 
+    def test_run_and_fence_lineage_is_rejected_before_insert(self) -> None:
+        receipt = applied_receipt()
+        for field, value in (
+            ("canary_run_id", "run-2"),
+            ("fence_identity", "fence:run-1:12"),
+            ("fence_counter", 12),
+        ):
+            with self.subTest(field=field):
+                with self.assertRaises(ObservationMaterializerError):
+                    self.materializer.record_ack(receipt, evidence(**{field: value}))
+                self.assertIsNone(
+                    self.connection.execute(
+                        "SELECT 1 FROM observation_materializer_acks"
+                    ).fetchone()
+                )
+
+    def test_closed_or_abandoned_fence_cannot_ack(self) -> None:
+        receipt = applied_receipt()
+        for state in (FenceState.CLOSED, FenceState.ABANDONED):
+            with self.subTest(state=state), self.assertRaises(ObservationMaterializerError):
+                closed = Receipt(
+                    receipt.pre_send_identity,
+                    receipt.envelope_fingerprint,
+                    receipt.canary_run_id,
+                    receipt.fence_identity,
+                    receipt.authority_epoch,
+                    receipt.fence_counter,
+                    receipt.state,
+                    receipt.pre_operation_observation_generation_floor,
+                    receipt.post_dispatch_observation_boundary_id,
+                    receipt.post_dispatch_observation_generation_floor,
+                    receipt.source_identity_ref,
+                    receipt.target_ref,
+                    receipt.requested_state,
+                    state,
+                )
+                self.materializer.record_ack(closed, evidence())
+
     def test_generation_must_be_strictly_later_than_floor(self) -> None:
         with self.assertRaises(ObservationMaterializerError):
             evidence(generation_id=42)
+
+    def test_generation_sequence_remains_monotonic_after_restart(self) -> None:
+        receipt = applied_receipt()
+        self.materializer.record_ack(receipt, evidence())
+        self.connection.close()
+        reopened = sqlite3.connect(Path(self.temporary.name) / "ack.sqlite3")
+        materializer = ObservationMaterializer(reopened)
+        with self.assertRaises(ObservationMaterializerError):
+            second_receipt = Receipt(
+                "send-2", "sha256:envelope-2", "run-2", "fence:run-2:12",
+                "epoch-2", 12, ReceiptState.APPLIED, 10, "boundary-11", 11,
+                "legacy-source:one", "client:one", "running", FenceState.RECEIPT_TERMINAL,
+            )
+            materializer.record_ack(
+                second_receipt,
+                evidence(
+                    boundary_id="boundary-11", generation_floor=11, generation_id=12,
+                    canary_run_id="run-2", fence_identity="fence:run-2:12", fence_counter=12,
+                ),
+            )
+        reopened.close()
+        self.connection = sqlite3.connect(Path(self.temporary.name) / "ack.sqlite3")
+        self.connection.row_factory = sqlite3.Row
+        self.materializer = ObservationMaterializer(self.connection)
 
     def test_non_applied_receipt_cannot_ack(self) -> None:
         receipt = applied_receipt()

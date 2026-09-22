@@ -32,7 +32,7 @@ class _ReceiptHost(Protocol):
     def get_receipt(self, identity: str) -> Receipt: ...
 
     @staticmethod
-    def _receipt(row: sqlite3.Row) -> Receipt: ...
+    def _receipt(row: sqlite3.Row, fence_state: str | None = None) -> Receipt: ...
 
 
 class ReceiptLifecycleMixin:
@@ -43,7 +43,10 @@ class ReceiptLifecycleMixin:
             if existing is not None:
                 if existing["envelope_fingerprint"] != fingerprint:
                     raise ReceiptConflictError("receipt identity has a conflicting fingerprint")
-                return ReceiptDecision(self._receipt(existing), False)
+                fence = self.get_fence(identity)
+                return ReceiptDecision(
+                    self._receipt(existing, fence["state"] if fence else None), False
+                )
             artifact = self._artifact(identity)
             if artifact["envelope_fingerprint"] != fingerprint:
                 raise ReceiptConflictError("artifact fingerprint binding conflict")
@@ -118,7 +121,7 @@ class ReceiptLifecycleMixin:
                 raise TransitionError("observation boundary requires an open post-terminal fence")
             if existing["post_dispatch_observation_boundary_id"] is not None:
                 if existing["post_dispatch_observation_boundary_id"] == boundary_id and existing["post_dispatch_observation_generation_floor"] == generation_floor:
-                    return self._receipt(existing)
+                    return self._receipt(existing, fence["state"])
                 raise ReceiptConflictError("observation boundary conflict")
             changed = self.connection.execute(
                 "UPDATE receipts SET post_dispatch_observation_boundary_id=?,post_dispatch_observation_generation_floor=? WHERE pre_send_identity=? AND envelope_fingerprint=? AND canary_run_id=? AND fence_identity=? AND fence_counter=? AND state=? AND post_dispatch_observation_boundary_id IS NULL AND post_dispatch_observation_generation_floor IS NULL",
@@ -148,13 +151,14 @@ class ReceiptLifecycleMixin:
         row = self._receipt_row(identity)
         if row is None:
             raise TransitionError("receipt is missing")
-        return self._receipt(row)
+        fence = self.get_fence(identity)
+        return self._receipt(row, fence["state"] if fence else None)
 
     def _receipt_row(self: _ReceiptHost, identity: str) -> sqlite3.Row | None:
         return self.connection.execute("SELECT * FROM receipts WHERE pre_send_identity=?", (identity,)).fetchone()
 
     @staticmethod
-    def _receipt(row: sqlite3.Row) -> Receipt:
+    def _receipt(row: sqlite3.Row, fence_state: str | None = None) -> Receipt:
         return Receipt(
             row["pre_send_identity"], row["envelope_fingerprint"],
             row["canary_run_id"], row["fence_identity"], row["authority_epoch"],
@@ -163,4 +167,5 @@ class ReceiptLifecycleMixin:
             row["post_dispatch_observation_boundary_id"],
             row["post_dispatch_observation_generation_floor"],
             row["source_identity_ref"], row["target_ref"], "running",
+            FenceState(fence_state) if fence_state is not None else None,
         )

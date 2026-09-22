@@ -6,6 +6,8 @@ the snapshot provenance through an audited integration boundary.
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime
@@ -42,7 +44,6 @@ class ObservationEvidence:
         for field in (
             "boundary_id",
             "snapshot_id",
-            "captured_at",
             "materializer_run_id",
             "source_hash",
             "source_identity_ref",
@@ -52,9 +53,13 @@ class ObservationEvidence:
             "requested_state",
             "observed_state",
         ):
-            value = getattr(self, field)
-            if not value or value != value.strip():
-                raise ObservationMaterializerError(f"{field} must be canonical")
+            _safe_reference(getattr(self, field), field)
+        if type(self.captured_at) is not str:
+            raise ObservationMaterializerError("captured_at must be an ISO timestamp")
+        if type(self.generation_floor) is not int or type(self.generation_id) is not int:
+            raise ObservationMaterializerError("generation values must be integers")
+        if type(self.fence_counter) is not int:
+            raise ObservationMaterializerError("fence_counter must be an integer")
         if self.generation_floor < 0 or self.generation_id <= self.generation_floor:
             raise ObservationMaterializerError(
                 "generation_id must be strictly later than generation_floor"
@@ -74,6 +79,10 @@ class MaterializerAck:
 
 
 ACK_SCHEMA_SQL = """
+CREATE TABLE observation_materializer_meta (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS observation_materializer_acks (
     receipt_identity TEXT PRIMARY KEY,
     boundary_id TEXT NOT NULL UNIQUE,
@@ -90,8 +99,13 @@ CREATE TABLE IF NOT EXISTS observation_materializer_acks (
     target_ref TEXT NOT NULL,
     requested_state TEXT NOT NULL,
     observed_state TEXT NOT NULL,
+    UNIQUE(generation_id),
     CHECK (generation_id > generation_floor),
     CHECK (fence_counter > 0)
+);
+CREATE TABLE observation_generation_sequence (
+    key TEXT PRIMARY KEY,
+    last_generation_id INTEGER NOT NULL CHECK (last_generation_id >= 0)
 );
 CREATE TRIGGER IF NOT EXISTS observation_ack_immutable_update
 BEFORE UPDATE ON observation_materializer_acks
@@ -101,10 +115,90 @@ BEFORE DELETE ON observation_materializer_acks
 BEGIN SELECT RAISE(ABORT, 'observation ACK immutable'); END;
 """
 
+ACK_STORE_KIND = "legacy_observation_materializer"
+ACK_SCHEMA_VERSION = "1"
+_SECRET_MARKERS = ("authorization", "cookie", "credential", "password", "secret", "session", "token", "http://", "https://")
+
+
+def _safe_reference(value: object, field: str) -> None:
+    if type(value) is not str or not value or value != value.strip():
+        raise ObservationMaterializerError(f"{field} must be a canonical string")
+    if any(marker in value.casefold() for marker in _SECRET_MARKERS):
+        raise ObservationMaterializerError(f"{field} must be a non-secret reference")
+
+
+def _schema_identity(connection: sqlite3.Connection) -> str:
+    rows = connection.execute(
+        "SELECT type, name, tbl_name, sql FROM sqlite_master "
+        "WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name"
+    ).fetchall()
+    return json.dumps([tuple(row) for row in rows], separators=(",", ":"))
+
+
+def _schema_checksum(identity: str) -> str:
+    return hashlib.sha256(identity.encode()).hexdigest()
+
+
+with sqlite3.connect(":memory:") as _schema_connection:
+    _schema_connection.executescript(ACK_SCHEMA_SQL)
+    ACK_SCHEMA_IDENTITY = _schema_identity(_schema_connection)
+ACK_SCHEMA_CHECKSUM = _schema_checksum(ACK_SCHEMA_IDENTITY)
+
 
 def initialize_ack_schema(connection: sqlite3.Connection) -> None:
-    """Create the append-only ACK relation on a caller-owned SQLite store."""
-    connection.executescript(ACK_SCHEMA_SQL)
+    """Create or validate the append-only ACK relation on its own store."""
+    tables = {
+        row[0]
+        for row in connection.execute(
+            "SELECT name FROM sqlite_master WHERE type IN ('table', 'trigger') "
+            "AND name NOT LIKE 'sqlite_%'"
+        )
+    }
+    if not tables:
+        connection.executescript(ACK_SCHEMA_SQL)
+        connection.execute(
+            "INSERT INTO observation_materializer_meta(key,value) VALUES (?,?)",
+            ("store_kind", ACK_STORE_KIND),
+        )
+        connection.execute(
+            "INSERT INTO observation_materializer_meta(key,value) VALUES (?,?)",
+            ("schema_version", ACK_SCHEMA_VERSION),
+        )
+        connection.execute(
+            "INSERT INTO observation_materializer_meta(key,value) VALUES (?,?)",
+            ("schema_checksum", ACK_SCHEMA_CHECKSUM),
+        )
+        connection.execute(
+            "INSERT INTO observation_materializer_meta(key,value) VALUES (?,?)",
+            ("schema_identity", ACK_SCHEMA_IDENTITY),
+        )
+        connection.execute(
+            "INSERT INTO observation_generation_sequence(key,last_generation_id) VALUES ('global',0)"
+        )
+        connection.commit()
+        return
+    expected_tables = {
+        "observation_materializer_meta",
+        "observation_materializer_acks",
+        "observation_generation_sequence",
+        "observation_ack_immutable_update",
+        "observation_ack_immutable_delete",
+    }
+    if tables != expected_tables:
+        raise ObservationMaterializerError("observation ACK store schema is not dedicated")
+    metadata = dict(
+        connection.execute("SELECT key,value FROM observation_materializer_meta")
+    )
+    if (
+        metadata.get("store_kind") != ACK_STORE_KIND
+        or metadata.get("schema_version") != ACK_SCHEMA_VERSION
+        or metadata.get("schema_checksum") != ACK_SCHEMA_CHECKSUM
+        or metadata.get("schema_identity") != ACK_SCHEMA_IDENTITY
+        or _schema_identity(connection) != ACK_SCHEMA_IDENTITY
+    ):
+        raise ObservationMaterializerError("observation ACK store schema mismatch")
+    if connection.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+        raise ObservationMaterializerError("observation ACK store integrity failed")
 
 
 class ObservationMaterializer:
@@ -112,14 +206,6 @@ class ObservationMaterializer:
 
     def __init__(self, connection: sqlite3.Connection) -> None:
         self.connection = connection
-        if any(
-            connection.execute(
-                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,)
-            ).fetchone()
-            is not None
-            for name in ("schema_meta", "receipts", "import_runs", "source_snapshots")
-        ):
-            raise ObservationMaterializerError("observation ACKs require a dedicated SQLite store")
         initialize_ack_schema(connection)
 
     def record_ack(
@@ -141,6 +227,12 @@ class ObservationMaterializer:
             or receipt.requested_state != evidence.requested_state
             or receipt.requested_state != "running"
             or evidence.observed_state != evidence.requested_state
+            or receipt.canary_run_id != evidence.canary_run_id
+            or receipt.fence_identity != evidence.fence_identity
+            or receipt.fence_counter != evidence.fence_counter
+            or receipt.fence_state is None
+            or receipt.fence_state.value
+            not in ("receipt_terminal", "observation_pending")
         ):
             raise ObservationMaterializerError("ACK does not bind to receipt lineage")
         identity = receipt.pre_send_identity
@@ -163,6 +255,20 @@ class ObservationMaterializer:
         )
         self.connection.execute("BEGIN IMMEDIATE")
         try:
+            existing = self.connection.execute(
+                "SELECT * FROM observation_materializer_acks WHERE receipt_identity=?",
+                (identity,),
+            ).fetchone()
+            if existing is not None:
+                if tuple(existing) != values:
+                    raise ObservationMaterializerConflict("observation ACK conflict")
+                self.connection.commit()
+                return MaterializerAck(identity, evidence)
+            last_generation = self.connection.execute(
+                "SELECT last_generation_id FROM observation_generation_sequence WHERE key='global'"
+            ).fetchone()[0]
+            if evidence.generation_id <= last_generation:
+                raise ObservationMaterializerError("generation is not globally monotonic")
             self.connection.execute(
                 "INSERT OR IGNORE INTO observation_materializer_acks "
                 "(receipt_identity,boundary_id,generation_floor,generation_id,"
@@ -171,12 +277,16 @@ class ObservationMaterializer:
                 "target_ref,requested_state,observed_state) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 values,
             )
-            existing = self.connection.execute(
+            inserted = self.connection.execute(
                 "SELECT * FROM observation_materializer_acks WHERE receipt_identity=?",
                 (identity,),
             ).fetchone()
-            if existing is None or tuple(existing) != values:
+            if inserted is None or tuple(inserted) != values:
                 raise ObservationMaterializerConflict("observation ACK conflict")
+            self.connection.execute(
+                "UPDATE observation_generation_sequence SET last_generation_id=? WHERE key='global'",
+                (evidence.generation_id,),
+            )
         except Exception:
             self.connection.rollback()
             raise
@@ -208,6 +318,8 @@ class ObservationMaterializer:
             or row[13] != receipt.requested_state
             or row[14] != receipt.requested_state
             or row[3] <= row[2]
+            or receipt.fence_state is None
+            or receipt.fence_state.value not in ("receipt_terminal", "observation_pending")
         ):
             raise ObservationMaterializerError("post-dispatch evidence binding mismatch")
         return MaterializerAck(

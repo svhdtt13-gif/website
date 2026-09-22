@@ -155,4 +155,12 @@ class ReceiptLifecycleMixin:
 
     @staticmethod
     def _receipt(row: sqlite3.Row) -> Receipt:
-        return Receipt(row["pre_send_identity"], row["envelope_fingerprint"], row["canary_run_id"], row["fence_identity"], row["authority_epoch"], row["fence_counter"], ReceiptState(row["state"]), row["pre_operation_observation_generation_floor"], row["post_dispatch_observation_boundary_id"], row["post_dispatch_observation_generation_floor"])
+        return Receipt(
+            row["pre_send_identity"], row["envelope_fingerprint"],
+            row["canary_run_id"], row["fence_identity"], row["authority_epoch"],
+            row["fence_counter"], ReceiptState(row["state"]),
+            row["pre_operation_observation_generation_floor"],
+            row["post_dispatch_observation_boundary_id"],
+            row["post_dispatch_observation_generation_floor"],
+            row["source_identity_ref"], row["target_ref"], "running",
+        )

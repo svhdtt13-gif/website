@@ -299,6 +299,9 @@ class Receipt:
     pre_operation_observation_generation_floor: int
     post_dispatch_observation_boundary_id: str | None = None
     post_dispatch_observation_generation_floor: int | None = None
+    source_identity_ref: str = ""
+    target_ref: str = ""
+    requested_state: str = ""
 
 
 @dataclass(frozen=True, slots=True)

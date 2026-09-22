@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import sys
 import tempfile
+import threading
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from pathlib import Path
 
@@ -10,7 +12,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "webapp" / "backend"))
 
 from repositories.legacy_authority_store import LegacyAuthorityStore, legacy_store_path
-from repositories.legacy_authority_types import AuthorizationLookup
+from repositories.legacy_authority_types import AuthorizationLookup, Handoff
 from services.canary_envelope import CanaryEnvelope
 from services.canary_handoff_export import CanaryHandoffExporter
 from services.legacy_canary_coordinator import (
@@ -21,6 +23,7 @@ from services.legacy_canary_coordinator import (
     ProductionAuthorizationContextProvider,
 )
 from services.legacy_handoff_trust import (
+    AuthenticatedAuthorizationAck,
     HandoffTrustError,
     TrustedAckVerifier,
     TrustedHandoffVerifier,
@@ -36,6 +39,21 @@ class CoordinatorTestKeyProvider:
             if candidate == identity:
                 return key
         raise KeyError(identity)
+
+
+class CountingAuthorizationContextProvider:
+    def __init__(self, context: LegacyAuthorizationContext) -> None:
+        self._context = context
+        self._lock = threading.Lock()
+        self.allocations = 0
+
+    def context_for(
+        self, handoff: Handoff, envelope: CanaryEnvelope
+    ) -> LegacyAuthorizationContext:
+        del handoff, envelope
+        with self._lock:
+            self.allocations += 1
+        return self._context
 
 
 def valid_envelope() -> CanaryEnvelope:
@@ -182,6 +200,47 @@ class LegacyCanaryCoordinatorTests(unittest.TestCase):
 
         with self.assertRaises(HandoffTrustError):
             self.coordinator(ProductionAuthorizationContextProvider()).authorize(handoff)
+
+    def test_two_independent_stores_allocate_one_durable_authorization(self) -> None:
+        handoff = self.exporter.export(valid_envelope())
+        provider = CountingAuthorizationContextProvider(valid_context())
+        trust = LegacyCoordinatorTrust(
+            self.handoff_verifier,
+            "coordinator:legacy",
+            self.keys,
+        )
+        barrier = threading.Barrier(2)
+
+        def authorize(_index: int) -> AuthenticatedAuthorizationAck:
+            worker_store = LegacyAuthorityStore.open(self.store.path)
+            try:
+                coordinator = LegacyCanaryCoordinator(worker_store, provider, trust)
+                barrier.wait()
+                return coordinator.authorize(handoff)
+            finally:
+                worker_store.close()
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            acknowledgements = list(executor.map(authorize, range(2)))
+
+        stored = self.store.lookup_authorization_by_pre_send_identity("send-1")
+        self.assertIsNotNone(stored)
+        self.assertEqual(provider.allocations, 1)
+        self.assertEqual(
+            self.store.connection.execute("SELECT COUNT(*) FROM handoffs").fetchone()[0],
+            1,
+        )
+        self.assertEqual(
+            self.store.connection.execute(
+                "SELECT COUNT(*) FROM authorization_artifacts"
+            ).fetchone()[0],
+            1,
+        )
+        self.assertEqual(acknowledgements[0], acknowledgements[1])
+        self.assertEqual(stored.artifact.canary_run_id, "run-1")
+        self.assertEqual(stored.artifact.fence_identity, "fence:run-1:11")
+        for acknowledgement in acknowledgements:
+            self.ack_verifier.verify(acknowledgement)
 
 
 if __name__ == "__main__":

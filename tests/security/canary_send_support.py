@@ -9,13 +9,26 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "webapp" / "backend"))
 
+from repositories.legacy_authority_store import LegacyAuthorityStore, legacy_store_path
 from services.binding_authority import AuthorityConfig  # noqa: F401
 from services.canary_arming import CanaryArmingService
+from services.canary_handoff_export import CanaryHandoffExporter
 from services.canary_send import CanarySingleShotService
 from services.canary_send_transport import SingleShotCanaryTransport
 from services.canary_transport import RecordingCanaryTransport
+from services.legacy_canary_coordinator import (
+    LegacyCanaryCoordinator,
+    LegacyCoordinatorTrust,
+)
+from services.legacy_handoff_trust import TrustedAckVerifier, TrustedHandoffVerifier
 from services.shadow_dispatch_transport import RecordingShadowTransport
 
+from tests.security.canary_handoff_support import (
+    TEST_COORDINATOR_IDENTITY,
+    TEST_EXPORTER_IDENTITY,
+    DeterministicCanaryContextProvider,
+    HandoffHmacKeyProvider,
+)
 from tests.security.shadow_dispatch_support import ShadowDispatchFixture
 
 TEST_CREDENTIAL = "test-credential-9f3a"
@@ -120,12 +133,32 @@ class CanaryStubServer:
 class CanarySendFixture(ShadowDispatchFixture):
     def setUp(self):
         super().setUp()
+        self.legacy_stores = []
+        self.handoff_keys = HandoffHmacKeyProvider(
+            (
+                (TEST_EXPORTER_IDENTITY, b"deterministic-test-exporter-key"),
+                (TEST_COORDINATOR_IDENTITY, b"deterministic-test-coordinator-key"),
+            )
+        )
+        self.handoff_exporter = CanaryHandoffExporter(
+            TEST_EXPORTER_IDENTITY, self.handoff_keys
+        )
+        self.handoff_verifier = TrustedHandoffVerifier(
+            TEST_EXPORTER_IDENTITY, self.handoff_keys
+        )
+        self.ack_verifier = TrustedAckVerifier(
+            TEST_COORDINATOR_IDENTITY, self.handoff_keys
+        )
+        self.context_provider = DeterministicCanaryContextProvider()
         self.canary = CanaryArmingService(
             self.portable_path, self.operational, self.coordinator
         )
-        self.sender = CanarySingleShotService(
-            self.portable_path, self.operational, self.coordinator,
-            arming=self.canary, committed_wait_seconds=0.3,
+        self.sender = self.trusted_sender(
+            self.operational,
+            self.coordinator,
+            arming=self.canary,
+            committed_wait_seconds=0.3,
+            context_provider=self.context_provider,
         )
         self.stubs = []
 
@@ -133,7 +166,67 @@ class CanarySendFixture(ShadowDispatchFixture):
         for stub in self.stubs:
             stub.stop()
         self.stubs = []
+        for store in self.legacy_stores:
+            store.close()
+        self.legacy_stores = []
         super().tearDown()
+
+    def execution(self, key="target-key"):
+        target = self.targets.record_target(
+            self.scope, self.lease, "group_on", "profile-a", "operator-a", key
+        )
+        claimed = self.targets.claim_target(
+            target["target_id"], self.lease, "agent-a"
+        )
+        return self.executions.create_execution(
+            claimed["target_id"], self.lease, "agent-a"
+        )
+
+    def trusted_sender(
+        self,
+        operational,
+        coordinator,
+        arming=None,
+        committed_wait_seconds=2.0,
+        context_provider=None,
+    ):
+        path = legacy_store_path(self.runtime)
+        store = (
+            LegacyAuthorityStore.open(path)
+            if path.exists()
+            else LegacyAuthorityStore.create(path)
+        )
+        self.legacy_stores.append(store)
+        provider = context_provider or DeterministicCanaryContextProvider()
+        legacy_coordinator = LegacyCanaryCoordinator(
+            store,
+            provider,
+            LegacyCoordinatorTrust(
+                self.handoff_verifier,
+                TEST_COORDINATOR_IDENTITY,
+                self.handoff_keys,
+            ),
+        )
+        return CanarySingleShotService(
+            self.portable_path,
+            operational,
+            coordinator,
+            arming=arming,
+            committed_wait_seconds=committed_wait_seconds,
+            handoff_exporter=self.handoff_exporter,
+            legacy_coordinator=legacy_coordinator,
+            ack_verifier=self.ack_verifier,
+        )
+
+    def close_trusted_sender(self, sender):
+        store = sender.legacy_coordinator._store
+        self.legacy_stores.remove(store)
+        store.close()
+
+    def legacy_artifact_count(self):
+        return self.legacy_stores[0].connection.execute(
+            "SELECT COUNT(*) FROM authorization_artifacts"
+        ).fetchone()[0]
 
     def stub(self, behavior=None):
         server = CanaryStubServer(behavior).start()

@@ -255,6 +255,39 @@ class AuthorizationArtifact:
 
 
 @dataclass(frozen=True, slots=True)
+class AuthorizationLookup:
+    pre_send_identity: str
+
+    def __post_init__(self) -> None:
+        _required(self.pre_send_identity, "pre_send_identity")
+
+
+@dataclass(frozen=True, slots=True)
+class HandoffAuthorizationLookup:
+    handoff_id: str
+
+    def __post_init__(self) -> None:
+        _required(self.handoff_id, "handoff_id")
+
+
+@dataclass(frozen=True, slots=True)
+class EnvelopeAuthorizationLookup:
+    envelope_fingerprint: str
+
+    def __post_init__(self) -> None:
+        _required(self.envelope_fingerprint, "envelope_fingerprint")
+
+
+@dataclass(frozen=True, slots=True)
+class StoredAuthorization:
+    handoff: Handoff
+    artifact: AuthorizationArtifact
+
+    def __post_init__(self) -> None:
+        self.artifact.require_handoff(self.handoff)
+
+
+@dataclass(frozen=True, slots=True)
 class Receipt:
     pre_send_identity: str
     envelope_fingerprint: str

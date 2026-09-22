@@ -5,12 +5,12 @@ import json
 import sqlite3
 from typing import Final
 
-SCHEMA_SQL: Final = """
+V3_SCHEMA_SQL: Final = """
 CREATE TABLE schema_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE handoffs (
  handoff_id TEXT PRIMARY KEY, source_envelope_contract_version TEXT NOT NULL,
  transport_contract_version TEXT NOT NULL, pre_send_identity TEXT NOT NULL UNIQUE, canary_idempotency_key TEXT NOT NULL,
- envelope_fingerprint TEXT NOT NULL UNIQUE, canonical_envelope_json TEXT NOT NULL, operation_kind TEXT NOT NULL,
+ envelope_fingerprint TEXT NOT NULL, canonical_envelope_json TEXT NOT NULL, operation_kind TEXT NOT NULL,
  target_ref TEXT NOT NULL, binding_generation INTEGER NOT NULL, verified_identity_ref TEXT NOT NULL,
  verified_identity_revision INTEGER NOT NULL, authority_epoch TEXT NOT NULL, fence_counter INTEGER NOT NULL,
  exporter_identity TEXT NOT NULL, exporter_attestation TEXT NOT NULL, UNIQUE(authority_epoch, fence_counter)
@@ -79,6 +79,17 @@ CREATE TRIGGER receipt_boundary_immutable_update BEFORE UPDATE ON receipts
 CREATE TRIGGER receipt_immutable_delete BEFORE DELETE ON receipts BEGIN SELECT RAISE(ABORT, 'receipt immutable'); END;
 """
 
+V4_UNIQUE_INDEX_SQL: Final = """
+CREATE UNIQUE INDEX unique_handoffs_envelope_fingerprint
+ ON handoffs(envelope_fingerprint);
+"""
+SCHEMA_SQL: Final = V3_SCHEMA_SQL + V4_UNIQUE_INDEX_SQL
+
+TRANSITIONAL_INLINE_UNIQUE_SCHEMA_SQL: Final = V3_SCHEMA_SQL.replace(
+    "envelope_fingerprint TEXT NOT NULL, canonical_envelope_json",
+    "envelope_fingerprint TEXT NOT NULL UNIQUE, canonical_envelope_json",
+)
+
 
 def schema_identity(connection: sqlite3.Connection) -> str:
     rows = connection.execute(
@@ -92,15 +103,23 @@ def _canonical_sql(sql: str) -> str:
     return " ".join(line.strip() for line in sql.splitlines() if line.strip())
 
 
-SCHEMA_CHECKSUM: Final = hashlib.sha256(
-    _canonical_sql(SCHEMA_SQL).encode()
-).hexdigest()
+def _schema_checksum(sql: str) -> str:
+    return hashlib.sha256(_canonical_sql(sql).encode()).hexdigest()
 
 
-def _expected_schema_identity() -> str:
+def _expected_schema_identity(sql: str) -> str:
     with sqlite3.connect(":memory:") as connection:
-        connection.executescript(SCHEMA_SQL)
+        connection.executescript(sql)
         return schema_identity(connection)
 
 
-SCHEMA_IDENTITY: Final = _expected_schema_identity()
+V3_SCHEMA_CHECKSUM: Final = _schema_checksum(V3_SCHEMA_SQL)
+V3_SCHEMA_IDENTITY: Final = _expected_schema_identity(V3_SCHEMA_SQL)
+TRANSITIONAL_INLINE_UNIQUE_SCHEMA_CHECKSUM: Final = _schema_checksum(
+    TRANSITIONAL_INLINE_UNIQUE_SCHEMA_SQL
+)
+TRANSITIONAL_INLINE_UNIQUE_SCHEMA_IDENTITY: Final = _expected_schema_identity(
+    TRANSITIONAL_INLINE_UNIQUE_SCHEMA_SQL
+)
+SCHEMA_CHECKSUM: Final = _schema_checksum(SCHEMA_SQL)
+SCHEMA_IDENTITY: Final = _expected_schema_identity(SCHEMA_SQL)

@@ -92,7 +92,7 @@ class LegacyAuthorityStoreTests(unittest.TestCase):
         metadata = self.store.schema_metadata()
 
         self.assertEqual(metadata["store_kind"], "legacy_canary_authority")
-        self.assertEqual(metadata["schema_version"], "3")
+        self.assertEqual(metadata["schema_version"], "4")
         self.assertEqual(len(metadata["schema_checksum"]), 64)
         with self.assertRaises(sqlite3.DatabaseError):
             self.store.connection.execute("ATTACH DATABASE ':memory:' AS forbidden")

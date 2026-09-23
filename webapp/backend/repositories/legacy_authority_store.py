@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hmac
 import sqlite3
+import time
 from collections.abc import Mapping
 from pathlib import Path, PurePath
 from typing import Final
@@ -79,7 +80,16 @@ class LegacyAuthorityStore(
             connection.row_factory = sqlite3.Row
             connection.set_authorizer(_deny_cross_database)
             connection.execute("PRAGMA foreign_keys = ON")
-            mode = connection.execute("PRAGMA journal_mode = WAL").fetchone()[0]
+            connection.execute("PRAGMA busy_timeout = 5000")
+            mode = ""
+            for _attempt in range(100):
+                try:
+                    mode = connection.execute("PRAGMA journal_mode = WAL").fetchone()[0]
+                    break
+                except sqlite3.OperationalError as error:
+                    if "locked" not in str(error).casefold() or _attempt == 99:
+                        raise
+                    time.sleep(0.05)
             if str(mode).casefold() != "wal":
                 raise LegacyAuthorityStoreError(
                     "LEGACY authority store requires WAL"
@@ -102,23 +112,29 @@ class LegacyAuthorityStore(
         store = cls(connection, path, observation_identity=observation_identity, observation_key_provider=observation_key_provider)
         try:
             with ImmediateTransaction(connection):
-                _execute_schema_script(connection, SCHEMA_SQL)
-                connection.execute(
-                    "INSERT INTO observation_generation_sequence(key,last_generation_id,last_record_digest) VALUES ('global',0,'')"
-                )
-                connection.execute(
-                    "INSERT INTO observation_boundary_sequence(key,last_generation_floor) VALUES ('global',0)"
-                )
-                connection.executemany(
-                    "INSERT INTO schema_meta(key, value) VALUES (?, ?)",
-                    (
-                        ("store_kind", STORE_KIND),
-                        ("schema_version", str(SCHEMA_VERSION)),
-                        ("schema_checksum", SCHEMA_CHECKSUM),
-                        ("restore_state", "canonical"),
-                        ("restore_marker", ""),
-                    ),
-                )
+                objects = connection.execute(
+                    "SELECT name FROM sqlite_master "
+                    "WHERE type IN ('table','index','trigger','view') "
+                    "AND name NOT LIKE 'sqlite_%'"
+                ).fetchall()
+                if not objects:
+                    _execute_schema_script(connection, SCHEMA_SQL)
+                    connection.execute(
+                        "INSERT INTO observation_generation_sequence(key,last_generation_id,last_record_digest) VALUES ('global',0,'')"
+                    )
+                    connection.execute(
+                        "INSERT INTO observation_boundary_sequence(key,last_generation_floor) VALUES ('global',0)"
+                    )
+                    connection.executemany(
+                        "INSERT INTO schema_meta(key, value) VALUES (?, ?)",
+                        (
+                            ("store_kind", STORE_KIND),
+                            ("schema_version", str(SCHEMA_VERSION)),
+                            ("schema_checksum", SCHEMA_CHECKSUM),
+                            ("restore_state", "canonical"),
+                            ("restore_marker", ""),
+                        ),
+                    )
                 store._validate()
         except (sqlite3.DatabaseError, LegacyAuthorityStoreError):
             connection.close()

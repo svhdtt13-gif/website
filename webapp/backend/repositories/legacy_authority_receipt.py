@@ -103,7 +103,7 @@ class ReceiptLifecycleMixin:
             self._transition_fence(receipt.pre_send_identity, FenceState.RECEIPT_TERMINAL)
         return self.get_receipt(receipt.pre_send_identity)
 
-    def append_observation_boundary(self: _ReceiptHost, receipt: Receipt, boundary_id: str, generation_floor: int) -> Receipt:
+    def append_observation_boundary(self: _ReceiptHost, receipt: Receipt, boundary_id: str) -> Receipt:
         self._require_live()
         if receipt.state is not ReceiptState.APPLIED:
             raise TransitionError("observation boundary requires an applied receipt")
@@ -135,8 +135,6 @@ class ReceiptLifecycleMixin:
                 existing["pre_operation_observation_generation_floor"],
             ):
                 raise ReceiptConflictError("receipt observation floor does not match durable lineage")
-            if generation_floor <= existing["pre_operation_observation_generation_floor"]:
-                raise TransitionError("invalid post-dispatch observation boundary")
             fence = self.get_fence(receipt.pre_send_identity)
             if fence is None or fence["state"] not in (
                 FenceState.RECEIPT_TERMINAL.value,
@@ -144,14 +142,18 @@ class ReceiptLifecycleMixin:
             ):
                 raise TransitionError("observation boundary requires an open post-terminal fence")
             if existing["post_dispatch_observation_boundary_id"] is not None:
-                if existing["post_dispatch_observation_boundary_id"] == boundary_id and existing["post_dispatch_observation_generation_floor"] == generation_floor:
+                if existing["post_dispatch_observation_boundary_id"] == boundary_id:
                     return self._receipt(existing, fence["state"])
                 raise ReceiptConflictError("observation boundary conflict")
             sequence = self.connection.execute(
                 "SELECT last_generation_floor FROM observation_boundary_sequence WHERE key='global'"
             ).fetchone()
-            if sequence is None or generation_floor <= sequence[0]:
-                raise TransitionError("observation boundary floor is not fresh")
+            if sequence is None:
+                raise TransitionError("observation boundary sequence is missing")
+            generation_floor = max(
+                int(sequence[0]),
+                int(existing["pre_operation_observation_generation_floor"]),
+            ) + 1
             changed = self.connection.execute(
                 "UPDATE receipts SET post_dispatch_observation_boundary_id=?,post_dispatch_observation_generation_floor=? WHERE pre_send_identity=? AND envelope_fingerprint=? AND canary_run_id=? AND fence_identity=? AND fence_counter=? AND pre_operation_observation_generation_floor=? AND state=? AND post_dispatch_observation_boundary_id IS NULL AND post_dispatch_observation_generation_floor IS NULL",
                 (boundary_id, generation_floor, receipt.pre_send_identity, receipt.envelope_fingerprint, receipt.canary_run_id, receipt.fence_identity, receipt.fence_counter, existing["pre_operation_observation_generation_floor"], ReceiptState.APPLIED.value),

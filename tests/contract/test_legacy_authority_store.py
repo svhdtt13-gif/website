@@ -4,6 +4,7 @@ import sqlite3
 import sys
 import tempfile
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, replace
 from pathlib import Path
 
@@ -103,6 +104,33 @@ class LegacyAuthorityStoreTests(unittest.TestCase):
         with self.assertRaises(sqlite3.DatabaseError):
             self.store.connection.execute("ATTACH DATABASE ':memory:' AS forbidden")
 
+    def test_concurrent_fresh_creators_share_one_canonical_store(self) -> None:
+        path = legacy_store_path(Path(self.temporary.name) / "fresh")
+        self.store.close()
+
+        def create_and_inspect() -> tuple[str, int]:
+            store = LegacyAuthorityStore.create(path)
+            try:
+                return (
+                    store.schema_metadata()["schema_version"],
+                    store.connection.execute("SELECT COUNT(*) FROM schema_meta").fetchone()[0],
+                )
+            finally:
+                store.close()
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            results = list(executor.map(lambda _index: create_and_inspect(), range(2)))
+
+        self.assertEqual(results, [("5", 5), ("5", 5)])
+        inspection = sqlite3.connect(path)
+        try:
+            self.assertEqual(
+                inspection.execute("SELECT COUNT(*) FROM schema_meta").fetchone()[0],
+                5,
+            )
+        finally:
+            inspection.close()
+
     def test_fence_lifecycle_and_abandoned_resolve_clear_history(self) -> None:
         self.store.request_fence("send-1")
         for state in (
@@ -162,12 +190,12 @@ class LegacyAuthorityStoreTests(unittest.TestCase):
         self.assertEqual(applied.state, ReceiptState.APPLIED)
         self.assertIsNone(applied.post_dispatch_observation_boundary_id)
         self.assertIsNone(applied.post_dispatch_observation_generation_floor)
-        applied = self.store.append_observation_boundary(applied, "boundary-42", 42)
+        applied = self.store.append_observation_boundary(applied, "boundary-42")
         self.assertEqual(applied.post_dispatch_observation_boundary_id, "boundary-42")
         self.assertEqual(applied.post_dispatch_observation_generation_floor, 42)
-        self.assertEqual(self.store.append_observation_boundary(applied, "boundary-42", 42), applied)
+        self.assertEqual(self.store.append_observation_boundary(applied, "boundary-42"), applied)
         with self.assertRaises(ReceiptConflictError):
-            self.store.append_observation_boundary(applied, "boundary-43", 43)
+            self.store.append_observation_boundary(applied, "boundary-43")
         with self.assertRaises(TransitionError):
             self.store.terminal_receipt(dispatching, ReceiptState.UNKNOWN)
 

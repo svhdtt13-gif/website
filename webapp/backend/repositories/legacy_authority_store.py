@@ -1,22 +1,29 @@
 from __future__ import annotations
 
+import hmac
 import sqlite3
 from collections.abc import Mapping
 from pathlib import Path, PurePath
 from typing import Final
 
+from services.legacy_handoff_trust import HmacKeyProvider
+from services.legacy_observation_trust import observation_attestation
+
 from repositories.legacy_authority_authorization import AuthorizationPersistenceMixin
 from repositories.legacy_authority_fence import FenceLifecycleMixin, TransitionError
+from repositories.legacy_authority_migration import (
+    AuthoritySchemaMigrationMixin,
+    _execute_schema_script,
+)
+from repositories.legacy_authority_observation import (
+    ObservationEvidence,
+    ObservationPersistenceMixin,
+)
 from repositories.legacy_authority_receipt import ReceiptLifecycleMixin
 from repositories.legacy_authority_schema import (
     SCHEMA_CHECKSUM,
     SCHEMA_IDENTITY,
     SCHEMA_SQL,
-    TRANSITIONAL_INLINE_UNIQUE_SCHEMA_CHECKSUM,
-    TRANSITIONAL_INLINE_UNIQUE_SCHEMA_IDENTITY,
-    V3_SCHEMA_CHECKSUM,
-    V3_SCHEMA_IDENTITY,
-    V4_UNIQUE_INDEX_SQL,
     schema_identity,
 )
 from repositories.legacy_authority_store_types import (
@@ -29,13 +36,14 @@ from repositories.legacy_authority_types import LegacyValidationError
 
 __all__ = (
     "LegacyAuthorityStore",
+    "LegacyAuthorityStoreFactory",
     "ReceiptConflictError",
     "TransitionError",
     "legacy_store_path",
 )
 
 STORE_KIND: Final = "legacy_canary_authority"
-SCHEMA_VERSION: Final = 4
+SCHEMA_VERSION: Final = 5
 DB_FILENAME: Final = "legacy_canary.sqlite3"
 
 def legacy_store_path(runtime_root: PurePath) -> Path:
@@ -51,14 +59,18 @@ def _deny_cross_database(action: int, _arg1: str | None, _arg2: str | None, _db:
 
 
 class LegacyAuthorityStore(
+    AuthoritySchemaMigrationMixin,
     AuthorizationPersistenceMixin,
     FenceLifecycleMixin,
     ReceiptLifecycleMixin,
+    ObservationPersistenceMixin,
 ):
-    def __init__(self, connection: sqlite3.Connection, path: Path, quarantined: bool = False) -> None:
+    def __init__(self, connection: sqlite3.Connection, path: Path, quarantined: bool = False, observation_identity: str | None = None, observation_key_provider: HmacKeyProvider | None = None) -> None:
         self.connection = connection
         self.path = path
         self._quarantined = quarantined
+        self._observation_identity = observation_identity
+        self._observation_key_provider = observation_key_provider
 
     @staticmethod
     def _connect(path: Path) -> sqlite3.Connection:
@@ -80,23 +92,34 @@ class LegacyAuthorityStore(
 
     @classmethod
     def create(cls, path: Path) -> LegacyAuthorityStore:
+        return cls._create(path, None, None)
+
+    @classmethod
+    def _create(cls, path: Path, observation_identity: str | None, observation_key_provider: HmacKeyProvider | None) -> LegacyAuthorityStore:
         cls._require_safe_path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         connection = cls._connect(path)
-        store = cls(connection, path)
+        store = cls(connection, path, observation_identity=observation_identity, observation_key_provider=observation_key_provider)
         try:
-            connection.executescript(SCHEMA_SQL)
-            connection.executemany(
-                "INSERT INTO schema_meta(key, value) VALUES (?, ?)",
-                (
-                    ("store_kind", STORE_KIND),
-                    ("schema_version", str(SCHEMA_VERSION)),
-                    ("schema_checksum", SCHEMA_CHECKSUM),
-                    ("restore_state", "canonical"),
-                    ("restore_marker", ""),
-                ),
-            )
-            store._validate()
+            with ImmediateTransaction(connection):
+                _execute_schema_script(connection, SCHEMA_SQL)
+                connection.execute(
+                    "INSERT INTO observation_generation_sequence(key,last_generation_id,last_record_digest) VALUES ('global',0,'')"
+                )
+                connection.execute(
+                    "INSERT INTO observation_boundary_sequence(key,last_generation_floor) VALUES ('global',0)"
+                )
+                connection.executemany(
+                    "INSERT INTO schema_meta(key, value) VALUES (?, ?)",
+                    (
+                        ("store_kind", STORE_KIND),
+                        ("schema_version", str(SCHEMA_VERSION)),
+                        ("schema_checksum", SCHEMA_CHECKSUM),
+                        ("restore_state", "canonical"),
+                        ("restore_marker", ""),
+                    ),
+                )
+                store._validate()
         except (sqlite3.DatabaseError, LegacyAuthorityStoreError):
             connection.close()
             raise
@@ -104,8 +127,12 @@ class LegacyAuthorityStore(
 
     @classmethod
     def open(cls, path: Path) -> LegacyAuthorityStore:
+        return cls._open(path, None, None)
+
+    @classmethod
+    def _open(cls, path: Path, observation_identity: str | None, observation_key_provider: HmacKeyProvider | None) -> LegacyAuthorityStore:
         cls._require_safe_path(path)
-        store = cls(cls._connect(path), path)
+        store = cls(cls._connect(path), path, observation_identity=observation_identity, observation_key_provider=observation_key_provider)
         try:
             store._prepare_schema()
         except (sqlite3.DatabaseError, LegacyAuthorityStoreError):
@@ -161,98 +188,6 @@ class LegacyAuthorityStore(
         if self.connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
             raise LegacyAuthorityStoreError("LEGACY authority foreign key check failed")
 
-    def _prepare_schema(self) -> None:
-        self.connection.execute("PRAGMA foreign_keys = OFF")
-        self.connection.execute("PRAGMA legacy_alter_table = ON")
-        try:
-            with self._immediate():
-                metadata = self.schema_metadata()
-                version = metadata.get("schema_version")
-                if version == "3":
-                    self._migrate_v3_locked(metadata)
-                elif version == str(SCHEMA_VERSION):
-                    self._validate()
-                else:
-                    raise LegacyAuthorityStoreError(
-                        "LEGACY authority schema metadata mismatch"
-                    )
-        finally:
-            self.connection.execute("PRAGMA legacy_alter_table = OFF")
-            self.connection.execute("PRAGMA foreign_keys = ON")
-
-    def _migrate_v3_locked(self, metadata: Mapping[str, str]) -> None:
-        required_metadata = {
-            "store_kind": STORE_KIND,
-            "schema_version": "3",
-        }
-        if any(metadata.get(key) != value for key, value in required_metadata.items()):
-            raise LegacyAuthorityStoreError("LEGACY authority v3 metadata mismatch")
-        if metadata.get("restore_state") not in ("canonical", "quarantined"):
-            raise LegacyAuthorityStoreError("LEGACY authority restore state mismatch")
-        current_identity = schema_identity(self.connection)
-        checksum = metadata.get("schema_checksum")
-        is_exact_v3 = (
-            checksum == V3_SCHEMA_CHECKSUM and current_identity == V3_SCHEMA_IDENTITY
-        )
-        is_transitional_inline = (
-            checksum == TRANSITIONAL_INLINE_UNIQUE_SCHEMA_CHECKSUM
-            and current_identity == TRANSITIONAL_INLINE_UNIQUE_SCHEMA_IDENTITY
-        )
-        if not is_exact_v3 and not is_transitional_inline:
-            raise LegacyAuthorityStoreError("LEGACY authority v3 schema identity mismatch")
-        if self.connection.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
-            raise LegacyAuthorityStoreError("LEGACY authority integrity check failed")
-        if self.connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
-            raise LegacyAuthorityStoreError("LEGACY authority foreign key check failed")
-        duplicate = self.connection.execute(
-            "SELECT envelope_fingerprint FROM handoffs "
-            "GROUP BY envelope_fingerprint HAVING COUNT(*) > 1 LIMIT 1"
-        ).fetchone()
-        if duplicate is not None:
-            raise LegacyAuthorityStoreError(
-                "LEGACY authority v3 contains duplicate envelope fingerprints"
-            )
-        if is_transitional_inline:
-            self._rebuild_transitional_handoffs_locked()
-        self.connection.execute(V4_UNIQUE_INDEX_SQL)
-        self.connection.execute(
-            "UPDATE schema_meta SET value=? WHERE key='schema_version'",
-            (str(SCHEMA_VERSION),),
-        )
-        self.connection.execute(
-            "UPDATE schema_meta SET value=? WHERE key='schema_checksum'",
-            (SCHEMA_CHECKSUM,),
-        )
-        self._validate()
-
-    def _rebuild_transitional_handoffs_locked(self) -> None:
-        table_sql_row = self.connection.execute(
-            "SELECT sql FROM sqlite_master WHERE type='table' AND name='handoffs'"
-        ).fetchone()
-        trigger_rows = self.connection.execute(
-            "SELECT name, sql FROM sqlite_master WHERE type='trigger' "
-            "AND tbl_name='handoffs' ORDER BY name"
-        ).fetchall()
-        if table_sql_row is None or len(trigger_rows) != 2:
-            raise LegacyAuthorityStoreError(
-                "LEGACY authority transitional handoff schema mismatch"
-            )
-        canonical_table_sql = str(table_sql_row["sql"]).replace(
-            "envelope_fingerprint TEXT NOT NULL UNIQUE",
-            "envelope_fingerprint TEXT NOT NULL",
-        )
-        trigger_sql = tuple(str(row["sql"]) for row in trigger_rows)
-        self.connection.execute("DROP TRIGGER handoffs_immutable_delete")
-        self.connection.execute("DROP TRIGGER handoffs_immutable_update")
-        self.connection.execute("ALTER TABLE handoffs RENAME TO handoffs_inline_old")
-        self.connection.execute(canonical_table_sql)
-        self.connection.execute(
-            "INSERT INTO handoffs SELECT * FROM handoffs_inline_old"
-        )
-        self.connection.execute("DROP TABLE handoffs_inline_old")
-        for statement in trigger_sql:
-            self.connection.execute(statement)
-
     def schema_metadata(self) -> Mapping[str, str]:
         return {row["key"]: row["value"] for row in self.connection.execute("SELECT key, value FROM schema_meta")}
 
@@ -268,3 +203,23 @@ class LegacyAuthorityStore(
     def _require_live(self) -> None:
         if self._quarantined:
             raise StoreQuarantinedError("LEGACY authority store is quarantined")
+
+    def _verify_observation_attestation(self, evidence: ObservationEvidence) -> str:
+        if self._observation_identity is None or self._observation_key_provider is None:
+            raise LegacyAuthorityStoreError("trusted observation verifier is not configured")
+        expected = observation_attestation(evidence, self._observation_identity, self._observation_key_provider)
+        if not hmac.compare_digest(evidence.attestation_fingerprint, expected):
+            raise LegacyAuthorityStoreError("detached observation attestation is invalid")
+        return expected
+
+
+class LegacyAuthorityStoreFactory:
+    def __init__(self, observation_identity: str, observation_key_provider: HmacKeyProvider) -> None:
+        self._observation_identity = observation_identity
+        self._observation_key_provider = observation_key_provider
+
+    def create(self, path: Path) -> LegacyAuthorityStore:
+        return LegacyAuthorityStore._create(path, self._observation_identity, self._observation_key_provider)
+
+    def open(self, path: Path) -> LegacyAuthorityStore:
+        return LegacyAuthorityStore._open(path, self._observation_identity, self._observation_key_provider)

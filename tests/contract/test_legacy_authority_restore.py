@@ -14,6 +14,7 @@ sys.path.insert(0, str(ROOT / "webapp" / "backend"))
 
 from repositories.legacy_authority_store import (
     LegacyAuthorityStore,
+    LegacyAuthorityStoreFactory,
     StoreQuarantinedError,
     TransitionError,
     legacy_store_path,
@@ -25,6 +26,16 @@ from repositories.legacy_authority_types import (
     Receipt,
     ReceiptState,
 )
+from services.legacy_observation_materializer import (
+    ObservationEvidence,
+    ObservationMaterializer,
+)
+from services.legacy_observation_trust import observation_attestation
+
+
+class TestKeyProvider:
+    def key_for(self, _identity: str) -> bytes:
+        return b"test-observation-key"
 
 
 def valid_handoff() -> Handoff:
@@ -45,6 +56,21 @@ def valid_handoff() -> Handoff:
         fence_counter=11,
         exporter_identity="exporter:one",
         exporter_attestation="attestation:one",
+    )
+
+
+def closeable_observation(store: LegacyAuthorityStore, receipt: Receipt) -> None:
+    unsigned = ObservationEvidence(
+        "boundary-42", 42, 43, "snapshot-43", "2026-09-22T00:00:00+00:00",
+        "materializer-run-1", "sha256:source-1", receipt.source_identity_ref,
+        receipt.canary_run_id, receipt.fence_identity, receipt.fence_counter,
+        receipt.target_ref, receipt.requested_state, receipt.requested_state,
+        "pending",
+    )
+    signed = replace(unsigned, attestation_fingerprint=observation_attestation(unsigned, "materializer:one", TestKeyProvider()))
+    ObservationMaterializer(store).record_ack(
+        receipt,
+        signed,
     )
 
 
@@ -133,16 +159,21 @@ class LegacyAuthorityRestoreTests(unittest.TestCase):
             self.assertEqual(store.get_fence("send-1")["state"], FenceState.OBSERVATION_PENDING.value)
 
             store.append_observation_boundary(applied, "boundary-42", 42)
-            store.close_fence("send-1")
-            self.assertEqual(store.get_fence("send-1")["state"], FenceState.CLOSED.value)
+            with self.assertRaises(TransitionError):
+                store.transition_fence("send-1", FenceState.CLOSED)
+            with self.assertRaises(TransitionError):
+                store.close_fence("send-1")
             store.close()
 
     def test_closed_applied_receipt_rejects_late_observation_boundary(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            store = LegacyAuthorityStore.create(legacy_store_path(Path(temporary)))
+            store = LegacyAuthorityStoreFactory("materializer:one", TestKeyProvider()).create(
+                legacy_store_path(Path(temporary))
+            )
             store.add_authorization(valid_handoff(), valid_artifact())
             applied = self._applied_receipt(store)
-            store.append_observation_boundary(applied, "boundary-42", 42)
+            bounded = store.append_observation_boundary(applied, "boundary-42", 42)
+            closeable_observation(store, bounded)
             store.mark_observation_pending("send-1")
             store.close_fence("send-1")
 

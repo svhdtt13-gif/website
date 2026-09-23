@@ -10,6 +10,11 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "webapp" / "backend"))
 
+from repositories.legacy_authority_schema import (
+    SCHEMA_CHECKSUM,
+    SCHEMA_IDENTITY,
+    schema_identity,
+)
 from repositories.legacy_authority_store import (
     LegacyAuthorityStore,
     ReceiptConflictError,
@@ -92,8 +97,9 @@ class LegacyAuthorityStoreTests(unittest.TestCase):
         metadata = self.store.schema_metadata()
 
         self.assertEqual(metadata["store_kind"], "legacy_canary_authority")
-        self.assertEqual(metadata["schema_version"], "4")
-        self.assertEqual(len(metadata["schema_checksum"]), 64)
+        self.assertEqual(metadata["schema_version"], "5")
+        self.assertEqual(metadata["schema_checksum"], SCHEMA_CHECKSUM)
+        self.assertEqual(schema_identity(self.store.connection), SCHEMA_IDENTITY)
         with self.assertRaises(sqlite3.DatabaseError):
             self.store.connection.execute("ATTACH DATABASE ':memory:' AS forbidden")
 

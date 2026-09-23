@@ -17,6 +17,8 @@ from repositories.legacy_authority_schema import (
     TRANSITIONAL_INLINE_UNIQUE_SCHEMA_SQL,
     V3_SCHEMA_CHECKSUM,
     V3_SCHEMA_SQL,
+    V4_SCHEMA_CHECKSUM,
+    V4_SCHEMA_SQL,
 )
 from repositories.legacy_authority_store import (
     LegacyAuthorityStore,
@@ -83,10 +85,26 @@ class LegacyAuthorityMigrationTests(unittest.TestCase):
         )
         return connection
 
+    def create_v4(self, *, checksum: str = V4_SCHEMA_CHECKSUM) -> sqlite3.Connection:
+        connection = sqlite3.connect(self.path)
+        connection.execute("PRAGMA journal_mode = WAL")
+        connection.executescript(V4_SCHEMA_SQL)
+        connection.executemany(
+            "INSERT INTO schema_meta(key, value) VALUES (?, ?)",
+            (
+                ("store_kind", "legacy_canary_authority"),
+                ("schema_version", "4"),
+                ("schema_checksum", checksum),
+                ("restore_state", "canonical"),
+                ("restore_marker", ""),
+            ),
+        )
+        return connection
+
     def test_frozen_v3_checksum_matches_pre_unique_schema(self) -> None:
         self.assertEqual(V3_SCHEMA_CHECKSUM, FROZEN_V3_CHECKSUM)
 
-    def test_create_builds_only_canonical_v4(self) -> None:
+    def test_create_builds_only_canonical_v5(self) -> None:
         store = LegacyAuthorityStore.create(self.path)
         try:
             metadata = store.schema_metadata()
@@ -95,7 +113,7 @@ class LegacyAuthorityMigrationTests(unittest.TestCase):
                 "AND name='unique_handoffs_envelope_fingerprint'"
             ).fetchone()
 
-            self.assertEqual(metadata["schema_version"], "4")
+            self.assertEqual(metadata["schema_version"], "5")
             self.assertEqual(metadata["schema_checksum"], SCHEMA_CHECKSUM)
             self.assertIsNotNone(index)
         finally:
@@ -113,7 +131,7 @@ class LegacyAuthorityMigrationTests(unittest.TestCase):
 
         store = LegacyAuthorityStore.open(self.path)
         try:
-            self.assertEqual(store.schema_metadata()["schema_version"], "4")
+            self.assertEqual(store.schema_metadata()["schema_version"], "5")
             self.assertEqual(
                 store.connection.execute("SELECT COUNT(*) FROM handoffs").fetchone()[0],
                 1,
@@ -124,7 +142,7 @@ class LegacyAuthorityMigrationTests(unittest.TestCase):
         reopened = LegacyAuthorityStore.open(self.path)
         reopened.close()
 
-    def test_inline_unique_transitional_database_is_canonicalized_to_v4(self) -> None:
+    def test_inline_unique_transitional_database_is_canonicalized_to_v5(self) -> None:
         connection = sqlite3.connect(self.path)
         connection.execute("PRAGMA journal_mode = WAL")
         connection.executescript(TRANSITIONAL_INLINE_UNIQUE_SCHEMA_SQL)
@@ -154,7 +172,7 @@ class LegacyAuthorityMigrationTests(unittest.TestCase):
             handoffs_sql = store.connection.execute(
                 "SELECT sql FROM sqlite_master WHERE type='table' AND name='handoffs'"
             ).fetchone()[0]
-            self.assertEqual(store.schema_metadata()["schema_version"], "4")
+            self.assertEqual(store.schema_metadata()["schema_version"], "5")
             self.assertNotIn("envelope_fingerprint TEXT NOT NULL UNIQUE", handoffs_sql)
             self.assertEqual(
                 store.connection.execute("SELECT COUNT(*) FROM handoffs").fetchone()[0],
@@ -220,7 +238,66 @@ class LegacyAuthorityMigrationTests(unittest.TestCase):
         with ThreadPoolExecutor(max_workers=2) as executor:
             versions = list(executor.map(lambda _index: open_version(), range(2)))
 
-        self.assertEqual(versions, ["4", "4"])
+        self.assertEqual(versions, ["5", "5"])
+
+    def test_canonical_v4_is_upgraded_to_v5_without_losing_rows(self) -> None:
+        connection = self.create_v4()
+        _insert_v3_handoff(connection, suffix="1", envelope_fingerprint="sha256:envelope-1")
+        connection.commit()
+        connection.close()
+
+        store = LegacyAuthorityStore.open(self.path)
+        try:
+            self.assertEqual(store.schema_metadata()["schema_version"], "5")
+            self.assertEqual(store.schema_metadata()["schema_checksum"], SCHEMA_CHECKSUM)
+            self.assertEqual(store.connection.execute("SELECT COUNT(*) FROM handoffs").fetchone()[0], 1)
+        finally:
+            store.close()
+
+    def test_poisoned_v4_artifact_lineage_is_rejected(self) -> None:
+        connection = self.create_v4()
+        _insert_v3_handoff(
+            connection,
+            suffix="1",
+            envelope_fingerprint="sha256:envelope-1",
+        )
+        connection.execute(
+            "INSERT INTO authorization_artifacts ("
+            "handoff_id,pre_send_identity,canary_idempotency_key,canary_run_id,"
+            "fence_identity,authority_epoch,fence_counter,source_identity_ref,"
+            "artifact_producer_identity,source_envelope_contract_version,"
+            "transport_contract_version,contract_version,envelope_exporter_identity,"
+            "operation_kind,target_ref,requested_state,"
+            "pre_operation_observation_generation_floor,envelope_fingerprint,"
+            "authorization_artifact_fingerprint) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                "handoff-1", "send-1", "idem-1", "run-1", "fence:run-1:1",
+                "epoch-1", 1, "legacy-source:one", "producer:one", "is3b1.v1",
+                "is3b2.v1", "is3b2.v1", "exporter:one", "group_on", "client:evil",
+                "running", 41, "sha256:envelope-1", "sha256:artifact-1",
+            ),
+        )
+        connection.commit()
+        connection.close()
+
+        with self.assertRaises(LegacyAuthorityStoreError):
+            LegacyAuthorityStore.open(self.path)
+
+        with closing(sqlite3.connect(self.path)) as inspection:
+            metadata = dict(inspection.execute("SELECT key, value FROM schema_meta"))
+            self.assertEqual(metadata["schema_version"], "4")
+
+    def test_bad_v4_metadata_is_rejected_without_migration(self) -> None:
+        connection = self.create_v4(checksum="0" * 64)
+        connection.commit()
+        connection.close()
+
+        with self.assertRaises(LegacyAuthorityStoreError):
+            LegacyAuthorityStore.open(self.path)
+        with closing(sqlite3.connect(self.path)) as inspection:
+            metadata = dict(inspection.execute("SELECT key, value FROM schema_meta"))
+            self.assertEqual(metadata["schema_version"], "4")
+            self.assertEqual(metadata["schema_checksum"], "0" * 64)
 
 
 if __name__ == "__main__":

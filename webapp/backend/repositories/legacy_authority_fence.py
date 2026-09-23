@@ -4,8 +4,9 @@ import sqlite3
 from contextlib import AbstractContextManager
 from typing import Final, Protocol
 
+from repositories.legacy_authority_observation import ObservationEvidence
 from repositories.legacy_authority_store_types import LegacyAuthorityStoreError
-from repositories.legacy_authority_types import FenceState
+from repositories.legacy_authority_types import REQUESTED_STATE, FenceState
 
 
 class TransitionError(LegacyAuthorityStoreError):
@@ -24,6 +25,10 @@ class _FenceHost(Protocol):
     def get_fence(self, identity: str) -> sqlite3.Row | None: ...
 
     def _transition_fence(self, identity: str, state: FenceState) -> None: ...
+
+    def _verify_generation_locked(self) -> None: ...
+
+    def _verify_observation_attestation(self, evidence: ObservationEvidence) -> str: ...
 
 
 _ALLOWED_TRANSITIONS: Final = {
@@ -92,6 +97,58 @@ class FenceLifecycleMixin:
         row = self.get_fence(identity)
         if row is None:
             raise TransitionError("fence is missing")
+        if state is FenceState.CLOSED:
+            receipt = self.connection.execute(
+                "SELECT * FROM receipts WHERE pre_send_identity=?",
+                (identity,),
+            ).fetchone()
+            if row["state"] == FenceState.OBSERVATION_PENDING.value and receipt is not None and receipt["state"] == "not_applied_proven":
+                raise TransitionError("observation-pending fence cannot close a proven non-applied receipt")
+            if receipt is not None and receipt["state"] == "applied" and (
+                receipt["post_dispatch_observation_boundary_id"] is None
+                or receipt["post_dispatch_observation_generation_floor"] is None
+                or self.connection.execute(
+                    "SELECT 1 FROM observation_materializer_acks WHERE receipt_identity=?",
+                    (identity,),
+                ).fetchone() is None
+            ):
+                raise TransitionError("applied receipt requires observation evidence before closure")
+            if receipt is not None and receipt["state"] == "applied":
+                self._verify_generation_locked()
+                ack = self.connection.execute(
+                    "SELECT boundary_id,generation_floor FROM observation_materializer_acks WHERE receipt_identity=?",
+                    (identity,),
+                ).fetchone()
+                if ack is None or ack[0] != receipt["post_dispatch_observation_boundary_id"] or ack[1] != receipt["post_dispatch_observation_generation_floor"]:
+                    raise TransitionError("applied receipt observation evidence binding is invalid")
+                evidence = self.connection.execute(
+                    "SELECT boundary_id,generation_floor,generation_id,snapshot_id,captured_at,materializer_run_id,source_hash,source_identity_ref,canary_run_id,fence_identity,fence_counter,target_ref,requested_state,observed_state,attestation_fingerprint FROM observation_materializer_acks WHERE receipt_identity=?",
+                    (identity,),
+                ).fetchone()
+                if evidence is None:
+                    raise TransitionError("applied receipt observation evidence is missing")
+                if (
+                    evidence["source_identity_ref"],
+                    evidence["canary_run_id"],
+                    evidence["fence_identity"],
+                    evidence["fence_counter"],
+                    evidence["target_ref"],
+                    evidence["requested_state"],
+                    evidence["observed_state"],
+                ) != (
+                    receipt["source_identity_ref"],
+                    receipt["canary_run_id"],
+                    receipt["fence_identity"],
+                    receipt["fence_counter"],
+                    receipt["target_ref"],
+                    REQUESTED_STATE,
+                    REQUESTED_STATE,
+                ):
+                    raise TransitionError("applied receipt observation lineage is invalid")
+                try:
+                    self._verify_observation_attestation(ObservationEvidence(*evidence))
+                except (LegacyAuthorityStoreError, ValueError) as error:
+                    raise TransitionError("applied receipt observation attestation is invalid") from error
         current = FenceState(row["state"])
         if state not in _ALLOWED_TRANSITIONS.get(current, ()):
             raise TransitionError("invalid fence transition")

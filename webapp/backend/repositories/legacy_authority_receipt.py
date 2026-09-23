@@ -107,12 +107,36 @@ class ReceiptLifecycleMixin:
         self._require_live()
         if receipt.state is not ReceiptState.APPLIED:
             raise TransitionError("observation boundary requires an applied receipt")
-        if not boundary_id or boundary_id != boundary_id.strip() or generation_floor <= receipt.pre_operation_observation_generation_floor:
+        if not boundary_id or boundary_id != boundary_id.strip():
             raise TransitionError("invalid post-dispatch observation boundary")
         with self._immediate():
             existing = self._receipt_row(receipt.pre_send_identity)
             if existing is None:
                 raise TransitionError("receipt is missing")
+            if (
+                receipt.envelope_fingerprint,
+                receipt.canary_run_id,
+                receipt.fence_identity,
+                receipt.authority_epoch,
+                receipt.fence_counter,
+                receipt.source_identity_ref,
+                receipt.target_ref,
+                receipt.state.value,
+                receipt.pre_operation_observation_generation_floor,
+            ) != (
+                existing["envelope_fingerprint"],
+                existing["canary_run_id"],
+                existing["fence_identity"],
+                existing["authority_epoch"],
+                existing["fence_counter"],
+                existing["source_identity_ref"],
+                existing["target_ref"],
+                existing["state"],
+                existing["pre_operation_observation_generation_floor"],
+            ):
+                raise ReceiptConflictError("receipt observation floor does not match durable lineage")
+            if generation_floor <= existing["pre_operation_observation_generation_floor"]:
+                raise TransitionError("invalid post-dispatch observation boundary")
             fence = self.get_fence(receipt.pre_send_identity)
             if fence is None or fence["state"] not in (
                 FenceState.RECEIPT_TERMINAL.value,
@@ -123,18 +147,37 @@ class ReceiptLifecycleMixin:
                 if existing["post_dispatch_observation_boundary_id"] == boundary_id and existing["post_dispatch_observation_generation_floor"] == generation_floor:
                     return self._receipt(existing, fence["state"])
                 raise ReceiptConflictError("observation boundary conflict")
+            sequence = self.connection.execute(
+                "SELECT last_generation_floor FROM observation_boundary_sequence WHERE key='global'"
+            ).fetchone()
+            if sequence is None or generation_floor <= sequence[0]:
+                raise TransitionError("observation boundary floor is not fresh")
             changed = self.connection.execute(
-                "UPDATE receipts SET post_dispatch_observation_boundary_id=?,post_dispatch_observation_generation_floor=? WHERE pre_send_identity=? AND envelope_fingerprint=? AND canary_run_id=? AND fence_identity=? AND fence_counter=? AND state=? AND post_dispatch_observation_boundary_id IS NULL AND post_dispatch_observation_generation_floor IS NULL",
-                (boundary_id, generation_floor, receipt.pre_send_identity, receipt.envelope_fingerprint, receipt.canary_run_id, receipt.fence_identity, receipt.fence_counter, ReceiptState.APPLIED.value),
+                "UPDATE receipts SET post_dispatch_observation_boundary_id=?,post_dispatch_observation_generation_floor=? WHERE pre_send_identity=? AND envelope_fingerprint=? AND canary_run_id=? AND fence_identity=? AND fence_counter=? AND pre_operation_observation_generation_floor=? AND state=? AND post_dispatch_observation_boundary_id IS NULL AND post_dispatch_observation_generation_floor IS NULL",
+                (boundary_id, generation_floor, receipt.pre_send_identity, receipt.envelope_fingerprint, receipt.canary_run_id, receipt.fence_identity, receipt.fence_counter, existing["pre_operation_observation_generation_floor"], ReceiptState.APPLIED.value),
             ).rowcount
             if changed != 1:
                 raise TransitionError("observation boundary CAS lost")
+            self.connection.execute(
+                "INSERT INTO observation_boundaries(boundary_id,pre_send_identity,generation_floor,allocated_after_terminal) VALUES (?,?,?,1)",
+                (boundary_id, receipt.pre_send_identity, generation_floor),
+            )
+            if fence["state"] == FenceState.RECEIPT_TERMINAL.value:
+                self._transition_fence(receipt.pre_send_identity, FenceState.OBSERVATION_PENDING)
+            self.connection.execute(
+                "UPDATE observation_boundary_sequence SET last_generation_floor=? WHERE key='global' AND last_generation_floor<?",
+                (generation_floor, generation_floor),
+            )
         return self.get_receipt(receipt.pre_send_identity)
 
     def mark_observation_pending(self: _ReceiptHost, identity: str) -> None:
         self._require_live()
         with self._immediate():
-            self._transition_fence(identity, FenceState.OBSERVATION_PENDING)
+            fence = self.get_fence(identity)
+            if fence is None:
+                raise TransitionError("fence is missing")
+            if fence["state"] != FenceState.OBSERVATION_PENDING.value:
+                self._transition_fence(identity, FenceState.OBSERVATION_PENDING)
 
     def close_fence(self: _ReceiptHost, identity: str) -> None:
         self._require_live()
@@ -145,6 +188,11 @@ class ReceiptLifecycleMixin:
                 or receipt["post_dispatch_observation_generation_floor"] is None
             ):
                 raise TransitionError("applied receipt requires an observation boundary before closure")
+            if receipt is not None and receipt["state"] == ReceiptState.APPLIED.value and self.connection.execute(
+                "SELECT 1 FROM observation_materializer_acks WHERE receipt_identity=?",
+                (identity,),
+            ).fetchone() is None:
+                raise TransitionError("applied receipt requires observation evidence before closure")
             self._transition_fence(identity, FenceState.CLOSED)
 
     def get_receipt(self: _ReceiptHost, identity: str) -> Receipt:

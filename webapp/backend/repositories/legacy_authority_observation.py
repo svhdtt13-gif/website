@@ -46,8 +46,8 @@ class ObservationEvidence:
             _reference(getattr(self, name), name)
         if type(self.generation_floor) is not int or type(self.snapshot_generation_id) is not int:
             raise ObservationMaterializerError("generation values must be integers")
-        if self.generation_floor < 0 or self.snapshot_generation_id < 0:
-            raise ObservationMaterializerError("snapshot generation values must be non-negative")
+        if self.generation_floor < 0 or self.snapshot_generation_id <= self.generation_floor:
+            raise ObservationMaterializerError("snapshot generation must be later than generation floor")
         if type(self.fence_counter) is not int or self.fence_counter < 1:
             raise ObservationMaterializerError("fence_counter must be positive")
         try:

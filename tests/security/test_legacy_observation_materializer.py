@@ -155,6 +155,11 @@ class LegacyObservationMaterializerTests(unittest.TestCase):
         self.assertEqual(authority_generation_id, 43)
         self.assertEqual(stored_snapshot_generation_id, 999)
 
+    def test_stale_snapshot_generation_is_rejected(self) -> None:
+        for snapshot_generation_id in (41, 42):
+            with self.subTest(snapshot_generation_id=snapshot_generation_id), self.assertRaises(ObservationMaterializerError):
+                evidence(snapshot_generation_id=snapshot_generation_id)
+
     def test_ack_is_append_only_and_authority_is_same_store(self) -> None:
         self.materializer.record_ack(self.receipt, evidence())
         self.assertIsNotNone(self.store.connection.execute("SELECT 1 FROM observation_boundaries").fetchone())

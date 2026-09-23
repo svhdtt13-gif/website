@@ -96,7 +96,7 @@ CREATE TABLE observation_materializer_acks (
  materializer_run_id TEXT NOT NULL, source_hash TEXT NOT NULL, source_identity_ref TEXT NOT NULL, canary_run_id TEXT NOT NULL,
  fence_identity TEXT NOT NULL, fence_counter INTEGER NOT NULL, target_ref TEXT NOT NULL, requested_state TEXT NOT NULL,
  observed_state TEXT NOT NULL, attestation_fingerprint TEXT NOT NULL,
- CHECK (generation_id > generation_floor), CHECK (fence_counter > 0)
+  CHECK (generation_id > generation_floor), CHECK (snapshot_generation_id > generation_floor), CHECK (fence_counter > 0)
 );
 CREATE TABLE observation_generation_ledger (
  generation_id INTEGER PRIMARY KEY, generation_floor INTEGER NOT NULL, record_digest TEXT NOT NULL UNIQUE,

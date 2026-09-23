@@ -83,7 +83,51 @@ V4_UNIQUE_INDEX_SQL: Final = """
 CREATE UNIQUE INDEX unique_handoffs_envelope_fingerprint
  ON handoffs(envelope_fingerprint);
 """
-SCHEMA_SQL: Final = V3_SCHEMA_SQL + V4_UNIQUE_INDEX_SQL
+V4_SCHEMA_SQL: Final = V3_SCHEMA_SQL + V4_UNIQUE_INDEX_SQL
+
+V5_OBSERVATION_SQL: Final = """
+CREATE TABLE observation_boundaries (
+ boundary_id TEXT PRIMARY KEY, pre_send_identity TEXT NOT NULL UNIQUE REFERENCES receipts(pre_send_identity),
+ generation_floor INTEGER NOT NULL, allocated_after_terminal INTEGER NOT NULL CHECK (allocated_after_terminal = 1)
+);
+CREATE TABLE observation_materializer_acks (
+ receipt_identity TEXT PRIMARY KEY REFERENCES receipts(pre_send_identity), boundary_id TEXT NOT NULL UNIQUE REFERENCES observation_boundaries(boundary_id),
+ generation_floor INTEGER NOT NULL, generation_id INTEGER NOT NULL UNIQUE, snapshot_id TEXT NOT NULL, captured_at TEXT NOT NULL,
+ materializer_run_id TEXT NOT NULL, source_hash TEXT NOT NULL, source_identity_ref TEXT NOT NULL, canary_run_id TEXT NOT NULL,
+ fence_identity TEXT NOT NULL, fence_counter INTEGER NOT NULL, target_ref TEXT NOT NULL, requested_state TEXT NOT NULL,
+ observed_state TEXT NOT NULL, attestation_fingerprint TEXT NOT NULL,
+ CHECK (generation_id > generation_floor), CHECK (fence_counter > 0)
+);
+CREATE TABLE observation_generation_ledger (
+ generation_id INTEGER PRIMARY KEY, generation_floor INTEGER NOT NULL, record_digest TEXT NOT NULL UNIQUE,
+ previous_digest TEXT NOT NULL, attestation_fingerprint TEXT NOT NULL, CHECK (generation_id > generation_floor)
+);
+CREATE TABLE observation_generation_sequence (
+ key TEXT PRIMARY KEY, last_generation_id INTEGER NOT NULL CHECK (last_generation_id >= 0), last_record_digest TEXT NOT NULL
+);
+CREATE TABLE observation_boundary_sequence (
+ key TEXT PRIMARY KEY, last_generation_floor INTEGER NOT NULL CHECK (last_generation_floor >= 0)
+);
+CREATE TRIGGER observation_boundary_immutable_update BEFORE UPDATE ON observation_boundaries
+ BEGIN SELECT RAISE(ABORT, 'observation boundary immutable'); END;
+CREATE TRIGGER observation_boundary_immutable_delete BEFORE DELETE ON observation_boundaries
+ BEGIN SELECT RAISE(ABORT, 'observation boundary immutable'); END;
+CREATE TRIGGER observation_ack_immutable_update BEFORE UPDATE ON observation_materializer_acks
+ BEGIN SELECT RAISE(ABORT, 'observation ACK immutable'); END;
+CREATE TRIGGER observation_ack_immutable_delete BEFORE DELETE ON observation_materializer_acks
+ BEGIN SELECT RAISE(ABORT, 'observation ACK immutable'); END;
+CREATE TRIGGER observation_generation_immutable_update BEFORE UPDATE ON observation_generation_ledger
+ BEGIN SELECT RAISE(ABORT, 'observation generation immutable'); END;
+CREATE TRIGGER observation_generation_immutable_delete BEFORE DELETE ON observation_generation_ledger
+ BEGIN SELECT RAISE(ABORT, 'observation generation immutable'); END;
+CREATE TRIGGER observation_ack_requires_generation BEFORE INSERT ON observation_materializer_acks
+ WHEN NOT EXISTS (SELECT 1 FROM observation_generation_ledger AS ledger
+   WHERE ledger.generation_id = NEW.generation_id
+   AND ledger.generation_floor = NEW.generation_floor
+   AND ledger.attestation_fingerprint = NEW.attestation_fingerprint)
+ BEGIN SELECT RAISE(ABORT, 'observation ACK requires generation ledger'); END;
+"""
+SCHEMA_SQL: Final = V4_SCHEMA_SQL + V5_OBSERVATION_SQL
 
 TRANSITIONAL_INLINE_UNIQUE_SCHEMA_SQL: Final = V3_SCHEMA_SQL.replace(
     "envelope_fingerprint TEXT NOT NULL, canonical_envelope_json",
@@ -115,6 +159,8 @@ def _expected_schema_identity(sql: str) -> str:
 
 V3_SCHEMA_CHECKSUM: Final = _schema_checksum(V3_SCHEMA_SQL)
 V3_SCHEMA_IDENTITY: Final = _expected_schema_identity(V3_SCHEMA_SQL)
+V4_SCHEMA_CHECKSUM: Final = _schema_checksum(V4_SCHEMA_SQL)
+V4_SCHEMA_IDENTITY: Final = _expected_schema_identity(V4_SCHEMA_SQL)
 TRANSITIONAL_INLINE_UNIQUE_SCHEMA_CHECKSUM: Final = _schema_checksum(
     TRANSITIONAL_INLINE_UNIQUE_SCHEMA_SQL
 )

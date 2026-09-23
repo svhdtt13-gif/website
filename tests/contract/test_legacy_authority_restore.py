@@ -158,7 +158,7 @@ class LegacyAuthorityRestoreTests(unittest.TestCase):
                 store.close_fence("send-1")
             self.assertEqual(store.get_fence("send-1")["state"], FenceState.OBSERVATION_PENDING.value)
 
-            store.append_observation_boundary(applied, "boundary-42", 42)
+            store.append_observation_boundary(applied, "boundary-42")
             with self.assertRaises(TransitionError):
                 store.transition_fence("send-1", FenceState.CLOSED)
             with self.assertRaises(TransitionError):
@@ -172,13 +172,13 @@ class LegacyAuthorityRestoreTests(unittest.TestCase):
             )
             store.add_authorization(valid_handoff(), valid_artifact())
             applied = self._applied_receipt(store)
-            bounded = store.append_observation_boundary(applied, "boundary-42", 42)
+            bounded = store.append_observation_boundary(applied, "boundary-42")
             closeable_observation(store, bounded)
             store.mark_observation_pending("send-1")
             store.close_fence("send-1")
 
             with self.assertRaises(TransitionError):
-                store.append_observation_boundary(applied, "boundary-43", 43)
+                store.append_observation_boundary(applied, "boundary-43")
             store.close()
 
     def test_abandoned_applied_receipt_rejects_late_observation_boundary(self) -> None:
@@ -190,7 +190,7 @@ class LegacyAuthorityRestoreTests(unittest.TestCase):
             store.transition_fence("send-1", FenceState.ABANDONED)
 
             with self.assertRaises(TransitionError):
-                store.append_observation_boundary(applied, "boundary-43", 43)
+                store.append_observation_boundary(applied, "boundary-43")
             receipt = store.get_receipt("send-1")
             self.assertIsNone(receipt.post_dispatch_observation_boundary_id)
             self.assertIsNone(receipt.post_dispatch_observation_generation_floor)

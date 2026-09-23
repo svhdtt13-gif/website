@@ -4,7 +4,10 @@ import sqlite3
 from contextlib import AbstractContextManager
 from typing import Final, Protocol
 
-from repositories.legacy_authority_observation import ObservationEvidence
+from repositories.legacy_authority_observation import (
+    ObservationEvidence,
+    _evidence_from_ack_row,
+)
 from repositories.legacy_authority_store_types import LegacyAuthorityStoreError
 from repositories.legacy_authority_types import REQUESTED_STATE, FenceState
 
@@ -122,19 +125,20 @@ class FenceLifecycleMixin:
                 if ack is None or ack[0] != receipt["post_dispatch_observation_boundary_id"] or ack[1] != receipt["post_dispatch_observation_generation_floor"]:
                     raise TransitionError("applied receipt observation evidence binding is invalid")
                 evidence = self.connection.execute(
-                    "SELECT boundary_id,generation_floor,generation_id,snapshot_id,captured_at,materializer_run_id,source_hash,source_identity_ref,canary_run_id,fence_identity,fence_counter,target_ref,requested_state,observed_state,attestation_fingerprint FROM observation_materializer_acks WHERE receipt_identity=?",
+                    "SELECT * FROM observation_materializer_acks WHERE receipt_identity=?",
                     (identity,),
                 ).fetchone()
                 if evidence is None:
                     raise TransitionError("applied receipt observation evidence is missing")
+                evidence_value = _evidence_from_ack_row(evidence)
                 if (
-                    evidence["source_identity_ref"],
-                    evidence["canary_run_id"],
-                    evidence["fence_identity"],
-                    evidence["fence_counter"],
-                    evidence["target_ref"],
-                    evidence["requested_state"],
-                    evidence["observed_state"],
+                    evidence_value.source_identity_ref,
+                    evidence_value.canary_run_id,
+                    evidence_value.fence_identity,
+                    evidence_value.fence_counter,
+                    evidence_value.target_ref,
+                    evidence_value.requested_state,
+                    evidence_value.observed_state,
                 ) != (
                     receipt["source_identity_ref"],
                     receipt["canary_run_id"],
@@ -146,7 +150,7 @@ class FenceLifecycleMixin:
                 ):
                     raise TransitionError("applied receipt observation lineage is invalid")
                 try:
-                    self._verify_observation_attestation(ObservationEvidence(*evidence))
+                    self._verify_observation_attestation(evidence_value)
                 except (LegacyAuthorityStoreError, ValueError) as error:
                     raise TransitionError("applied receipt observation attestation is invalid") from error
         current = FenceState(row["state"])

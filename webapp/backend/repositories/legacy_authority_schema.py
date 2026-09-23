@@ -92,7 +92,7 @@ CREATE TABLE observation_boundaries (
 );
 CREATE TABLE observation_materializer_acks (
  receipt_identity TEXT PRIMARY KEY REFERENCES receipts(pre_send_identity), boundary_id TEXT NOT NULL UNIQUE REFERENCES observation_boundaries(boundary_id),
- generation_floor INTEGER NOT NULL, generation_id INTEGER NOT NULL UNIQUE, snapshot_id TEXT NOT NULL, captured_at TEXT NOT NULL,
+  generation_floor INTEGER NOT NULL, generation_id INTEGER NOT NULL UNIQUE, snapshot_generation_id INTEGER NOT NULL, snapshot_id TEXT NOT NULL, captured_at TEXT NOT NULL,
  materializer_run_id TEXT NOT NULL, source_hash TEXT NOT NULL, source_identity_ref TEXT NOT NULL, canary_run_id TEXT NOT NULL,
  fence_identity TEXT NOT NULL, fence_counter INTEGER NOT NULL, target_ref TEXT NOT NULL, requested_state TEXT NOT NULL,
  observed_state TEXT NOT NULL, attestation_fingerprint TEXT NOT NULL,

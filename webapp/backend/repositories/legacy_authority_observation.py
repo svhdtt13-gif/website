@@ -23,7 +23,7 @@ class ObservationMaterializerConflict(ObservationMaterializerError):
 class ObservationEvidence:
     boundary_id: str
     generation_floor: int
-    generation_id: int
+    snapshot_generation_id: int
     snapshot_id: str
     captured_at: str
     materializer_run_id: str
@@ -44,10 +44,10 @@ class ObservationEvidence:
             "requested_state", "observed_state", "attestation_fingerprint",
         ):
             _reference(getattr(self, name), name)
-        if type(self.generation_floor) is not int or type(self.generation_id) is not int:
+        if type(self.generation_floor) is not int or type(self.snapshot_generation_id) is not int:
             raise ObservationMaterializerError("generation values must be integers")
-        if self.generation_floor < 0 or self.generation_id <= self.generation_floor:
-            raise ObservationMaterializerError("generation_id must be later than generation_floor")
+        if self.generation_floor < 0 or self.snapshot_generation_id < 0:
+            raise ObservationMaterializerError("snapshot generation values must be non-negative")
         if type(self.fence_counter) is not int or self.fence_counter < 1:
             raise ObservationMaterializerError("fence_counter must be positive")
         try:
@@ -57,7 +57,7 @@ class ObservationEvidence:
 
     def projection(self) -> tuple[str | int, ...]:
         return (
-            self.boundary_id, self.generation_floor, self.generation_id, self.snapshot_id,
+            self.boundary_id, self.generation_floor, self.snapshot_generation_id, self.snapshot_id,
             self.captured_at, self.materializer_run_id, self.source_hash,
             self.source_identity_ref, self.canary_run_id, self.fence_identity,
             self.fence_counter, self.target_ref, self.requested_state,
@@ -94,9 +94,19 @@ def _reference(value: str, field: str) -> None:
         raise ObservationMaterializerError(f"{field} must not contain secret material")
 
 
-def _digest(previous: str, evidence: ObservationEvidence) -> str:
-    payload = json.dumps((previous, evidence.projection()), separators=(",", ":"))
+def _digest(previous: str, authority_generation_id: int, evidence: ObservationEvidence) -> str:
+    payload = json.dumps(
+        (previous, authority_generation_id, evidence.projection()),
+        separators=(",", ":"),
+    )
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _evidence_from_ack_row(row: sqlite3.Row) -> ObservationEvidence:
+    return ObservationEvidence(
+        row[1], row[2], row[4], row[5], row[6], row[7], row[8], row[9],
+        row[10], row[11], row[12], row[13], row[14], row[15], row[16],
+    )
 
 
 class ObservationPersistenceMixin:
@@ -133,29 +143,39 @@ class ObservationPersistenceMixin:
                 "SELECT * FROM observation_materializer_acks WHERE receipt_identity=?",
                 (receipt.pre_send_identity,),
             ).fetchone()
-            values = (receipt.pre_send_identity, *evidence.projection())
-            if existing is not None:
-                if tuple(existing[:16]) != values:
-                    raise ObservationMaterializerConflict("observation ACK conflict")
-                return MaterializerAck(receipt.pre_send_identity, evidence)
             sequence = self.connection.execute(
                 "SELECT last_generation_id,last_record_digest FROM observation_generation_sequence WHERE key='global'"
             ).fetchone()
-            if sequence is None or evidence.generation_id <= sequence[0]:
-                raise ObservationMaterializerError("generation is not globally monotonic")
+            if sequence is None:
+                raise ObservationMaterializerError("observation generation sequence is missing")
+            authority_generation_id = max(
+                int(sequence[0]),
+                evidence.generation_floor,
+            ) + 1
+            values = (
+                receipt.pre_send_identity,
+                evidence.boundary_id,
+                evidence.generation_floor,
+                authority_generation_id,
+                *evidence.projection()[2:],
+            )
+            if existing is not None:
+                if tuple(existing[:3]) + tuple(existing[4:]) != values[:3] + values[4:]:
+                    raise ObservationMaterializerConflict("observation ACK conflict")
+                return MaterializerAck(receipt.pre_send_identity, evidence)
             previous = str(sequence[1])
-            record_digest = _digest(previous, evidence)
+            record_digest = _digest(previous, authority_generation_id, evidence)
             self.connection.execute(
                 "INSERT INTO observation_generation_ledger VALUES (?,?,?,?,?)",
-                (evidence.generation_id, evidence.generation_floor, record_digest, previous, evidence.attestation_fingerprint),
+                (authority_generation_id, evidence.generation_floor, record_digest, previous, evidence.attestation_fingerprint),
             )
             self.connection.execute(
-                "INSERT INTO observation_materializer_acks VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO observation_materializer_acks VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 values,
             )
             self.connection.execute(
                 "UPDATE observation_generation_sequence SET last_generation_id=?,last_record_digest=? WHERE key='global'",
-                (evidence.generation_id, record_digest),
+                (authority_generation_id, record_digest),
             )
         return MaterializerAck(receipt.pre_send_identity, evidence)
 
@@ -178,7 +198,7 @@ class ObservationPersistenceMixin:
             ).fetchone()
             if row is None:
                 raise ObservationMaterializerError("post-dispatch evidence is missing")
-            evidence = ObservationEvidence(*row[1:16])
+            evidence = _evidence_from_ack_row(row)
             if evidence.attestation_fingerprint != self._verify_observation_attestation(evidence):
                 raise ObservationMaterializerError("detached observation attestation is not trusted")
             if (
@@ -210,7 +230,7 @@ class ObservationPersistenceMixin:
                 "SELECT * FROM observation_materializer_acks WHERE generation_id=?",
                 (row[0],),
             ).fetchone()
-            if ack is None or _digest(previous, ObservationEvidence(*ack[1:16])) != row[2]:
+            if ack is None or _digest(previous, row[0], _evidence_from_ack_row(ack)) != row[2]:
                 raise ObservationMaterializerError("observation generation ledger tampered")
             previous = row[2]
             last_id = row[0]

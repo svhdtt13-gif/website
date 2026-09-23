@@ -49,7 +49,7 @@ def artifact() -> AuthorizationArtifact:
 
 def evidence(**changes: str | int) -> ObservationEvidence:
     values: dict[str, str | int] = {
-        "boundary_id": "boundary-42", "generation_floor": 42, "generation_id": 43,
+        "boundary_id": "boundary-42", "generation_floor": 42, "snapshot_generation_id": 43,
         "snapshot_id": "snapshot-43", "captured_at": "2026-09-22T00:00:00+00:00",
         "materializer_run_id": "materializer-run-1", "source_hash": "sha256:source-1",
         "source_identity_ref": "legacy-source:one", "canary_run_id": "run-1",
@@ -79,7 +79,7 @@ class LegacyObservationMaterializerTests(unittest.TestCase):
         accepted = self.store.accept_receipt("send-1", "sha256:envelope-1")
         dispatching = self.store.begin_dispatch(accepted)
         terminal = self.store.terminal_receipt(dispatching, ReceiptState.APPLIED)
-        self.receipt = self.store.append_observation_boundary(terminal, "boundary-42", 42)
+        self.receipt = self.store.append_observation_boundary(terminal, "boundary-42")
         self.materializer = ObservationMaterializer(self.store)
 
     def tearDown(self) -> None:
@@ -96,12 +96,12 @@ class LegacyObservationMaterializerTests(unittest.TestCase):
     def test_boundary_rejects_forged_pre_operation_floor(self) -> None:
         forged = replace(self.receipt, pre_operation_observation_generation_floor=0)
         with self.assertRaises(ReceiptConflictError):
-            self.store.append_observation_boundary(forged, "boundary-43", 43)
+            self.store.append_observation_boundary(forged, "boundary-43")
 
     def test_boundary_rejects_forged_authority_epoch(self) -> None:
         forged = replace(self.receipt, authority_epoch="epoch-forged")
         with self.assertRaises(ReceiptConflictError):
-            self.store.append_observation_boundary(forged, "boundary-43", 43)
+            self.store.append_observation_boundary(forged, "boundary-43")
 
     def test_ack_rejects_forged_pre_operation_floor(self) -> None:
         forged = replace(self.receipt, pre_operation_observation_generation_floor=0)
@@ -130,7 +130,7 @@ class LegacyObservationMaterializerTests(unittest.TestCase):
     def test_conflicting_replay_and_provenance_mismatch_fail_closed(self) -> None:
         self.materializer.record_ack(self.receipt, evidence())
         with self.assertRaises(ObservationMaterializerConflict):
-            self.materializer.record_ack(self.receipt, evidence(generation_id=44))
+            self.materializer.record_ack(self.receipt, evidence(snapshot_generation_id=44))
         mismatched = Receipt(self.receipt.pre_send_identity, self.receipt.envelope_fingerprint, self.receipt.canary_run_id, self.receipt.fence_identity, self.receipt.authority_epoch, self.receipt.fence_counter, self.receipt.state, self.receipt.pre_operation_observation_generation_floor, self.receipt.post_dispatch_observation_boundary_id, self.receipt.post_dispatch_observation_generation_floor, self.receipt.source_identity_ref, "client:two", self.receipt.requested_state)
         with self.assertRaises(ObservationMaterializerError):
             self.materializer.require_evidence(mismatched)
@@ -142,7 +142,18 @@ class LegacyObservationMaterializerTests(unittest.TestCase):
         self.materializer = ObservationMaterializer(self.store)
         second_receipt = replace(self.receipt, pre_send_identity="send-2")
         with self.assertRaises(ObservationMaterializerError):
-            self.materializer.record_ack(second_receipt, evidence(generation_id=43))
+            self.materializer.record_ack(second_receipt, evidence(snapshot_generation_id=43))
+
+    def test_authority_generation_is_store_owned_not_snapshot_selected(self) -> None:
+        self.materializer.record_ack(self.receipt, evidence(snapshot_generation_id=999))
+        authority_generation_id = self.store.connection.execute(
+            "SELECT generation_id FROM observation_generation_ledger"
+        ).fetchone()[0]
+        stored_snapshot_generation_id = self.store.connection.execute(
+            "SELECT snapshot_generation_id FROM observation_materializer_acks"
+        ).fetchone()[0]
+        self.assertEqual(authority_generation_id, 43)
+        self.assertEqual(stored_snapshot_generation_id, 999)
 
     def test_ack_is_append_only_and_authority_is_same_store(self) -> None:
         self.materializer.record_ack(self.receipt, evidence())

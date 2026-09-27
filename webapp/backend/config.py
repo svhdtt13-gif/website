@@ -24,6 +24,19 @@ SQLITE_RUNTIME_DIR = Path(os.environ.get(
 SQLITE_FRESHNESS_SECONDS = int(os.environ.get("SQLITE_FRESHNESS_SECONDS", "60"))
 SQLITE_REFRESH_TIMEOUT_SECONDS = int(os.environ.get("SQLITE_REFRESH_TIMEOUT_SECONDS", "15"))
 SQLITE_MUTEX_NAME = "Local\\WebsiteSQLiteGenerationMutex"
+LEGACY_AUTHORITY_STORE_PATH = Path(os.environ.get(
+    "LEGACY_AUTHORITY_STORE_PATH",
+    str(SQLITE_RUNTIME_DIR / "legacy" / "legacy_canary.sqlite3"),
+))
+SQLITE_TRUSTED_SOURCE_IDENTITY = os.environ.get(
+    "SQLITE_TRUSTED_SOURCE_IDENTITY", ""
+).strip()
+SQLITE_OBSERVATION_MATERIALIZER_IDENTITY = os.environ.get(
+    "SQLITE_OBSERVATION_MATERIALIZER_IDENTITY", ""
+).strip()
+SQLITE_OBSERVATION_MATERIALIZER_KEY = os.environ.get(
+    "SQLITE_OBSERVATION_MATERIALIZER_KEY", ""
+)
 
 # The profile manager reads this store directly in SQLite read-only mode.
 PORTABLE_STORE_PATH = Path(os.environ.get(

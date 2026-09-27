@@ -42,6 +42,14 @@ class AuthorizationContextProvider(Protocol):
     ) -> LegacyAuthorizationContext: ...
 
 
+class VerifiedObservationGenerationProvider(Protocol):
+    def current_observation_generation(self) -> int: ...
+
+    def current_observation_source_set(self) -> str: ...
+
+    def trusted_source_identity(self) -> str: ...
+
+
 class ProductionAuthorizationContextProvider:
     def context_for(
         self, handoff: Handoff, envelope: CanaryEnvelope
@@ -59,6 +67,38 @@ class DeterministicTestAuthorizationContextProvider:
     ) -> LegacyAuthorizationContext:
         del handoff, envelope
         return self.context
+
+
+@dataclass(frozen=True, slots=True)
+class VerifiedRuntimeAuthorizationContextProvider:
+    """Derive the pre-operation floor from the current verified publication."""
+
+    context_provider: AuthorizationContextProvider
+    generation_provider: VerifiedObservationGenerationProvider
+    expected_source_set: str = "wave1"
+
+    def __post_init__(self) -> None:
+        if type(self.expected_source_set) is not str or not self.expected_source_set:
+            raise HandoffTrustError("trusted runtime source set is unavailable")
+
+    def context_for(
+        self, handoff: Handoff, envelope: CanaryEnvelope
+    ) -> LegacyAuthorizationContext:
+        context = self.context_provider.context_for(handoff, envelope)
+        generation = self.generation_provider.current_observation_generation()
+        source_set = self.generation_provider.current_observation_source_set()
+        trusted_source_identity = self.generation_provider.trusted_source_identity()
+        if type(generation) is not int or generation < 1:
+            raise HandoffTrustError("runtime observation generation is invalid")
+        if source_set != self.expected_source_set:
+            raise HandoffTrustError("runtime observation source set is untrusted")
+        if context.source_identity_ref != trusted_source_identity:
+            raise HandoffTrustError("authorization source identity is untrusted")
+        return replace(
+            context,
+            pre_operation_observation_generation_floor=generation,
+            source_identity_ref=trusted_source_identity,
+        )
 
 
 @dataclass(frozen=True, slots=True)

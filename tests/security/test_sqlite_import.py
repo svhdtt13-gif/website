@@ -2,26 +2,29 @@
 """Disposable tests for the Phase 3 candidate importer and SQLite store."""
 import hashlib
 import json
-from pathlib import Path
 import sys
 import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "webapp" / "backend"))
 
-from repositories.sqlite import CandidatePathError, SQLiteCandidateRepository  # noqa: E402
-import services.sqlite_import as sqlite_import  # noqa: E402
-from services.sqlite_import import (  # noqa: E402
-    AiToolHttpSource,
-    FidelityError,
+from repositories.sqlite import (
+    CandidatePathError,
+    SQLiteCandidateRepository,
+)
+from services import sqlite_import
+from services.sqlite_import import (
     SOURCE_ORDER,
     SOURCE_SET_FULL,
     SOURCE_SET_WAVE1,
+    WAVE1_RUNTIME_SOURCE_ORDER,
+    AiToolHttpSource,
+    FidelityError,
     SourceValue,
     UnstableSnapshotError,
-    WAVE1_RUNTIME_SOURCE_ORDER,
     _canonical_bytes,
     capture_stable_snapshot,
     import_candidate,
@@ -147,9 +150,7 @@ class Wave1MutatingSource(FakeSource):
         if not self.changed and len(self.calls) > len(WAVE1_RUNTIME_SOURCE_ORDER):
             if endpoint == self.endpoint:
                 payload = json.loads(value.body.decode("utf-8"))
-                if endpoint == "api/master":
-                    payload["clients"][0]["name"] += "-changed"
-                elif endpoint == "client_database.json":
+                if endpoint == "api/master" or endpoint == "client_database.json":
                     payload["clients"][0]["name"] += "-changed"
                 else:
                     payload["tunnel_port"] += 1
@@ -315,7 +316,10 @@ class SQLiteImportTests(unittest.TestCase):
                 self.assertEqual(source.calls, list(WAVE1_RUNTIME_SOURCE_ORDER) * 2)
 
     def test_runtime_publishes_wave1_and_rejects_non_wave1_manifest(self):
-        from services.sqlite_runtime import GROUP_MASTER_DATABASE, SQLiteRuntimeCoordinator
+        from services.sqlite_runtime import (
+            GROUP_MASTER_DATABASE,
+            SQLiteRuntimeCoordinator,
+        )
 
         with tempfile.TemporaryDirectory() as directory:
             runtime = SQLiteRuntimeCoordinator(
@@ -324,6 +328,7 @@ class SQLiteImportTests(unittest.TestCase):
                 group_enabled={GROUP_MASTER_DATABASE: True},
                 background_refresh=False,
                 source_factory=lambda: FakeSource(fixture_values()),
+                trusted_source_identity="legacy-sole-reader:v1",
             )
             self.assertTrue(runtime.refresh_now(GROUP_MASTER_DATABASE))
             state = runtime.state()

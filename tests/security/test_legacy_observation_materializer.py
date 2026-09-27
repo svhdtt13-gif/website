@@ -25,11 +25,13 @@ from repositories.legacy_authority_types import (
     Receipt,
     ReceiptState,
 )
+from repositories.sqlite import VerifiedTargetObservation
 from services.legacy_observation_materializer import (
     ObservationEvidence,
     ObservationMaterializer,
     ObservationMaterializerConflict,
     ObservationMaterializerError,
+    VerifiedRuntimeSnapshot,
 )
 from services.legacy_observation_trust import observation_attestation
 
@@ -92,6 +94,25 @@ class LegacyObservationMaterializerTests(unittest.TestCase):
         self.assertEqual(self.materializer.require_evidence(self.receipt), ack)
         self.store.close_fence("send-1")
         self.assertEqual(self.store.get_fence("send-1")["state"], FenceState.CLOSED.value)
+
+    def test_runtime_adapter_reloads_authority_and_constructs_signed_evidence(self) -> None:
+        ack = self.materializer.record_verified_runtime_snapshot(
+            "send-1",
+            VerifiedRuntimeSnapshot(
+                snapshot_generation_id=43,
+                snapshot_id="snapshot-43",
+                captured_at="2026-09-22T00:00:00+00:00",
+                source_hash="sha256:source-1",
+                target_observation=VerifiedTargetObservation._from_candidate(
+                    "candidate-run-1", "client:one", "running"
+                ),
+                materializer_run_id="materializer-run-internal",
+            ),
+        )
+        self.assertEqual(ack.evidence.boundary_id, "boundary-42")
+        self.assertEqual(ack.evidence.canary_run_id, "run-1")
+        self.assertEqual(ack.evidence.fence_counter, 11)
+        self.assertTrue(ack.evidence.attestation_fingerprint.startswith("hmac-sha256:"))
 
     def test_boundary_rejects_forged_pre_operation_floor(self) -> None:
         forged = replace(self.receipt, pre_operation_observation_generation_floor=0)

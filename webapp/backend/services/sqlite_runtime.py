@@ -1,27 +1,58 @@
 """Guarded SQLite generation publication, normalized reads, and write fencing."""
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
-from contextlib import contextmanager
-from datetime import datetime, timedelta, timezone
 import ctypes
 import hashlib
 import json
 import os
-from pathlib import Path
 import tempfile
 import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FutureTimeoutError
+from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Protocol
 
 from repositories.aitool import UpstreamError, ai_tool
-from repositories.sqlite import SCHEMA_CHECKSUM, SCHEMA_VERSION, SQLiteCandidateRepository
+from repositories.legacy_authority_store import (
+    LegacyAuthorityStore,
+    LegacyAuthorityStoreError,
+    TransitionError,
+)
+from repositories.sqlite import (
+    SCHEMA_CHECKSUM,
+    SCHEMA_VERSION,
+    SQLiteCandidateRepository,
+)
+
 from services import settings as settings_service
+from services.legacy_observation_materializer import (
+    ObservationMaterializer,
+    ObservationMaterializerError,
+    VerifiedRuntimeSnapshot,
+)
+from services.runtime_observation_generation import (
+    DurableObservationBoundaryProvider,
+    ObservationGenerationContractError,
+    TrustedObservationBoundary,
+    require_non_secret_source_identity,
+)
+from services.runtime_observation_ledger import (
+    ObservationLedgerError,
+    PublicationParity,
+    PublicationRecord,
+    PublicationReservation,
+    RuntimeObservationPublicationLedger,
+    ledger_path,
+)
 from services.sqlite_import import (
-    AiToolHttpSource,
     PUBLIC_SETTINGS_FIELDS,
     SOURCE_SET_WAVE1,
+    WAVE1_RUNTIME_SOURCE_ORDER,
+    AiToolHttpSource,
     SourceAcquisitionError,
     SourceValue,
-    WAVE1_RUNTIME_SOURCE_ORDER,
     _canonical_bytes,
     _json_bytes,
     _sha256,
@@ -40,6 +71,12 @@ ROUTE_ENDPOINTS = {
 }
 MUTEX_NAME = "Local\\WebsiteSQLiteGenerationMutex"
 
+
+class LegacyAuthorityStoreOpener(Protocol):
+    """Open a fresh LEGACY authority connection for one runtime lookup."""
+
+    def __call__(self) -> LegacyAuthorityStore: ...
+
 _FALLBACK_LOCKS = {}
 _FALLBACK_LOCKS_GUARD = threading.Lock()
 
@@ -55,7 +92,7 @@ class NamedGenerationMutex:
         self.name = name
         self.timeout_seconds = timeout_seconds
         with _FALLBACK_LOCKS_GUARD:
-            self._fallback = _FALLBACK_LOCKS.setdefault(name, threading.Lock())
+            self._fallback = _FALLBACK_LOCKS.setdefault(name, threading.RLock())
 
     @contextmanager
     def hold(self, timeout_seconds=None):
@@ -239,6 +276,9 @@ class SQLiteRuntimeCoordinator:
         importer=import_candidate,
         background_refresh=True,
         clock=None,
+        legacy_authority_store_factory: LegacyAuthorityStoreOpener | None = None,
+        trusted_source_identity=None,
+        test_only_observation_boundary_provider=None,
     ):
         self.runtime_dir = Path(runtime_dir)
         self.state_path = self.runtime_dir / "current.json"
@@ -251,6 +291,25 @@ class SQLiteRuntimeCoordinator:
         self._source_factory = source_factory
         self._importer = importer
         self._background_refresh = background_refresh
+        if legacy_authority_store_factory is not None and not callable(
+            legacy_authority_store_factory
+        ):
+            raise RuntimeStateError("LEGACY store factory is not callable")
+        if legacy_authority_store_factory is not None and test_only_observation_boundary_provider is not None:
+            raise RuntimeStateError("production and test boundary providers cannot mix")
+        self._legacy_authority_store_factory = legacy_authority_store_factory
+        self._test_only_observation_boundary_provider = test_only_observation_boundary_provider
+        if trusted_source_identity is not None:
+            try:
+                require_non_secret_source_identity(trusted_source_identity)
+            except ObservationGenerationContractError as error:
+                raise RuntimeStateError(
+                    "trusted runtime source identity is invalid"
+                ) from error
+        self._trusted_source_identity = trusted_source_identity
+        self.ledger = RuntimeObservationPublicationLedger(
+            ledger_path(self.runtime_dir), trusted_source_identity=trusted_source_identity
+        )
         self._refresh_guard = threading.Lock()
         self._refresh_active = False
         self._refresh_pending = set()
@@ -283,6 +342,423 @@ class SQLiteRuntimeCoordinator:
                 },
             )
         return state
+
+    def _verify_publication_candidate(
+        self,
+        publication: PublicationRecord,
+        expected_completed_at: str | None = None,
+        candidate_path: str | None = None,
+    ):
+        candidate = Path(candidate_path or publication.candidate_path).resolve()
+        runtime_root = self.runtime_dir.resolve()
+        try:
+            candidate.relative_to(runtime_root)
+        except ValueError as error:
+            raise RuntimeStateError("publication candidate escapes runtime directory") from error
+        if not candidate.is_file():
+            raise RuntimeStateError("publication candidate is missing")
+        repository = SQLiteCandidateRepository.open_read_only(candidate)
+        verified_target = None
+        try:
+            schema = repository.rows(
+                "SELECT version, checksum FROM schema_migrations ORDER BY version"
+            )
+            if schema != [(SCHEMA_VERSION, SCHEMA_CHECKSUM)]:
+                raise RuntimeStateError("publication candidate schema mismatch")
+            row = repository.rows(
+                "SELECT snapshot_id, source_hash, status, checks_json, "
+                "observation_generation, publication_generation_id, "
+                "observation_source_set, source_identity_ref, observation_boundary_id, "
+                "observation_generation_floor, observation_captured_at, "
+                "observation_completed_at, observation_pre_send_identity, "
+                "observation_canary_run_id, observation_fence_identity, "
+                "observation_authority_epoch, observation_fence_counter, "
+                "observation_target_ref, observation_requested_state, "
+                "observation_binding_fingerprint, observation_materializer_run_id, "
+                "observation_observed_state, observation_attestation_fingerprint "
+                "FROM import_runs WHERE run_id=?",
+                (publication.run_id,),
+            )
+            if len(row) != 1 or row[0][2] != "verified":
+                raise RuntimeStateError("publication candidate is not verified")
+            if (
+                row[0][0] != publication.snapshot_id
+                or row[0][1] != publication.source_hash
+                or row[0][4] != publication.observation_generation
+                or row[0][5] != publication.generation_id
+                or row[0][6] != publication.source_set
+                or row[0][7] != publication.source_identity_ref
+                or row[0][8] != publication.observation_boundary_id
+                or row[0][9] != publication.observation_generation_floor
+                or row[0][10] != publication.captured_at
+                or row[0][11]
+                != (
+                    publication.completed_at
+                    if expected_completed_at is None
+                    else expected_completed_at
+                )
+                or row[0][12] != publication.pre_send_identity
+                or row[0][13] != publication.canary_run_id
+                or row[0][14] != publication.fence_identity
+                or row[0][15] != publication.authority_epoch
+                or row[0][16] != publication.fence_counter
+                or row[0][17] != publication.target_ref
+                or row[0][18] != publication.requested_state
+                or row[0][19] != publication.observation_binding_fingerprint
+                or row[0][20] != publication.materializer_run_id
+                or row[0][21] != publication.observed_state
+            ):
+                raise RuntimeStateError("publication candidate metadata mismatch")
+            checks = json.loads(row[0][3])
+            nested = checks.get("checks") if isinstance(checks, dict) else None
+            if (
+                not isinstance(checks, dict)
+                or checks.get("source_set") != publication.source_set
+                or not isinstance(nested, dict)
+                or nested.get("source_set") != publication.source_set
+            ):
+                raise RuntimeStateError("publication candidate source set mismatch")
+            if publication.observation_boundary_id is not None:
+                verified_target = repository.observed_state_for_target(
+                    publication.run_id,
+                    publication.target_ref,
+                    publication.requested_state,
+                )
+                if verified_target.observed_state != publication.observed_state:
+                    raise RuntimeStateError("publication target observation mismatch")
+        except (TypeError, ValueError, json.JSONDecodeError) as error:
+            raise RuntimeStateError("publication candidate metadata is invalid") from error
+        finally:
+            repository.close()
+        return verified_target
+
+    def _state_from_publication(self, publication: PublicationRecord, state):
+        projection = state if isinstance(state, dict) and state.get("version") == 1 else _default_state()
+        current = {
+            "generation_id": publication.generation_id,
+            "run_id": publication.run_id,
+            "candidate_path": publication.candidate_path,
+            "receipt_id": publication.run_id,
+            "snapshot_id": publication.snapshot_id,
+            "source_hash": publication.source_hash,
+            "source_set": publication.source_set,
+            "source_identity_ref": publication.source_identity_ref,
+            "pre_send_identity": publication.pre_send_identity,
+            "canary_run_id": publication.canary_run_id,
+            "fence_identity": publication.fence_identity,
+            "authority_epoch": publication.authority_epoch,
+            "fence_counter": publication.fence_counter,
+            "target_ref": publication.target_ref,
+            "requested_state": publication.requested_state,
+            "schema_version": publication.candidate_schema_version,
+            "schema_checksum": publication.candidate_schema_checksum,
+            "status": "verified",
+            "captured_at": publication.captured_at,
+            "completed_at": publication.completed_at,
+            "observation_generation": publication.observation_generation,
+            "publication_generation_id": publication.generation_id,
+            "observation_boundary_id": publication.observation_boundary_id,
+            "observation_generation_floor": publication.observation_generation_floor,
+            "observation_binding_fingerprint": publication.observation_binding_fingerprint,
+            "materializer_run_id": publication.materializer_run_id,
+            "observed_state": publication.observed_state,
+            "attestation_fingerprint": publication.attestation_fingerprint,
+        }
+        projection["current"] = current
+        for group in GROUPS:
+            group_state = projection["groups"].get(group, {})
+            if (
+                self.configured_enabled(group)
+                and group_state.get("eligible")
+                and group not in projection.get("fences", {})
+            ):
+                projection["groups"][group] = {
+                    "eligible": True,
+                    "generation_id": publication.generation_id,
+                    "reason": "verified",
+                    "updated_at": publication.completed_at,
+                }
+        return projection
+
+    @staticmethod
+    def _projection_matches_publication(state, publication):
+        current = state.get("current")
+        if not isinstance(current, dict):
+            return False
+        return (
+            current.get("observation_generation") == publication.observation_generation
+            and current.get("generation_id") == publication.generation_id
+            and current.get("snapshot_id") == publication.snapshot_id
+            and current.get("run_id") == publication.run_id
+            and current.get("candidate_path") == publication.candidate_path
+            and current.get("source_hash") == publication.source_hash
+            and current.get("source_set") == publication.source_set
+            and current.get("source_identity_ref") == publication.source_identity_ref
+            and current.get("pre_send_identity") == publication.pre_send_identity
+            and current.get("canary_run_id") == publication.canary_run_id
+            and current.get("fence_identity") == publication.fence_identity
+            and current.get("authority_epoch") == publication.authority_epoch
+            and current.get("fence_counter") == publication.fence_counter
+            and current.get("target_ref") == publication.target_ref
+            and current.get("requested_state") == publication.requested_state
+            and current.get("captured_at") == publication.captured_at
+            and current.get("completed_at") == publication.completed_at
+            and current.get("observation_boundary_id") == publication.observation_boundary_id
+            and current.get("observation_generation_floor") == publication.observation_generation_floor
+            and current.get("observation_binding_fingerprint") == publication.observation_binding_fingerprint
+            and current.get("materializer_run_id") == publication.materializer_run_id
+            and current.get("observed_state") == publication.observed_state
+            and current.get("attestation_fingerprint") == publication.attestation_fingerprint
+            and current.get("schema_version") == publication.candidate_schema_version
+            and current.get("schema_checksum") == publication.candidate_schema_checksum
+            and current.get("status") == "verified"
+        )
+
+    def _ensure_generation_state(self, state, allow_reserved_recovery=False):
+        try:
+            publication = self.ledger.latest_available()
+        except ObservationLedgerError as error:
+            raise ObservationGenerationContractError(str(error)) from error
+        if publication is not None and publication.state in ("finalized", "published"):
+            try:
+                self._verify_publication_candidate(publication)
+                if (
+                    publication.observation_boundary_id is not None
+                    and self._legacy_authority_store_factory is None
+                    and self._test_only_observation_boundary_provider is None
+                ):
+                    raise ObservationGenerationContractError(
+                        "pending boundary requires authority verification"
+                    )
+                if publication.state == "finalized":
+                    publication = self.ledger.publish_finalized(
+                        publication.observation_generation
+                    )
+                if (
+                    publication.observation_boundary_id is not None
+                    and self._legacy_authority_store_factory is not None
+                ):
+                    publication = self._acknowledge_published_authority(publication)
+            except (ObservationGenerationContractError, RuntimeStateError):
+                if publication is not None:
+                    pass
+                elif not allow_reserved_recovery:
+                    raise
+                else:
+                    for target in GROUPS:
+                        self._mark_ineligible_locked(
+                            state, target, "unproven_publication_not_recoverable"
+                        )
+                    return state
+        if publication is not None:
+            if publication.source_identity_ref != self.trusted_source_identity():
+                raise ObservationGenerationContractError(
+                    "ledger source identity does not match trusted runtime identity"
+                )
+            try:
+                self._verify_publication_candidate(publication)
+            except RuntimeStateError:
+                if not allow_reserved_recovery:
+                    raise
+                for target in GROUPS:
+                    self._mark_ineligible_locked(state, target, "published_candidate_unusable")
+                return state
+            if (
+                publication.observation_boundary_id is not None
+                and self._legacy_authority_store_factory is None
+                and self._test_only_observation_boundary_provider is None
+            ):
+                raise ObservationGenerationContractError(
+                    "boundary-bound publication requires authority verification"
+                )
+            if publication.observation_boundary_id is not None and self._legacy_authority_store_factory is not None:
+                try:
+                    self._verify_published_authority_ack(publication)
+                    self._close_published_authority_fence(publication)
+                except ObservationGenerationContractError:
+                    if not allow_reserved_recovery:
+                        raise
+                    for target in GROUPS:
+                        self._mark_ineligible_locked(state, target, "published_authority_ack_unavailable")
+                    return state
+            if not self._projection_matches_publication(state, publication):
+                state = self._state_from_publication(publication, state)
+                _atomic_json(self.state_path, state)
+            return state
+        if self.ledger.has_history() and allow_reserved_recovery:
+            return state
+        current = state.get("current")
+        if isinstance(current, dict) and current.get("observation_generation") is not None:
+            raise RuntimeStateError("published observation is absent from ledger")
+        if self.ledger.has_history():
+            raise RuntimeStateError("ledger has no published observation")
+        if self.state_path.exists():
+            try:
+                with self.state_path.open("r", encoding="utf-8") as stream:
+                    raw = json.load(stream)
+            except (OSError, ValueError, TypeError) as error:
+                raise RuntimeStateError("current projection is corrupt") from error
+            if not isinstance(raw, dict) or raw.get("version") != 1:
+                raise RuntimeStateError("current projection is invalid")
+        return state
+
+    @staticmethod
+    def _receipt_matches_publication(receipt, publication: PublicationRecord) -> bool:
+        return (
+            receipt.pre_send_identity == publication.pre_send_identity
+            and receipt.canary_run_id == publication.canary_run_id
+            and receipt.fence_identity == publication.fence_identity
+            and receipt.authority_epoch == publication.authority_epoch
+            and receipt.fence_counter == publication.fence_counter
+            and receipt.source_identity_ref == publication.source_identity_ref
+            and receipt.target_ref == publication.target_ref
+            and receipt.requested_state == publication.requested_state
+            and receipt.post_dispatch_observation_boundary_id
+            == publication.observation_boundary_id
+            and receipt.post_dispatch_observation_generation_floor
+            == publication.observation_generation_floor
+        )
+
+    def _record_published_authority_ack(
+        self, publication: PublicationRecord
+    ) -> str:
+        if (
+            self._legacy_authority_store_factory is None
+            or publication.pre_send_identity is None
+            or publication.materializer_run_id is None
+        ):
+            raise ObservationGenerationContractError(
+                "published authority binding is unavailable"
+            )
+        store = self._legacy_authority_store_factory()
+        try:
+            current_receipt = store.current_observation_receipt()
+            if (
+                current_receipt is None
+                or not self._receipt_matches_publication(current_receipt, publication)
+            ):
+                raise ObservationGenerationContractError(
+                    "published authority lineage changed"
+                )
+            verified_target = self._verify_publication_candidate(publication)
+            if verified_target is None:
+                raise ObservationGenerationContractError(
+                    "published target observation is unavailable"
+                )
+            materializer = ObservationMaterializer(store)
+            receipt, evidence = materializer.prepare_verified_runtime_snapshot(
+                publication.pre_send_identity,
+                VerifiedRuntimeSnapshot(
+                    snapshot_generation_id=publication.observation_generation,
+                    snapshot_id=publication.snapshot_id,
+                    captured_at=publication.captured_at,
+                    source_hash=publication.source_hash,
+                    target_observation=verified_target,
+                    materializer_run_id=publication.materializer_run_id,
+                ),
+            )
+            materializer.record_ack(receipt, evidence)
+        except (
+            LegacyAuthorityStoreError,
+            ObservationMaterializerError,
+            TransitionError,
+        ) as error:
+            raise ObservationGenerationContractError(
+                "published authority evidence was rejected"
+            ) from error
+        finally:
+            store.close()
+        return self._verify_published_authority_ack(publication)
+
+    def _acknowledge_published_authority(
+        self, publication: PublicationRecord
+    ) -> PublicationRecord:
+        try:
+            attestation_fingerprint = self._verify_published_authority_ack(publication)
+        except ObservationGenerationContractError:
+            attestation_fingerprint = self._record_published_authority_ack(publication)
+        acknowledged = self.ledger.acknowledge(
+            publication.observation_generation, attestation_fingerprint
+        )
+        self._close_published_authority_fence(acknowledged)
+        return acknowledged
+
+    def _close_published_authority_fence(
+        self, publication: PublicationRecord
+    ) -> None:
+        if (
+            self._legacy_authority_store_factory is None
+            or publication.pre_send_identity is None
+        ):
+            raise ObservationGenerationContractError(
+                "published authority binding is unavailable"
+            )
+        store = self._legacy_authority_store_factory()
+        try:
+            receipt = store.get_receipt(publication.pre_send_identity)
+            if not self._receipt_matches_publication(receipt, publication):
+                raise ObservationGenerationContractError(
+                    "published authority lineage changed"
+                )
+            fence = store.get_fence(publication.pre_send_identity)
+            if fence is None:
+                raise ObservationGenerationContractError(
+                    "published authority fence is unavailable"
+                )
+            if fence["state"] != "closed":
+                store.close_fence(publication.pre_send_identity)
+        except (LegacyAuthorityStoreError, TransitionError) as error:
+            raise ObservationGenerationContractError(
+                "published authority fence could not close"
+            ) from error
+        finally:
+            store.close()
+
+    def _verify_published_authority_ack(self, publication: PublicationRecord) -> str:
+        if self._legacy_authority_store_factory is None or publication.pre_send_identity is None:
+            raise ObservationGenerationContractError("published authority binding is unavailable")
+        store = self._legacy_authority_store_factory()
+        try:
+            receipt = store.get_receipt(publication.pre_send_identity)
+            ack = ObservationMaterializer(store).require_evidence(receipt)
+        except (
+            LegacyAuthorityStoreError,
+            ObservationMaterializerError,
+            TransitionError,
+        ) as error:
+            raise ObservationGenerationContractError(
+                "published authority evidence is unavailable"
+            ) from error
+        finally:
+            store.close()
+        evidence = ack.evidence
+        if (
+            receipt.authority_epoch != publication.authority_epoch
+            or receipt.pre_send_identity != publication.pre_send_identity
+            or evidence.snapshot_generation_id != publication.observation_generation
+            or evidence.snapshot_id != publication.snapshot_id
+            or evidence.captured_at != publication.captured_at
+            or evidence.materializer_run_id != publication.materializer_run_id
+            or evidence.source_hash != publication.source_hash
+            or evidence.source_identity_ref != publication.source_identity_ref
+            or evidence.boundary_id != publication.observation_boundary_id
+            or evidence.generation_floor != publication.observation_generation_floor
+            or evidence.canary_run_id != publication.canary_run_id
+            or evidence.fence_identity != publication.fence_identity
+            or evidence.fence_counter != publication.fence_counter
+            or evidence.target_ref != publication.target_ref
+            or evidence.requested_state != publication.requested_state
+            or evidence.observed_state != publication.observed_state
+            or (
+                publication.attestation_fingerprint is not None
+                and evidence.attestation_fingerprint
+                != publication.attestation_fingerprint
+            )
+        ):
+            raise ObservationGenerationContractError(
+                "published authority evidence does not match runtime publication"
+            )
+        return evidence.attestation_fingerprint
 
     @staticmethod
     def _mark_ineligible_locked(state, group, reason):
@@ -435,6 +911,8 @@ class SQLiteRuntimeCoordinator:
             return False
         if current.get("source_set") != SOURCE_SET_WAVE1:
             return False
+        if group in state.get("fences", {}):
+            return False
         if not group_state.get("eligible"):
             return False
         if group_state.get("generation_id") != current.get("generation_id"):
@@ -556,7 +1034,10 @@ class SQLiteRuntimeCoordinator:
             if schema != [(SCHEMA_VERSION, SCHEMA_CHECKSUM)]:
                 raise RuntimeStateError("stored schema validation failed")
             run = repository.rows(
-                "SELECT snapshot_id, source_hash, status, checks_json "
+                "SELECT snapshot_id, source_hash, status, checks_json, "
+                "observation_generation, observation_boundary_id, "
+                "observation_generation_floor, observation_captured_at, "
+                "observation_completed_at "
                 "FROM import_runs WHERE run_id=?",
                 (current.get("run_id"),),
             )
@@ -566,6 +1047,22 @@ class SQLiteRuntimeCoordinator:
                 raise RuntimeStateError("stored source hash mismatch")
             if run[0][0] != current.get("snapshot_id"):
                 raise RuntimeStateError("stored snapshot identity mismatch")
+            if (
+                type(run[0][4]) is not int
+                or run[0][4] < 1
+                or run[0][4] != current.get("observation_generation")
+                or run[0][5] != current.get("observation_boundary_id")
+                or run[0][6] != current.get("observation_generation_floor")
+                or run[0][7] != current.get("captured_at")
+                or run[0][8] != current.get("completed_at")
+            ):
+                raise RuntimeStateError("observation generation metadata mismatch")
+            if run[0][5] is None and run[0][6] is not None:
+                raise RuntimeStateError("observation boundary metadata is incomplete")
+            if run[0][5] is not None and (
+                type(run[0][6]) is not int or run[0][4] <= run[0][6]
+            ):
+                raise RuntimeStateError("observation generation is not later than boundary")
             try:
                 checks = json.loads(run[0][3])
             except (TypeError, ValueError, json.JSONDecodeError) as error:
@@ -629,11 +1126,12 @@ class SQLiteRuntimeCoordinator:
         if not self.configured_enabled(group):
             return fallback()
         stale = False
+        response = None
         try:
             # Nonblocking lock acquisition gives reads a clear linearization point
             # with write fences without waiting behind refresh or upstream writes.
             with self._mutex.hold(timeout_seconds=0):
-                state = self._load_state()
+                state = self._ensure_generation_state(self._load_state())
                 if not self._eligible(state, group):
                     stale = True
                 else:
@@ -815,6 +1313,7 @@ class SQLiteRuntimeCoordinator:
         staging = self.runtime_dir / (generation_id + ".sqlite3.staging")
         final = self.runtime_dir / (generation_id + ".sqlite3")
         published = False
+        head_committed = False
         lease_token = None
         lease_stop = None
         heartbeat = None
@@ -823,13 +1322,17 @@ class SQLiteRuntimeCoordinator:
         lease_released = False
         initial_generation_id = None
         initial_fence_token = None
+        initial_boundary = None
         requeue_group = False
+        reservation = None
         try:
             remaining = deadline - self._clock()
             if remaining <= 0:
                 raise SourceAcquisitionError("refresh timeout")
             with self._mutex.hold(timeout_seconds=remaining):
-                state = self._load_state()
+                state = self._ensure_generation_state(
+                    self._load_state(), allow_reserved_recovery=True
+                )
                 if not force and self._eligible(state, group):
                     return True
                 if self._lease_active(state.get("refresh_lease")):
@@ -839,6 +1342,7 @@ class SQLiteRuntimeCoordinator:
                     return True
                 initial_generation_id = (state.get("current") or {}).get("generation_id")
                 initial_fence_token = (state.get("fences", {}).get(group) or {}).get("token")
+                initial_boundary = self._current_observation_boundary()
                 lease_token = uuid.uuid4().hex
                 state["refresh_lease"] = {
                     "token": lease_token,
@@ -891,7 +1395,9 @@ class SQLiteRuntimeCoordinator:
             with self._mutex.hold(timeout_seconds=remaining):
                 if self._clock() > deadline:
                     raise SourceAcquisitionError("refresh timeout")
-                state = self._load_state()
+                state = self._ensure_generation_state(
+                    self._load_state(), allow_reserved_recovery=True
+                )
                 lease = state.get("refresh_lease") or {}
                 if lease.get("token") != lease_token:
                     _remove_candidate(staging)
@@ -916,9 +1422,145 @@ class SQLiteRuntimeCoordinator:
                         fence_observed = fence is not None and self._fence_observed(fence, snapshot)
                         if fence is not None and not fence_observed:
                             raise RuntimeStateError("write mutation not observed")
+                        boundary = self._current_observation_boundary()
+                        if boundary != initial_boundary:
+                            raise ObservationGenerationContractError(
+                                "observation boundary changed during capture"
+                            )
+                        source_identity = self.trusted_source_identity()
+                        if (
+                            boundary is not None
+                            and boundary.source_identity_ref != source_identity
+                        ):
+                            raise ObservationGenerationContractError(
+                                "observation boundary source identity is untrusted"
+                            )
+                        completed_at = _utc_now()
+                        binding_pre_send_identity = None if boundary is None else boundary.pre_send_identity
+                        binding_canary_run_id = None if boundary is None else boundary.canary_run_id
+                        binding_fence_identity = None if boundary is None else boundary.fence_identity
+                        binding_authority_epoch = None if boundary is None else boundary.authority_epoch
+                        binding_fence_counter = None if boundary is None else boundary.fence_counter
+                        binding_target_ref = None if boundary is None else boundary.target_ref
+                        binding_requested_state = None if boundary is None else boundary.requested_state
+                        binding_fingerprint = None if boundary is None else boundary.binding_fingerprint()
+                        materializer_run_id = uuid.uuid4().hex
+                        observed_state = None
+                        verified_target_observation = None
+                        if boundary is not None:
+                            observed_state = boundary.requested_state
+                            candidate_repository = SQLiteCandidateRepository.open_existing(staging)
+                            try:
+                                verified_target_observation = candidate_repository.observed_state_for_target(
+                                    receipt.run_id,
+                                    boundary.target_ref,
+                                    boundary.requested_state,
+                                )
+                                observed_state = verified_target_observation.observed_state
+                            finally:
+                                candidate_repository.close()
+                        reservation = self.ledger.reserve(
+                            None if boundary is None else boundary.generation_floor,
+                            PublicationReservation(
+                                snapshot_id=receipt.snapshot_id,
+                                run_id=receipt.run_id,
+                                candidate_path=str(final),
+                                candidate_schema_version=SCHEMA_VERSION,
+                                candidate_schema_checksum=SCHEMA_CHECKSUM,
+                                source_hash=receipt.source_hash,
+                                source_set=SOURCE_SET_WAVE1,
+                                source_identity_ref=source_identity,
+                                pre_send_identity=binding_pre_send_identity,
+                                canary_run_id=binding_canary_run_id,
+                                fence_identity=binding_fence_identity,
+                                authority_epoch=binding_authority_epoch,
+                                fence_counter=binding_fence_counter,
+                                target_ref=binding_target_ref,
+                                requested_state=binding_requested_state,
+                                captured_at=snapshot.captured_at,
+                                observation_boundary_id=None if boundary is None else boundary.boundary_id,
+                                observation_generation_floor=None if boundary is None else boundary.generation_floor,
+                                observation_binding_fingerprint=binding_fingerprint,
+                                materializer_run_id=materializer_run_id,
+                                observed_state=observed_state,
+                            ),
+                        )
+                        attestation_fingerprint = None
+                        self._persist_observation_metadata(
+                            staging,
+                            receipt.run_id,
+                            reservation,
+                            boundary,
+                            snapshot.captured_at,
+                            completed_at,
+                            materializer_run_id,
+                            observed_state,
+                            attestation_fingerprint,
+                        )
+                        self._verify_publication_candidate(
+                            reservation, completed_at, str(staging)
+                        )
                         os.replace(staging, final)
                         published = True
-                        completed_at = _utc_now()
+                        self._verify_publication_candidate(
+                            reservation, completed_at
+                        )
+                        self.ledger.finalize(
+                            reservation.observation_generation,
+                            completed_at,
+                            PublicationParity(
+                                candidate_path=str(final),
+                                candidate_schema_version=SCHEMA_VERSION,
+                                candidate_schema_checksum=SCHEMA_CHECKSUM,
+                                source_identity_ref=source_identity,
+                                pre_send_identity=binding_pre_send_identity,
+                                canary_run_id=binding_canary_run_id,
+                                fence_identity=binding_fence_identity,
+                                authority_epoch=binding_authority_epoch,
+                                fence_counter=binding_fence_counter,
+                                target_ref=binding_target_ref,
+                                requested_state=binding_requested_state,
+                                observation_binding_fingerprint=binding_fingerprint,
+                                materializer_run_id=materializer_run_id,
+                                observed_state=observed_state,
+                                attestation_fingerprint=attestation_fingerprint,
+                            ),
+                        )
+                        head_committed = True
+                        publication = self.ledger.publish(
+                            reservation.observation_generation,
+                            completed_at,
+                            PublicationParity(
+                                candidate_path=str(final),
+                                candidate_schema_version=SCHEMA_VERSION,
+                                candidate_schema_checksum=SCHEMA_CHECKSUM,
+                                source_identity_ref=source_identity,
+                                pre_send_identity=binding_pre_send_identity,
+                                canary_run_id=binding_canary_run_id,
+                                fence_identity=binding_fence_identity,
+                                authority_epoch=binding_authority_epoch,
+                                fence_counter=binding_fence_counter,
+                                target_ref=binding_target_ref,
+                                requested_state=binding_requested_state,
+                                observation_binding_fingerprint=binding_fingerprint,
+                                materializer_run_id=materializer_run_id,
+                                observed_state=observed_state,
+                                attestation_fingerprint=attestation_fingerprint,
+                            ),
+                        )
+                        self._verify_publication_candidate(publication)
+                        if (
+                            self._legacy_authority_store_factory is not None
+                            and boundary is not None
+                        ):
+                            publication = self._acknowledge_published_authority(
+                                publication
+                            )
+                            attestation_fingerprint = (
+                                publication.attestation_fingerprint
+                            )
+                        generation_id = publication.generation_id
+                        observation_generation = publication.observation_generation
                         current = {
                             "generation_id": generation_id,
                             "run_id": receipt.run_id,
@@ -927,11 +1569,31 @@ class SQLiteRuntimeCoordinator:
                             "snapshot_id": receipt.snapshot_id,
                             "source_hash": receipt.source_hash,
                             "source_set": SOURCE_SET_WAVE1,
+                            "source_identity_ref": source_identity,
+                            "pre_send_identity": binding_pre_send_identity,
+                            "canary_run_id": binding_canary_run_id,
+                            "fence_identity": binding_fence_identity,
+                            "authority_epoch": binding_authority_epoch,
+                            "fence_counter": binding_fence_counter,
+                            "target_ref": binding_target_ref,
+                            "requested_state": binding_requested_state,
                             "schema_version": SCHEMA_VERSION,
                             "schema_checksum": SCHEMA_CHECKSUM,
                             "status": "verified",
                             "captured_at": snapshot.captured_at,
                             "completed_at": completed_at,
+                            "observation_generation": observation_generation,
+                            "observation_boundary_id": (
+                                boundary.boundary_id if boundary is not None else None
+                            ),
+                            "observation_generation_floor": (
+                                boundary.generation_floor if boundary is not None else None
+                            ),
+                            "observation_binding_fingerprint": binding_fingerprint,
+                            "materializer_run_id": materializer_run_id,
+                            "observed_state": observed_state,
+                            "attestation_fingerprint": attestation_fingerprint,
+                            "publication_generation_id": generation_id,
                         }
                         state["current"] = current
                         for target in GROUPS:
@@ -976,8 +1638,20 @@ class SQLiteRuntimeCoordinator:
             return result
         except Exception:
             _remove_candidate(staging)
-            if published:
-                _remove_candidate(final)
+            if published and not head_committed:
+                try:
+                    durable_head = self.ledger.latest_available()
+                    head_committed = (
+                        durable_head is not None
+                        and reservation is not None
+                        and durable_head.observation_generation
+                        == reservation.observation_generation
+                        and durable_head.candidate_path == str(final)
+                    )
+                except ObservationLedgerError:
+                    head_committed = False
+                if not head_committed:
+                    _remove_candidate(final)
             if not lease_release_deferred:
                 self._mark_ineligible(group, "refresh_failed", timeout_seconds=0)
                 if lease_token and lease_owned:
@@ -988,7 +1662,137 @@ class SQLiteRuntimeCoordinator:
 
     def state(self):
         """Return redacted runtime state for tests/diagnostics, never source data."""
-        return self._load_state()
+        with self._mutex.hold():
+            return self._ensure_generation_state(self._load_state())
+
+    def current_observation_generation(self):
+        """Return the fresh verified generation or fail closed."""
+        with self._mutex.hold(timeout_seconds=0):
+            state = self._ensure_generation_state(self._load_state())
+            if not self._eligible(state, GROUP_MASTER_DATABASE):
+                raise ObservationGenerationContractError(
+                    "master database observation publication is not eligible"
+                )
+            current = state.get("current") or {}
+            if current.get("source_identity_ref") != self.trusted_source_identity():
+                raise ObservationGenerationContractError(
+                    "published source identity is untrusted"
+                )
+            self._read_generation(state, "api/master")
+            generation = self._last_observation_generation(state)
+            if generation is None:
+                raise ObservationGenerationContractError(
+                    "verified observation generation is unavailable"
+                )
+            return generation
+
+    def current_observation_publication(self):
+        """Return the latest verified ledger publication or fail closed."""
+        with self._mutex.hold(timeout_seconds=0):
+            self._ensure_generation_state(self._load_state())
+            publication = self.ledger.latest_available()
+            if publication is None:
+                raise ObservationGenerationContractError("verified publication is unavailable")
+            if publication.state == "finalized":
+                raise ObservationGenerationContractError(
+                    "verified publication is not published"
+                )
+            if (
+                publication.observation_boundary_id is not None
+                and publication.state != "authority_acked"
+            ):
+                raise ObservationGenerationContractError(
+                    "authority ACK is required for proving publication"
+                )
+            return publication
+
+    def current_observation_source_set(self):
+        """Return the source set bound to the verified ledger publication."""
+        return self.current_observation_publication().source_set
+
+    def trusted_source_identity(self):
+        """Return the immutable configured source identity or fail closed."""
+        if self._trusted_source_identity is None:
+            raise ObservationGenerationContractError(
+                "trusted runtime source identity is unavailable"
+            )
+        return self._trusted_source_identity
+
+    @staticmethod
+    def _last_observation_generation(state):
+        current = state.get("current")
+        if not isinstance(current, dict):
+            return None
+        value = current.get("observation_generation")
+        if value is None:
+            return None
+        if type(value) is not int or value < 1:
+            raise ObservationGenerationContractError(
+                "current observation generation is invalid"
+            )
+        return value
+
+    def _current_observation_boundary(self):
+        if self._test_only_observation_boundary_provider is not None:
+            boundary = self._test_only_observation_boundary_provider.current_boundary()
+            if not isinstance(boundary, TrustedObservationBoundary):
+                raise ObservationGenerationContractError(
+                    "test boundary provider returned an invalid boundary"
+                )
+            return boundary
+        if self._legacy_authority_store_factory is None:
+            return None
+        store = self._legacy_authority_store_factory()
+        try:
+            provider = DurableObservationBoundaryProvider(store)
+            boundary = provider.current_boundary()
+        finally:
+            store.close()
+        if boundary is not None and not isinstance(boundary, TrustedObservationBoundary):
+            raise ObservationGenerationContractError(
+                "observation boundary provider returned an invalid boundary"
+            )
+        return boundary
+
+    @staticmethod
+    def _persist_observation_metadata(
+        candidate,
+        run_id,
+        reservation,
+        boundary: TrustedObservationBoundary | None,
+        captured_at,
+        completed_at,
+        materializer_run_id,
+        observed_state,
+        attestation_fingerprint,
+    ):
+        repository = SQLiteCandidateRepository.open_existing(candidate)
+        try:
+            with repository.transaction():
+                repository.set_observation_generation(
+                    run_id,
+                    reservation.observation_generation,
+                    reservation.generation_id,
+                    reservation.source_set,
+                    reservation.source_identity_ref,
+                    None if boundary is None else boundary.boundary_id,
+                    None if boundary is None else boundary.generation_floor,
+                    captured_at,
+                    completed_at,
+                    reservation.pre_send_identity,
+                    reservation.canary_run_id,
+                    reservation.fence_identity,
+                    reservation.authority_epoch,
+                    reservation.fence_counter,
+                    reservation.target_ref,
+                    reservation.requested_state,
+                    reservation.observation_binding_fingerprint,
+                    materializer_run_id,
+                    observed_state,
+                    attestation_fingerprint,
+                )
+        finally:
+            repository.close()
 
 
 def _json_text(value):

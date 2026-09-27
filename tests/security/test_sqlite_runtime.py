@@ -2,7 +2,6 @@
 """Acceptance tests for guarded SQLite generation runtime behavior."""
 import multiprocessing
 import os
-from pathlib import Path
 import queue
 import sqlite3
 import sys
@@ -10,26 +9,47 @@ import tempfile
 import threading
 import time
 import unittest
+from dataclasses import replace
+from pathlib import Path
 from unittest.mock import Mock, patch
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "webapp" / "backend"))
 sys.path.insert(0, str(ROOT / "tests" / "security"))
 
-from repositories.aitool import UpstreamError  # noqa: E402
-from repositories.sqlite import SQLiteCandidateRepository  # noqa: E402
-from services import sqlite_runtime  # noqa: E402
-from services.sqlite_runtime import (  # noqa: E402
+from repositories.aitool import UpstreamError
+from repositories.legacy_authority_store import (
+    LegacyAuthorityStore,
+    LegacyAuthorityStoreFactory,
+    legacy_store_path,
+)
+from repositories.legacy_authority_types import FenceState, ReceiptState
+from repositories.sqlite import SQLiteCandidateRepository
+from services import sqlite_runtime
+from services.legacy_observation_materializer import ObservationMaterializerError
+from services.runtime_observation_generation import (
+    ObservationGenerationContractError,
+    TrustedObservationBoundary,
+)
+from services.sqlite_runtime import (
     GROUP_MASTER_DATABASE,
     GROUP_PUBLIC_SETTINGS,
     MUTEX_NAME,
     NamedGenerationMutex,
+    RuntimeStateError,
     SQLiteRuntimeCoordinator,
 )
-from test_sqlite_import import FakeSource, fixture_values, replace_json  # noqa: E402
+from test_legacy_observation_materializer import TestKeyProvider, artifact, handoff
+from test_sqlite_import import FakeSource, fixture_values, replace_json
 
 
-def enabled_runtime(directory, background_refresh=False, mutex_name=MUTEX_NAME):
+def enabled_runtime(
+    directory,
+    background_refresh=False,
+    mutex_name=MUTEX_NAME,
+    boundary_provider=None,
+    trusted_source_identity="legacy-sole-reader:v1",
+):
     return SQLiteRuntimeCoordinator(
         runtime_dir=directory,
         read_enabled=True,
@@ -40,13 +60,54 @@ def enabled_runtime(directory, background_refresh=False, mutex_name=MUTEX_NAME):
         background_refresh=background_refresh,
         mutex_name=mutex_name,
         source_factory=lambda: FakeSource(fixture_values()),
+        trusted_source_identity=trusted_source_identity,
+        test_only_observation_boundary_provider=boundary_provider,
     )
+
+
+class FixedBoundaryProvider:
+    def __init__(self, boundary):
+        self.boundary = boundary
+
+    def current_boundary(self):
+        return self.boundary
 
 
 def mutex_worker(name, entered, release):
     with NamedGenerationMutex(name, timeout_seconds=5).hold():
         entered.put(os.getpid())
         release.wait(5)
+
+
+def authority_runtime(directory):
+    authority = LegacyAuthorityStore.create(
+        legacy_store_path(Path(directory) / "authority")
+    )
+    authority_factory = LegacyAuthorityStoreFactory(
+        "materializer:one", TestKeyProvider()
+    )
+    authority.add_authorization(
+        replace(handoff(), target_ref="client:client_1"),
+        replace(artifact(), target_ref="client:client_1"),
+    )
+    authority.request_fence("send-1")
+    authority.transition_fence("send-1", FenceState.ACQUIRED)
+    accepted = authority.accept_receipt("send-1", "sha256:envelope-1")
+    dispatching = authority.begin_dispatch(accepted)
+    terminal = authority.terminal_receipt(dispatching, ReceiptState.APPLIED)
+    boundary_receipt = authority.append_observation_boundary(
+        terminal, "boundary-42"
+    )
+    runtime = SQLiteRuntimeCoordinator(
+        runtime_dir=directory,
+        read_enabled=True,
+        group_enabled={GROUP_MASTER_DATABASE: True},
+        background_refresh=False,
+        source_factory=lambda: FakeSource(fixture_values()),
+        legacy_authority_store_factory=lambda: authority_factory.open(authority.path),
+        trusted_source_identity="legacy-source:one",
+    )
+    return authority, authority_factory, runtime, boundary_receipt
 
 
 class SQLiteRuntimeTests(unittest.TestCase):
@@ -81,6 +142,544 @@ class SQLiteRuntimeTests(unittest.TestCase):
                 '{"source":"test"}',
             )
             repository.close()
+
+    def test_observation_generation_is_distinct_from_opaque_publication_uuid(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = enabled_runtime(directory)
+            self.assertTrue(runtime.refresh_now(GROUP_MASTER_DATABASE))
+            current = runtime.state()["current"]
+            self.assertIsInstance(current["generation_id"], str)
+            self.assertIsInstance(current["observation_generation"], int)
+            self.assertNotEqual(
+                current["generation_id"], str(current["observation_generation"])
+            )
+            self.assertEqual(runtime.current_observation_generation(), 1)
+
+    def test_failed_build_does_not_advance_observation_generation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = SQLiteRuntimeCoordinator(
+                directory,
+                read_enabled=True,
+                group_enabled={GROUP_MASTER_DATABASE: True},
+                background_refresh=False,
+                source_factory=lambda: FakeSource(fixture_values()),
+                trusted_source_identity="legacy-sole-reader:v1",
+            )
+            original_importer = runtime._importer
+            runtime._importer = lambda snapshot, path: type(
+                "FailedReceipt", (), {"status": "failed", "checks": {"ok": False}}
+            )()
+            self.assertFalse(runtime.refresh_now(GROUP_MASTER_DATABASE))
+            runtime._importer = original_importer
+            self.assertTrue(runtime.refresh_now(GROUP_MASTER_DATABASE))
+            self.assertEqual(runtime.current_observation_generation(), 1)
+
+    def test_boundary_publication_is_strictly_after_trusted_floor(self):
+        with tempfile.TemporaryDirectory() as directory:
+            boundary = TrustedObservationBoundary(
+                "boundary-42", "send-1", 42, "run-1", "fence-1",
+                "source-1", "client:client_1", "epoch-1", 1, "running",
+            )
+            runtime = enabled_runtime(
+                directory,
+                background_refresh=False,
+                boundary_provider=FixedBoundaryProvider(boundary),
+                trusted_source_identity="source-1",
+            )
+            self.assertTrue(runtime.refresh_now(GROUP_MASTER_DATABASE))
+            current = runtime.state()["current"]
+            self.assertEqual(current["observation_generation"], 43)
+            self.assertEqual(current["observation_boundary_id"], "boundary-42")
+            self.assertEqual(current["observation_generation_floor"], 42)
+
+    def test_production_boundary_wiring_loads_durable_authority_store(self):
+        with tempfile.TemporaryDirectory() as directory:
+            authority = LegacyAuthorityStore.create(
+                legacy_store_path(Path(directory) / "authority")
+            )
+            try:
+                authority_factory = LegacyAuthorityStoreFactory(
+                    "materializer:one", TestKeyProvider()
+                )
+                authority.add_authorization(
+                    replace(handoff(), target_ref="client:client_1"),
+                    replace(artifact(), target_ref="client:client_1"),
+                )
+                authority.request_fence("send-1")
+                authority.transition_fence("send-1", FenceState.ACQUIRED)
+                accepted = authority.accept_receipt("send-1", "sha256:envelope-1")
+                dispatching = authority.begin_dispatch(accepted)
+                terminal = authority.terminal_receipt(dispatching, ReceiptState.APPLIED)
+                boundary_receipt = authority.append_observation_boundary(
+                    terminal, "boundary-42"
+                )
+                runtime = SQLiteRuntimeCoordinator(
+                    runtime_dir=directory,
+                    read_enabled=True,
+                    group_enabled={GROUP_MASTER_DATABASE: True},
+                    background_refresh=False,
+                    source_factory=lambda: FakeSource(fixture_values()),
+                    legacy_authority_store_factory=lambda: authority_factory.open(authority.path),
+                    trusted_source_identity="legacy-source:one",
+                )
+                self.assertTrue(runtime.refresh_now(GROUP_MASTER_DATABASE))
+                self.assertEqual(runtime.current_observation_generation(), 43)
+                self.assertEqual(
+                    runtime.state()["current"]["observation_boundary_id"],
+                    "boundary-42",
+                )
+                publication = runtime.current_observation_publication()
+                self.assertEqual(publication.target_ref, "client:client_1")
+                self.assertEqual(publication.requested_state, "running")
+                self.assertEqual(publication.observed_state, "running")
+                verifying_authority = authority_factory.open(authority.path)
+                try:
+                    closed_receipt = verifying_authority.get_receipt(
+                        boundary_receipt.pre_send_identity
+                    )
+                    evidence = verifying_authority.require_observation_evidence(
+                        closed_receipt
+                    )
+                finally:
+                    verifying_authority.close()
+                self.assertEqual(evidence.evidence.snapshot_generation_id, 43)
+                self.assertEqual(evidence.evidence.target_ref, "client:client_1")
+                self.assertEqual(
+                    authority.get_fence("send-1")["state"], FenceState.CLOSED.value
+                )
+            finally:
+                authority.close()
+
+    def test_newer_boundaryless_publication_supersedes_older_proving_generation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            authority, authority_factory, bounded_runtime, _receipt = authority_runtime(
+                directory
+            )
+            try:
+                self.assertTrue(bounded_runtime.refresh_now(GROUP_MASTER_DATABASE))
+                ordinary_runtime = SQLiteRuntimeCoordinator(
+                    runtime_dir=directory,
+                    read_enabled=True,
+                    group_enabled={GROUP_MASTER_DATABASE: True},
+                    background_refresh=False,
+                    source_factory=lambda: FakeSource(fixture_values()),
+                    legacy_authority_store_factory=lambda: authority_factory.open(
+                        authority.path
+                    ),
+                    trusted_source_identity="legacy-source:one",
+                )
+                self.assertTrue(
+                    ordinary_runtime.refresh_now(GROUP_MASTER_DATABASE, force=True)
+                )
+
+                publication = ordinary_runtime.current_observation_publication()
+                self.assertEqual(publication.observation_generation, 44)
+                self.assertIsNone(publication.observation_boundary_id)
+            finally:
+                authority.close()
+
+    def test_publication_precedes_authority_ack_and_proving_event(self):
+        with tempfile.TemporaryDirectory() as directory:
+            authority, _factory, runtime, _receipt = authority_runtime(directory)
+            try:
+                events = []
+                publish = runtime.ledger.publish
+                record_ack = sqlite_runtime.ObservationMaterializer.record_ack
+                acknowledge = runtime.ledger.acknowledge
+
+                def tracked_publish(*args, **kwargs):
+                    publication = publish(*args, **kwargs)
+                    events.append("published")
+                    return publication
+
+                def tracked_record_ack(materializer, receipt, evidence):
+                    events.append("authority_ack")
+                    return record_ack(materializer, receipt, evidence)
+
+                def tracked_acknowledge(generation, attestation_fingerprint):
+                    events.append("authority_acked")
+                    return acknowledge(generation, attestation_fingerprint)
+
+                with patch.object(runtime.ledger, "publish", side_effect=tracked_publish), patch.object(
+                    sqlite_runtime.ObservationMaterializer,
+                    "record_ack",
+                    new=tracked_record_ack,
+                ), patch.object(
+                    runtime.ledger, "acknowledge", side_effect=tracked_acknowledge
+                ):
+                    self.assertTrue(runtime.refresh_now(GROUP_MASTER_DATABASE))
+                self.assertEqual(
+                    events, ["published", "authority_ack", "authority_acked"]
+                )
+            finally:
+                authority.close()
+
+    def test_failure_immediately_before_publish_leaves_no_ack(self):
+        with tempfile.TemporaryDirectory() as directory:
+            authority, authority_factory, runtime, boundary_receipt = authority_runtime(
+                directory
+            )
+            try:
+                with patch.object(
+                    runtime.ledger,
+                    "publish",
+                    side_effect=sqlite_runtime.ObservationLedgerError("simulated crash"),
+                ):
+                    self.assertFalse(runtime.refresh_now(GROUP_MASTER_DATABASE))
+                self.assertIsNone(runtime.ledger.latest_published())
+                self.assertIsNone(runtime.ledger.latest_proving())
+                verifying = authority_factory.open(authority.path)
+                try:
+                    with self.assertRaises(ObservationMaterializerError):
+                        verifying.require_observation_evidence(boundary_receipt)
+                finally:
+                    verifying.close()
+            finally:
+                authority.close()
+
+    def test_failure_after_publish_before_ack_remains_non_proving_and_recovers(self):
+        with tempfile.TemporaryDirectory() as directory:
+            authority, authority_factory, runtime, boundary_receipt = authority_runtime(
+                directory
+            )
+            try:
+                with patch.object(
+                    sqlite_runtime.ObservationMaterializer,
+                    "record_ack",
+                    side_effect=ObservationMaterializerError("simulated crash"),
+                ):
+                    self.assertFalse(runtime.refresh_now(GROUP_MASTER_DATABASE))
+                self.assertEqual(
+                    runtime.ledger.latest_published().observation_generation, 43
+                )
+                self.assertIsNone(runtime.ledger.latest_proving())
+                verifying = authority_factory.open(authority.path)
+                try:
+                    with self.assertRaises(ObservationMaterializerError):
+                        verifying.require_observation_evidence(boundary_receipt)
+                finally:
+                    verifying.close()
+                recovered = SQLiteRuntimeCoordinator(
+                    runtime_dir=directory,
+                    read_enabled=True,
+                    group_enabled={GROUP_MASTER_DATABASE: True},
+                    background_refresh=False,
+                    source_factory=lambda: FakeSource(fixture_values()),
+                    legacy_authority_store_factory=lambda: authority_factory.open(authority.path),
+                    trusted_source_identity="legacy-source:one",
+                )
+                self.assertEqual(
+                    recovered.state()["current"]["observation_generation"], 43
+                )
+                self.assertEqual(
+                    recovered.ledger.latest_proving().observation_generation, 43
+                )
+            finally:
+                authority.close()
+
+    def test_crash_after_ack_before_authority_acked_recovers_exact_evidence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            authority, authority_factory, runtime, boundary_receipt = authority_runtime(
+                directory
+            )
+            try:
+                with patch.object(
+                    runtime.ledger,
+                    "acknowledge",
+                    side_effect=sqlite_runtime.ObservationLedgerError("simulated crash"),
+                ):
+                    self.assertFalse(runtime.refresh_now(GROUP_MASTER_DATABASE))
+                self.assertEqual(
+                    runtime.ledger.latest_published().observation_generation, 43
+                )
+                self.assertIsNone(runtime.ledger.latest_proving())
+                verifying = authority_factory.open(authority.path)
+                try:
+                    original_evidence = verifying.require_observation_evidence(
+                        boundary_receipt
+                    ).evidence
+                finally:
+                    verifying.close()
+                recovered = SQLiteRuntimeCoordinator(
+                    runtime_dir=directory,
+                    read_enabled=True,
+                    group_enabled={GROUP_MASTER_DATABASE: True},
+                    background_refresh=False,
+                    source_factory=lambda: FakeSource(fixture_values()),
+                    legacy_authority_store_factory=lambda: authority_factory.open(authority.path),
+                    trusted_source_identity="legacy-source:one",
+                )
+                recovered.state()
+                proving = recovered.ledger.latest_proving()
+                self.assertEqual(proving.observation_generation, 43)
+                verifying = authority_factory.open(authority.path)
+                try:
+                    closed_receipt = verifying.get_receipt(
+                        boundary_receipt.pre_send_identity
+                    )
+                    recovered_evidence = verifying.require_observation_evidence(
+                        closed_receipt
+                    ).evidence
+                finally:
+                    verifying.close()
+                self.assertEqual(recovered_evidence, original_evidence)
+            finally:
+                authority.close()
+
+    def test_authority_lineage_change_after_publish_remains_non_proving(self):
+        with tempfile.TemporaryDirectory() as directory:
+            authority, authority_factory, runtime, boundary_receipt = authority_runtime(
+                directory
+            )
+            try:
+                published = False
+                publish = runtime.ledger.publish
+                get_receipt = LegacyAuthorityStore.get_receipt
+
+                def publish_then_change(*args, **kwargs):
+                    nonlocal published
+                    publication = publish(*args, **kwargs)
+                    published = True
+                    return publication
+
+                def changed_receipt(store, identity):
+                    receipt = get_receipt(store, identity)
+                    if published:
+                        return replace(receipt, authority_epoch="changed-after-publish")
+                    return receipt
+
+                with patch.object(
+                    runtime.ledger, "publish", side_effect=publish_then_change
+                ), patch.object(
+                    LegacyAuthorityStore, "get_receipt", new=changed_receipt
+                ):
+                    self.assertFalse(runtime.refresh_now(GROUP_MASTER_DATABASE))
+                self.assertEqual(
+                    runtime.ledger.latest_published().observation_generation, 43
+                )
+                self.assertIsNone(runtime.ledger.latest_proving())
+                verifying = authority_factory.open(authority.path)
+                try:
+                    with self.assertRaises(ObservationMaterializerError):
+                        verifying.require_observation_evidence(boundary_receipt)
+                finally:
+                    verifying.close()
+            finally:
+                authority.close()
+
+    def test_observation_gate_rejects_master_database_status_conflict(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = enabled_runtime(directory, background_refresh=False)
+            self.assertTrue(runtime.refresh_now(GROUP_MASTER_DATABASE))
+            state = runtime.state()
+            candidate = Path(state["current"]["candidate_path"])
+            repository = SQLiteCandidateRepository.open_existing(candidate)
+            try:
+                repository.connection.execute(
+                    "UPDATE database_clients SET status='offline' WHERE run_id=? AND client_id=?",
+                    (state["current"]["run_id"], "client_1"),
+                )
+                repository.connection.commit()
+                with self.assertRaises(ValueError):
+                    repository.observed_state_for_target(
+                        state["current"]["run_id"], "client:client_1", "running"
+                    )
+            finally:
+                repository.close()
+
+    def test_observation_gate_requires_both_projection_rows(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = enabled_runtime(directory, background_refresh=False)
+            self.assertTrue(runtime.refresh_now(GROUP_MASTER_DATABASE))
+            state = runtime.state()
+            candidate = Path(state["current"]["candidate_path"])
+            repository = SQLiteCandidateRepository.open_existing(candidate)
+            try:
+                repository.connection.execute(
+                    "DELETE FROM database_clients WHERE run_id=? AND client_id=?",
+                    (state["current"]["run_id"], "client_1"),
+                )
+                repository.connection.commit()
+                with self.assertRaises(ValueError):
+                    repository.observed_state_for_target(
+                        state["current"]["run_id"], "client:client_1", "running"
+                    )
+            finally:
+                repository.close()
+
+    def test_observation_gate_rejects_missing_master_projection(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = enabled_runtime(directory, background_refresh=False)
+            self.assertTrue(runtime.refresh_now(GROUP_MASTER_DATABASE))
+            state = runtime.state()
+            repository = SQLiteCandidateRepository.open_existing(
+                Path(state["current"]["candidate_path"])
+            )
+            try:
+                repository.connection.execute(
+                    "DELETE FROM database_clients WHERE run_id=? AND client_id=?",
+                    (state["current"]["run_id"], "client_1"),
+                )
+                repository.connection.execute(
+                    "DELETE FROM master_clients WHERE run_id=? AND client_id=?",
+                    (state["current"]["run_id"], "client_1"),
+                )
+                repository.connection.commit()
+                with self.assertRaises(ValueError):
+                    repository.observed_state_for_target(
+                        state["current"]["run_id"], "client:client_1", "running"
+                    )
+            finally:
+                repository.close()
+
+    def test_observation_gate_rejects_state_that_does_not_match_request(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = enabled_runtime(directory, background_refresh=False)
+            self.assertTrue(runtime.refresh_now(GROUP_MASTER_DATABASE))
+            state = runtime.state()
+            repository = SQLiteCandidateRepository.open_read_only(
+                Path(state["current"]["candidate_path"])
+            )
+            try:
+                with self.assertRaises(ValueError):
+                    repository.observed_state_for_target(
+                        state["current"]["run_id"], "client:client_1", "offline"
+                    )
+            finally:
+                repository.close()
+
+    def test_restart_preserves_observation_generation_order(self):
+        with tempfile.TemporaryDirectory() as directory:
+            first = enabled_runtime(directory, background_refresh=False)
+            self.assertTrue(first.refresh_now(GROUP_MASTER_DATABASE))
+            first_generation = first.current_observation_generation()
+            second = enabled_runtime(directory, background_refresh=False)
+            self.assertTrue(second.refresh_now(GROUP_MASTER_DATABASE, force=True))
+            self.assertGreater(
+                second.current_observation_generation(), first_generation
+            )
+
+    def test_deleted_current_projection_recovers_without_resetting_head(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = enabled_runtime(directory, background_refresh=False)
+            self.assertTrue(runtime.refresh_now(GROUP_MASTER_DATABASE))
+            first_generation = runtime.current_observation_generation()
+            runtime.state_path.unlink()
+            recovered = enabled_runtime(directory, background_refresh=False)
+            self.assertEqual(
+                recovered.state()["current"]["observation_generation"], first_generation
+            )
+            with self.assertRaises(ObservationGenerationContractError):
+                recovered.current_observation_generation()
+            self.assertTrue(recovered.refresh_now(GROUP_MASTER_DATABASE, force=True))
+            self.assertEqual(recovered.current_observation_generation(), first_generation + 1)
+
+    def test_corrupt_current_projection_recovers_from_head(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = enabled_runtime(directory, background_refresh=False)
+            self.assertTrue(runtime.refresh_now(GROUP_MASTER_DATABASE))
+            runtime.state_path.write_text("not-json", encoding="utf-8")
+            recovered = enabled_runtime(directory, background_refresh=False)
+            self.assertEqual(recovered.state()["current"]["observation_generation"], 1)
+            with self.assertRaises(ObservationGenerationContractError):
+                recovered.current_observation_generation()
+
+    def test_corrupt_current_projection_recovers_from_publication_ledger(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = enabled_runtime(directory, background_refresh=False)
+            self.assertTrue(runtime.refresh_now(GROUP_MASTER_DATABASE))
+            runtime.state_path.write_text("not-json", encoding="utf-8")
+            recovered = enabled_runtime(directory, background_refresh=False)
+            self.assertEqual(recovered.state()["current"]["observation_generation"], 1)
+            with self.assertRaises(ObservationGenerationContractError):
+                recovered.current_observation_generation()
+
+    def test_deleted_projection_never_reactivates_fenced_master_group(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = enabled_runtime(directory, background_refresh=False)
+            self.assertTrue(runtime.refresh_now(GROUP_MASTER_DATABASE))
+            with runtime.write_fence(GROUP_MASTER_DATABASE):
+                pass
+            runtime.state_path.unlink()
+            recovered = enabled_runtime(directory, background_refresh=False)
+            self.assertFalse(
+                recovered.state()["groups"][GROUP_MASTER_DATABASE]["eligible"]
+            )
+            with self.assertRaises(ObservationGenerationContractError):
+                recovered.current_observation_generation()
+
+    def test_production_wiring_rejects_generic_boundary_store_and_missing_source_identity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaises(RuntimeStateError):
+                SQLiteRuntimeCoordinator(
+                    directory,
+                    legacy_authority_store_factory=object(),
+                )
+            runtime = SQLiteRuntimeCoordinator(
+                directory,
+                read_enabled=True,
+                group_enabled={GROUP_MASTER_DATABASE: True},
+                background_refresh=False,
+                source_factory=lambda: FakeSource(fixture_values()),
+            )
+            with self.assertRaises(ObservationGenerationContractError):
+                runtime.trusted_source_identity()
+
+    def test_trusted_source_identity_rejects_secret_bearing_reference(self):
+        with tempfile.TemporaryDirectory() as directory, self.assertRaises(
+            RuntimeStateError
+        ):
+            enabled_runtime(
+                directory,
+                trusted_source_identity="https://legacy/session?token=raw-secret",
+            )
+
+    def test_restart_with_different_trusted_source_identity_fails_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = enabled_runtime(directory, background_refresh=False)
+            self.assertTrue(runtime.refresh_now(GROUP_MASTER_DATABASE))
+            restarted = enabled_runtime(
+                directory,
+                background_refresh=False,
+                trusted_source_identity="legacy-sole-reader:v2",
+            )
+            with self.assertRaises(ObservationGenerationContractError):
+                restarted.state()
+
+    def test_current_projection_mismatch_recovers_from_durable_head(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = enabled_runtime(directory, background_refresh=False)
+            self.assertTrue(runtime.refresh_now(GROUP_MASTER_DATABASE))
+            state = runtime.state()
+            state["current"]["observation_generation"] = 99
+            sqlite_runtime._atomic_json(runtime.state_path, state)
+            response = runtime.read(
+                "api/master", lambda: (_ for _ in ()).throw(AssertionError("fallback"))
+            )
+            self.assertEqual(response[1], 200)
+            self.assertEqual(runtime.state()["current"]["observation_generation"], 1)
+
+    def test_old_candidate_without_observation_metadata_cannot_prove(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = enabled_runtime(directory, background_refresh=False)
+            self.assertTrue(runtime.refresh_now(GROUP_MASTER_DATABASE))
+            state = runtime.state()
+            candidate = Path(state["current"]["candidate_path"])
+            repository = SQLiteCandidateRepository.open_existing(candidate)
+            repository.connection.execute(
+                "DROP TRIGGER import_run_observation_metadata_immutable_update"
+            )
+            repository.connection.execute(
+                "UPDATE import_runs SET observation_generation=NULL, "
+                "publication_generation_id=NULL, observation_source_set=NULL, "
+                "source_identity_ref=NULL "
+                "WHERE run_id=?",
+                (state["current"]["run_id"],),
+            )
+            repository.connection.commit()
+            repository.close()
+            fallback = (b"fallback", 200, "text/plain")
+            self.assertEqual(runtime.read("api/master", lambda: fallback), fallback)
 
     def test_settings_uses_separate_group_but_published_generation(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -125,12 +724,42 @@ class SQLiteRuntimeTests(unittest.TestCase):
             ):
                 self.assertFalse(runtime.refresh_now(GROUP_MASTER_DATABASE))
             self.assertIsNone(runtime.state()["current"])
-            self.assertFalse(list(Path(directory).glob("*.sqlite3")))
+            self.assertFalse(
+                [
+                    path
+                    for path in Path(directory).glob("*.sqlite3")
+                    if path.name != "runtime_observation_publications.sqlite3"
+                ]
+            )
+
+    def test_post_commit_finalize_failure_preserves_candidate_for_recovery(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = enabled_runtime(directory, background_refresh=False)
+            finalize = runtime.ledger.finalize
+
+            def finalize_then_fail(*args, **kwargs):
+                finalize(*args, **kwargs)
+                raise sqlite_runtime.ObservationLedgerError(
+                    "simulated post-commit finalize failure"
+                )
+
+            with patch.object(
+                runtime.ledger, "finalize", side_effect=finalize_then_fail
+            ):
+                self.assertFalse(runtime.refresh_now(GROUP_MASTER_DATABASE))
+
+            finalized = runtime.ledger.latest_finalized()
+            self.assertIsNotNone(finalized)
+            self.assertTrue(Path(finalized.candidate_path).is_file())
+            recovered = enabled_runtime(directory, background_refresh=False)
+            self.assertEqual(
+                recovered.state()["current"]["observation_generation"], 1
+            )
 
     def test_refresh_lease_prevents_parallel_importers_past_nominal_ttl(self):
         with tempfile.TemporaryDirectory() as directory:
             runtime = enabled_runtime(directory, background_refresh=False)
-            runtime.refresh_timeout_seconds = 0.05
+            runtime.refresh_timeout_seconds = 1
             started = threading.Event()
             release = threading.Event()
             calls = []
@@ -214,12 +843,20 @@ class SQLiteRuntimeTests(unittest.TestCase):
             state["refresh_pending"] = [GROUP_PUBLIC_SETTINGS]
             sqlite_runtime._atomic_json(runtime.state_path, state)
             result = []
+            pending_scheduled = threading.Event()
+
+            def schedule_pending(_group):
+                pending_scheduled.set()
+                return True
+
             owner = threading.Thread(
                 target=lambda: result.append(
                     runtime.refresh_now(GROUP_MASTER_DATABASE)
                 )
             )
-            with patch.object(runtime, "request_refresh", return_value=True) as request:
+            with patch.object(
+                runtime, "request_refresh", side_effect=schedule_pending
+            ) as request:
                 owner.start()
                 self.assertTrue(started.wait(2))
                 with runtime._mutex.hold():
@@ -227,12 +864,7 @@ class SQLiteRuntimeTests(unittest.TestCase):
                     owner.join(2)
                     self.assertEqual(result, [False])
                     self.assertIsNotNone(runtime.state()["refresh_lease"])
-                deadline = time.monotonic() + 2
-                while time.monotonic() < deadline:
-                    state = runtime.state()
-                    if state["refresh_lease"] is None and request.call_count:
-                        break
-                    time.sleep(0.05)
+                self.assertTrue(pending_scheduled.wait(3))
                 self.assertIsNone(runtime.state()["refresh_lease"])
                 self.assertEqual(runtime.state()["refresh_pending"], [])
                 request.assert_called_once_with(GROUP_PUBLIC_SETTINGS)
@@ -272,6 +904,26 @@ class SQLiteRuntimeTests(unittest.TestCase):
             worker.join(2)
             self.assertFalse(worker.is_alive())
 
+    def test_state_recovery_waits_for_generation_mutex(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = enabled_runtime(directory, background_refresh=False)
+            self.assertTrue(runtime.refresh_now(GROUP_MASTER_DATABASE))
+            started = threading.Event()
+            finished = threading.Event()
+
+            def read_state():
+                started.set()
+                runtime.state()
+                finished.set()
+
+            with runtime._mutex.hold():
+                worker = threading.Thread(target=read_state)
+                worker.start()
+                self.assertTrue(started.wait(2))
+                self.assertFalse(finished.wait(0.1))
+            worker.join(2)
+            self.assertTrue(finished.is_set())
+
     def test_timeout_before_future_wait_uses_deferred_lease_handoff(self):
         with tempfile.TemporaryDirectory() as directory:
             clock_values = iter((0.0, 0.0, 2.0))
@@ -283,6 +935,7 @@ class SQLiteRuntimeTests(unittest.TestCase):
                 background_refresh=False,
                 clock=lambda: next(clock_values),
                 source_factory=lambda: FakeSource(fixture_values()),
+                trusted_source_identity="legacy-sole-reader:v1",
             )
             started = threading.Event()
             release = threading.Event()
@@ -349,6 +1002,7 @@ class SQLiteRuntimeTests(unittest.TestCase):
             started = time.monotonic()
             self.assertFalse(runtime.refresh_now(GROUP_MASTER_DATABASE))
             self.assertLess(time.monotonic() - started, 0.15)
+            time.sleep(0.25)
 
     def test_write_fence_requires_observed_master_and_database_mutation(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -411,30 +1065,28 @@ class SQLiteRuntimeTests(unittest.TestCase):
                     repository.connection.execute(statement, args)
                 repository.close()
                 fallback = (b"http", 200, "application/json")
-                self.assertEqual(runtime.read(route, lambda: fallback), fallback)
+                self.assertEqual(runtime.read(route, lambda fallback=fallback: fallback), fallback)
 
-    def test_schema_mismatch_falls_back(self):
+    def test_projection_schema_mismatch_recovers_from_head(self):
         with tempfile.TemporaryDirectory() as directory:
             runtime = enabled_runtime(directory, background_refresh=False)
             self.assertTrue(runtime.refresh_now(GROUP_MASTER_DATABASE))
             state = runtime.state()
             state["current"]["schema_version"] = 999
             sqlite_runtime._atomic_json(runtime.state_path, state)
-            fallback = (b"http", 200, "application/json")
-            self.assertEqual(runtime.read("api/master", lambda: fallback), fallback)
+            response = runtime.read(
+                "api/master", lambda: (_ for _ in ()).throw(AssertionError("fallback"))
+            )
+            self.assertEqual(response[1], 200)
 
-    def test_reader_fallback_does_not_wait_for_refresh_mutex(self):
+    def test_reader_rebuilds_projection_from_ledger_without_rollback(self):
         with tempfile.TemporaryDirectory() as directory:
             runtime = enabled_runtime(directory, background_refresh=False)
             self.assertTrue(runtime.refresh_now(GROUP_MASTER_DATABASE))
             state = runtime.state()
-            state["current"]["captured_at"] = "2000-01-01T00:00:00+00:00"
+            state["current"]["observation_generation"] = 0
             sqlite_runtime._atomic_json(runtime.state_path, state)
-            fallback = (b"http", 200, "application/json")
-            started = time.monotonic()
-            with runtime._mutex.hold():
-                self.assertEqual(runtime.read("api/master", lambda: fallback), fallback)
-            self.assertLess(time.monotonic() - started, 0.15)
+            self.assertEqual(runtime.current_observation_generation(), 1)
 
     def test_startup_refresh_queues_each_missing_group_while_active(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -491,14 +1143,15 @@ class SQLiteRuntimeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             runtime = enabled_runtime(directory)
             self.assertTrue(runtime.refresh_now(GROUP_MASTER_DATABASE))
-            with runtime.write_fence(GROUP_MASTER_DATABASE):
-                with self.assertRaises(UpstreamError) as error:
-                    runtime.read(
-                        "api/master",
-                        lambda: (_ for _ in ()).throw(
-                            UpstreamError(503, b'{"error":"http unavailable"}')
-                        ),
-                    )
+            with runtime.write_fence(GROUP_MASTER_DATABASE), self.assertRaises(
+                UpstreamError
+            ) as error:
+                runtime.read(
+                    "api/master",
+                    lambda: (_ for _ in ()).throw(
+                        UpstreamError(503, b'{"error":"http unavailable"}')
+                    ),
+                )
             self.assertEqual(error.exception.status, 503)
 
     def test_runtime_eligibility_does_not_change_configuration(self):
@@ -554,6 +1207,26 @@ class FlaskRouteTests(unittest.TestCase):
                 return fallback()
 
         return RuntimeStub()
+
+    def test_trusted_source_requires_complete_materializer_capability(self):
+        import app as app_module
+
+        cases = (("", "key"), ("materializer:one", ""))
+        for identity, key in cases:
+            with self.subTest(identity=identity, key=key), patch.object(
+                app_module.config,
+                "SQLITE_TRUSTED_SOURCE_IDENTITY",
+                "legacy-source:one",
+            ), patch.object(
+                app_module.config,
+                "SQLITE_OBSERVATION_MATERIALIZER_IDENTITY",
+                identity,
+            ), patch.object(
+                app_module.config,
+                "SQLITE_OBSERVATION_MATERIALIZER_KEY",
+                key,
+            ), self.assertRaises(sqlite_runtime.RuntimeStateError):
+                app_module.create_app()
 
     def test_sqlite_runtime_is_only_called_for_wave_one_routes(self):
         import app as app_module

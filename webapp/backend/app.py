@@ -23,10 +23,7 @@ import pathlib
 import config
 from flask import Flask, Response, jsonify, request, send_from_directory
 from repositories.aitool import UpstreamError
-from repositories.legacy_authority_store import (
-    LegacyAuthorityStore,
-    LegacyAuthorityStoreFactory,
-)
+from repositories.legacy_authority_store import LegacyAuthorityStoreFactory
 from services import aifix as aifix_service
 from services import backup as backup_service
 from services import cycle as cycle_service
@@ -122,23 +119,22 @@ def create_app(runtime=None):
     authority_store_factory = None
     trusted_source_identity = config.SQLITE_TRUSTED_SOURCE_IDENTITY or None
     if trusted_source_identity is not None:
-        if (
+        if not (
             config.SQLITE_OBSERVATION_MATERIALIZER_IDENTITY
             and config.SQLITE_OBSERVATION_MATERIALIZER_KEY
         ):
-            signer_factory = LegacyAuthorityStoreFactory(
-                config.SQLITE_OBSERVATION_MATERIALIZER_IDENTITY,
-                _ConfiguredObservationKeyProvider(
-                    config.SQLITE_OBSERVATION_MATERIALIZER_KEY
-                ),
+            raise sqlite_runtime.RuntimeStateError(
+                "trusted runtime observation materializer is incomplete"
             )
-            authority_store_factory = lambda: signer_factory.open(
-                config.LEGACY_AUTHORITY_STORE_PATH
-            )
-        else:
-            authority_store_factory = lambda: LegacyAuthorityStore.open(
-                config.LEGACY_AUTHORITY_STORE_PATH
-            )
+        signer_factory = LegacyAuthorityStoreFactory(
+            config.SQLITE_OBSERVATION_MATERIALIZER_IDENTITY,
+            _ConfiguredObservationKeyProvider(
+                config.SQLITE_OBSERVATION_MATERIALIZER_KEY
+            ),
+        )
+        authority_store_factory = lambda: signer_factory.open(
+            config.LEGACY_AUTHORITY_STORE_PATH
+        )
     sqlite = runtime or sqlite_runtime.SQLiteRuntimeCoordinator(
         runtime_dir=config.SQLITE_RUNTIME_DIR,
         read_enabled=config.SQLITE_READ_ENABLED,

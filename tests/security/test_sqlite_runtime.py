@@ -732,6 +732,30 @@ class SQLiteRuntimeTests(unittest.TestCase):
                 ]
             )
 
+    def test_post_commit_finalize_failure_preserves_candidate_for_recovery(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = enabled_runtime(directory, background_refresh=False)
+            finalize = runtime.ledger.finalize
+
+            def finalize_then_fail(*args, **kwargs):
+                finalize(*args, **kwargs)
+                raise sqlite_runtime.ObservationLedgerError(
+                    "simulated post-commit finalize failure"
+                )
+
+            with patch.object(
+                runtime.ledger, "finalize", side_effect=finalize_then_fail
+            ):
+                self.assertFalse(runtime.refresh_now(GROUP_MASTER_DATABASE))
+
+            finalized = runtime.ledger.latest_finalized()
+            self.assertIsNotNone(finalized)
+            self.assertTrue(Path(finalized.candidate_path).is_file())
+            recovered = enabled_runtime(directory, background_refresh=False)
+            self.assertEqual(
+                recovered.state()["current"]["observation_generation"], 1
+            )
+
     def test_refresh_lease_prevents_parallel_importers_past_nominal_ttl(self):
         with tempfile.TemporaryDirectory() as directory:
             runtime = enabled_runtime(directory, background_refresh=False)
@@ -1183,6 +1207,26 @@ class FlaskRouteTests(unittest.TestCase):
                 return fallback()
 
         return RuntimeStub()
+
+    def test_trusted_source_requires_complete_materializer_capability(self):
+        import app as app_module
+
+        cases = (("", "key"), ("materializer:one", ""))
+        for identity, key in cases:
+            with self.subTest(identity=identity, key=key), patch.object(
+                app_module.config,
+                "SQLITE_TRUSTED_SOURCE_IDENTITY",
+                "legacy-source:one",
+            ), patch.object(
+                app_module.config,
+                "SQLITE_OBSERVATION_MATERIALIZER_IDENTITY",
+                identity,
+            ), patch.object(
+                app_module.config,
+                "SQLITE_OBSERVATION_MATERIALIZER_KEY",
+                key,
+            ), self.assertRaises(sqlite_runtime.RuntimeStateError):
+                app_module.create_app()
 
     def test_sqlite_runtime_is_only_called_for_wave_one_routes(self):
         import app as app_module

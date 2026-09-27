@@ -1640,7 +1640,7 @@ class SQLiteRuntimeCoordinator:
             _remove_candidate(staging)
             if published and not head_committed:
                 try:
-                    durable_head = self.ledger.latest_published()
+                    durable_head = self.ledger.latest_available()
                     head_committed = (
                         durable_head is not None
                         and reservation is not None

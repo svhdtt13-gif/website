@@ -21,6 +21,7 @@ from services.legacy_canary_coordinator import (
     LegacyCanaryCoordinator,
     LegacyCoordinatorTrust,
     ProductionAuthorizationContextProvider,
+    VerifiedRuntimeAuthorizationContextProvider,
 )
 from services.legacy_handoff_trust import (
     AuthenticatedAuthorizationAck,
@@ -54,6 +55,17 @@ class CountingAuthorizationContextProvider:
         with self._lock:
             self.allocations += 1
         return self._context
+
+
+class FixedObservationGenerationProvider:
+    def current_observation_generation(self) -> int:
+        return 43
+
+    def current_observation_source_set(self) -> str:
+        return "wave1"
+
+    def trusted_source_identity(self) -> str:
+        return "legacy-source:one"
 
 
 def valid_envelope() -> CanaryEnvelope:
@@ -200,6 +212,16 @@ class LegacyCanaryCoordinatorTests(unittest.TestCase):
 
         with self.assertRaises(HandoffTrustError):
             self.coordinator(ProductionAuthorizationContextProvider()).authorize(handoff)
+
+    def test_runtime_context_provider_uses_current_verified_generation(self) -> None:
+        provider = VerifiedRuntimeAuthorizationContextProvider(
+            DeterministicTestAuthorizationContextProvider(
+                replace(valid_context(), pre_operation_observation_generation_floor=1)
+            ),
+            FixedObservationGenerationProvider(),
+        )
+        context = provider.context_for(self.exporter.export(valid_envelope()), valid_envelope())
+        self.assertEqual(context.pre_operation_observation_generation_floor, 43)
 
     def test_two_independent_stores_allocate_one_durable_authorization(self) -> None:
         handoff = self.exporter.export(valid_envelope())

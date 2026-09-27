@@ -20,10 +20,13 @@ Host Registration foundation adds guarded portable configuration writes only.
 import hmac
 import pathlib
 
-from flask import Flask, Response, jsonify, request, send_from_directory
-
 import config
+from flask import Flask, Response, jsonify, request, send_from_directory
 from repositories.aitool import UpstreamError
+from repositories.legacy_authority_store import (
+    LegacyAuthorityStore,
+    LegacyAuthorityStoreFactory,
+)
 from services import aifix as aifix_service
 from services import backup as backup_service
 from services import cycle as cycle_service
@@ -34,6 +37,16 @@ from services import master as master_service
 from services import profile_manager as profile_manager_service
 from services import remote_live as remote_live_service
 from services import settings as settings_service
+
+
+class _ConfiguredObservationKeyProvider:
+    def __init__(self, key: str) -> None:
+        self._key = key.encode("utf-8")
+
+    def key_for(self, identity: str) -> bytes:
+        if identity != config.SQLITE_OBSERVATION_MATERIALIZER_IDENTITY:
+            raise KeyError(identity)
+        return self._key
 from services import settings_actions as settings_actions_service
 from services import sqlite_runtime
 from services import sync as sync_service
@@ -106,6 +119,26 @@ def _portable_write_gate():
 
 def create_app(runtime=None):
     app = Flask(__name__, static_folder=None)
+    authority_store_factory = None
+    trusted_source_identity = config.SQLITE_TRUSTED_SOURCE_IDENTITY or None
+    if trusted_source_identity is not None:
+        if (
+            config.SQLITE_OBSERVATION_MATERIALIZER_IDENTITY
+            and config.SQLITE_OBSERVATION_MATERIALIZER_KEY
+        ):
+            signer_factory = LegacyAuthorityStoreFactory(
+                config.SQLITE_OBSERVATION_MATERIALIZER_IDENTITY,
+                _ConfiguredObservationKeyProvider(
+                    config.SQLITE_OBSERVATION_MATERIALIZER_KEY
+                ),
+            )
+            authority_store_factory = lambda: signer_factory.open(
+                config.LEGACY_AUTHORITY_STORE_PATH
+            )
+        else:
+            authority_store_factory = lambda: LegacyAuthorityStore.open(
+                config.LEGACY_AUTHORITY_STORE_PATH
+            )
     sqlite = runtime or sqlite_runtime.SQLiteRuntimeCoordinator(
         runtime_dir=config.SQLITE_RUNTIME_DIR,
         read_enabled=config.SQLITE_READ_ENABLED,
@@ -116,6 +149,8 @@ def create_app(runtime=None):
         freshness_seconds=config.SQLITE_FRESHNESS_SECONDS,
         refresh_timeout_seconds=config.SQLITE_REFRESH_TIMEOUT_SECONDS,
         mutex_name=config.SQLITE_MUTEX_NAME,
+        legacy_authority_store_factory=authority_store_factory,
+        trusted_source_identity=trusted_source_identity,
     )
     app.extensions["sqlite_runtime"] = sqlite
     startup_refresh = getattr(sqlite, "startup_refresh", None)

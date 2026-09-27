@@ -4,18 +4,18 @@ The importer is intentionally not imported by Flask routes. Its source client
 accepts only golden HTTP API projections, including the redacted settings
 projection, and never falls back to ai tool filesystem access.
 """
-from dataclasses import dataclass
 import hashlib
 import json
 import re
+import uuid
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-import uuid
 
 from repositories.aitool import UpstreamError, ai_tool
 from repositories.sqlite import SQLiteCandidateRepository
-from services import settings as settings_service
 
+from services import settings as settings_service
 
 FULL_SOURCE_ORDER = (
     "api/master",
@@ -517,6 +517,27 @@ def shadow_verify(repository, run_id, snapshot):
         )
         if not checks["database_order_and_projection"]:
             mismatches.append("database order/projection mismatch")
+
+    if "api/master" in available and "client_database.json" in available:
+        master_states = dict(repository.rows(
+            "SELECT client_id, status FROM master_clients WHERE run_id=?",
+            (run_id,),
+        ))
+        database_states = dict(repository.rows(
+            "SELECT client_id, status FROM database_clients WHERE run_id=?",
+            (run_id,),
+        ))
+        checks["cross_source_target_consistency"] = (
+            master_states.keys() == database_states.keys()
+            and all(
+                type(status) is str
+                and status in {"running", "offline"}
+                and status == database_states[client_id]
+                for client_id, status in master_states.items()
+            )
+        )
+        if not checks["cross_source_target_consistency"]:
+            mismatches.append("master/database target state mismatch")
 
     if "api/settings" in available:
         settings_source = _parse_json(snapshot.value("api/settings"), "api/settings")

@@ -1,11 +1,11 @@
 """Versioned SQLite candidate store for Phase 3 shadow imports."""
-from contextlib import contextmanager
 import hashlib
-from pathlib import Path
 import sqlite3
+from contextlib import contextmanager
+from dataclasses import dataclass, field
+from pathlib import Path
 
-
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 5
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS schema_migrations (
     version INTEGER PRIMARY KEY,
@@ -21,7 +21,37 @@ CREATE TABLE IF NOT EXISTS import_runs (
     completed_at TEXT,
     status TEXT NOT NULL CHECK (status IN ('running', 'verified', 'failed')),
     checks_json TEXT NOT NULL DEFAULT '{}',
-    error_code TEXT
+    error_code TEXT,
+    observation_generation INTEGER,
+    publication_generation_id TEXT,
+    observation_source_set TEXT,
+    source_identity_ref TEXT,
+    observation_boundary_id TEXT,
+    observation_generation_floor INTEGER,
+    observation_pre_send_identity TEXT,
+    observation_canary_run_id TEXT,
+    observation_fence_identity TEXT,
+    observation_authority_epoch TEXT,
+    observation_fence_counter INTEGER,
+    observation_target_ref TEXT,
+    observation_requested_state TEXT,
+    observation_binding_fingerprint TEXT,
+    observation_materializer_run_id TEXT,
+    observation_observed_state TEXT,
+    observation_attestation_fingerprint TEXT,
+    observation_captured_at TEXT,
+    observation_completed_at TEXT,
+    CHECK (observation_generation IS NULL OR observation_generation > 0),
+    CHECK ((observation_generation IS NULL AND publication_generation_id IS NULL
+            AND observation_source_set IS NULL AND source_identity_ref IS NULL
+            AND observation_boundary_id IS NULL AND observation_generation_floor IS NULL)
+        OR (observation_generation IS NOT NULL AND publication_generation_id IS NOT NULL
+            AND observation_source_set IS NOT NULL AND source_identity_ref IS NOT NULL
+            AND ((observation_boundary_id IS NULL AND observation_generation_floor IS NULL)
+                 OR (observation_boundary_id IS NOT NULL AND observation_generation_floor IS NOT NULL
+                     AND observation_generation > observation_generation_floor)))),
+    CHECK ((observation_captured_at IS NULL AND observation_completed_at IS NULL)
+        OR (observation_captured_at IS NOT NULL AND observation_completed_at IS NOT NULL))
 );
 
 CREATE TABLE IF NOT EXISTS source_snapshots (
@@ -173,7 +203,53 @@ CREATE TABLE IF NOT EXISTS source_observations (
     payload_json TEXT NOT NULL,
     PRIMARY KEY (run_id, endpoint)
 );
+
+CREATE TRIGGER import_run_observation_metadata_immutable_update
+BEFORE UPDATE OF observation_generation, publication_generation_id, observation_source_set,
+source_identity_ref, observation_boundary_id, observation_generation_floor,
+observation_captured_at, observation_completed_at, observation_pre_send_identity,
+observation_canary_run_id, observation_fence_identity, observation_authority_epoch,
+observation_fence_counter, observation_target_ref, observation_requested_state,
+observation_binding_fingerprint, observation_materializer_run_id,
+observation_observed_state
+ON import_runs
+WHEN OLD.observation_generation IS NOT NULL
+BEGIN SELECT RAISE(ABORT, 'observation publication metadata immutable'); END;
+CREATE TRIGGER import_run_observation_attestation_immutable_update
+BEFORE UPDATE OF observation_attestation_fingerprint ON import_runs
+WHEN OLD.observation_generation IS NOT NULL
+AND OLD.observation_attestation_fingerprint IS NOT NULL
+BEGIN SELECT RAISE(ABORT, 'observation attestation immutable'); END;
 """
+
+
+class _VerifiedObservationToken:
+    pass
+
+
+_VERIFIED_OBSERVATION_TOKEN = _VerifiedObservationToken()
+
+
+@dataclass(frozen=True, slots=True)
+class VerifiedTargetObservation:
+    """State proven by one candidate run's matching source projections."""
+
+    run_id: str
+    target_ref: str
+    observed_state: str
+    _token: _VerifiedObservationToken | None = field(
+        default=None, repr=False, compare=False
+    )
+
+    def __post_init__(self) -> None:
+        if self._token is not _VERIFIED_OBSERVATION_TOKEN:
+            raise ValueError("target observation must come from the candidate gate")
+
+    @classmethod
+    def _from_candidate(
+        cls, run_id: str, target_ref: str, observed_state: str
+    ) -> "VerifiedTargetObservation":
+        return cls(run_id, target_ref, observed_state, _VERIFIED_OBSERVATION_TOKEN)
 SCHEMA_CHECKSUM = hashlib.sha256(SCHEMA_SQL.encode("utf-8")).hexdigest()
 
 
@@ -259,6 +335,151 @@ class SQLiteCandidateRepository:
             "INSERT INTO import_runs(run_id, snapshot_id, source_hash, started_at, status) VALUES (?, ?, ?, ?, 'running')",
             (run_id, snapshot_id, source_hash, started_at),
         )
+
+    def set_observation_generation(
+        self,
+        run_id,
+        observation_generation,
+        publication_generation_id,
+        observation_source_set,
+        source_identity_ref,
+        observation_boundary_id=None,
+        observation_generation_floor=None,
+        observation_captured_at=None,
+        observation_completed_at=None,
+        observation_pre_send_identity=None,
+        observation_canary_run_id=None,
+        observation_fence_identity=None,
+        observation_authority_epoch=None,
+        observation_fence_counter=None,
+        observation_target_ref=None,
+        observation_requested_state=None,
+        observation_binding_fingerprint=None,
+        observation_materializer_run_id=None,
+        observation_observed_state=None,
+        observation_attestation_fingerprint=None,
+    ):
+        if type(observation_generation) is not int or observation_generation < 1:
+            raise ValueError("observation_generation must be positive")
+        for name, value in (
+            ("publication_generation_id", publication_generation_id),
+            ("observation_source_set", observation_source_set),
+            ("source_identity_ref", source_identity_ref),
+        ):
+            if type(value) is not str or not value or value != value.strip():
+                raise ValueError(f"{name} must be canonical")
+        if (observation_boundary_id is None) != (observation_generation_floor is None):
+            raise ValueError("observation boundary metadata must be complete")
+        if (observation_captured_at is None) != (observation_completed_at is None):
+            raise ValueError("observation publication timestamps must be complete")
+        if observation_generation_floor is not None and (
+            type(observation_generation_floor) is not int
+            or observation_generation <= observation_generation_floor
+        ):
+            raise ValueError("observation generation must be later than boundary floor")
+        if observation_boundary_id is not None:
+            for name, value in (
+                ("observation_pre_send_identity", observation_pre_send_identity),
+                ("observation_canary_run_id", observation_canary_run_id),
+                ("observation_fence_identity", observation_fence_identity),
+                ("observation_authority_epoch", observation_authority_epoch),
+                ("observation_target_ref", observation_target_ref),
+                ("observation_requested_state", observation_requested_state),
+                ("observation_binding_fingerprint", observation_binding_fingerprint),
+                ("observation_materializer_run_id", observation_materializer_run_id),
+                ("observation_observed_state", observation_observed_state),
+            ):
+                if type(value) is not str or not value or value != value.strip():
+                    raise ValueError(f"{name} must be canonical")
+            if type(observation_fence_counter) is not int or observation_fence_counter < 1:
+                raise ValueError("observation_fence_counter must be positive")
+            if observation_requested_state != "running" or observation_observed_state != observation_requested_state:
+                raise ValueError("observation state must prove requested running state")
+            if observation_attestation_fingerprint is not None and (
+                type(observation_attestation_fingerprint) is not str
+                or not observation_attestation_fingerprint.strip()
+            ):
+                raise ValueError("observation attestation fingerprint must be canonical")
+        changed = self.connection.execute(
+            "UPDATE import_runs SET observation_generation=?, publication_generation_id=?, "
+            "observation_source_set=?, source_identity_ref=?, "
+            "observation_boundary_id=?, observation_generation_floor=?, "
+            "observation_captured_at=?, observation_completed_at=?, "
+            "observation_pre_send_identity=?, observation_canary_run_id=?, "
+            "observation_fence_identity=?, observation_authority_epoch=?, "
+            "observation_fence_counter=?, observation_target_ref=?, "
+            "observation_requested_state=?, observation_binding_fingerprint=?, "
+            "observation_materializer_run_id=?, observation_observed_state=?, "
+            "observation_attestation_fingerprint=? "
+            "WHERE run_id=? AND status='verified' AND observation_generation IS NULL",
+            (
+                observation_generation,
+                publication_generation_id,
+                observation_source_set,
+                source_identity_ref,
+                observation_boundary_id,
+                observation_generation_floor,
+                observation_captured_at,
+                observation_completed_at,
+                observation_pre_send_identity,
+                observation_canary_run_id,
+                observation_fence_identity,
+                observation_authority_epoch,
+                observation_fence_counter,
+                observation_target_ref,
+                observation_requested_state,
+                observation_binding_fingerprint,
+                observation_materializer_run_id,
+                observation_observed_state,
+                observation_attestation_fingerprint,
+                run_id,
+            ),
+        ).rowcount
+        if changed != 1:
+            raise ValueError("verified import is missing or already has observation metadata")
+
+    def observed_state_for_target(self, run_id, target_ref, requested_state):
+        """Prove target state from matching master and database projections."""
+        if type(target_ref) is not str or not target_ref.startswith("client:"):
+            raise ValueError("candidate target reference is unsupported")
+        if type(requested_state) is not str or requested_state not in {"running", "offline"}:
+            raise ValueError("candidate requested state is unsupported")
+        client_id = target_ref.removeprefix("client:")
+        rows = self.connection.execute(
+            """SELECT master.client_id, master.status, database.client_id, database.status
+               FROM master_clients AS master
+               LEFT JOIN database_clients AS database
+                 ON database.run_id=master.run_id AND database.client_id=master.client_id
+              WHERE master.run_id=? AND master.client_id=?""",
+            (run_id, client_id),
+        ).fetchall()
+        if len(rows) != 1:
+            raise ValueError("candidate target identity is ambiguous")
+        master_id, master_state, database_id, database_state = rows[0]
+        if (
+            master_id != database_id
+            or type(master_state) is not str
+            or type(database_state) is not str
+            or master_state != database_state
+            or master_state != requested_state
+        ):
+            raise ValueError("candidate target projections are inconsistent")
+        return VerifiedTargetObservation._from_candidate(
+            run_id, target_ref, master_state
+        )
+
+    def set_observation_attestation(self, run_id, attestation_fingerprint):
+        """Bind the authority-owned attestation exactly once before publication."""
+        if type(attestation_fingerprint) is not str or not attestation_fingerprint.strip():
+            raise ValueError("observation attestation fingerprint must be canonical")
+        changed = self.connection.execute(
+            "UPDATE import_runs SET observation_attestation_fingerprint=? "
+            "WHERE run_id=? AND status='verified' AND observation_generation IS NOT NULL "
+            "AND observation_attestation_fingerprint IS NULL",
+            (attestation_fingerprint, run_id),
+        ).rowcount
+        if changed != 1:
+            raise ValueError("observation attestation is missing or already bound")
 
     def add_source_snapshot(self, run_id, position, value):
         self.connection.execute(

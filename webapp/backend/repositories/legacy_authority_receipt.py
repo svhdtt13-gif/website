@@ -204,6 +204,30 @@ class ReceiptLifecycleMixin:
         fence = self.get_fence(identity)
         return self._receipt(row, fence["state"] if fence else None)
 
+    def current_observation_receipt(self: _ReceiptHost) -> Receipt | None:
+        """Load the unique durable receipt currently eligible for observation."""
+        rows = self.connection.execute(
+            """SELECT receipts.*, fences.state AS fence_state
+               FROM receipts
+               JOIN fences ON fences.pre_send_identity=receipts.pre_send_identity
+              WHERE receipts.state=?
+                AND receipts.post_dispatch_observation_boundary_id IS NOT NULL
+                AND receipts.post_dispatch_observation_generation_floor IS NOT NULL
+                AND fences.state IN (?, ?)
+              ORDER BY receipts.pre_send_identity""",
+            (
+                ReceiptState.APPLIED.value,
+                FenceState.RECEIPT_TERMINAL.value,
+                FenceState.OBSERVATION_PENDING.value,
+            ),
+        ).fetchall()
+        if len(rows) > 1:
+            raise TransitionError("observation receipt is missing or ambiguous")
+        if not rows:
+            return None
+        row = rows[0]
+        return self._receipt(row, row["fence_state"])
+
     def _receipt_row(self: _ReceiptHost, identity: str) -> sqlite3.Row | None:
         return self.connection.execute("SELECT * FROM receipts WHERE pre_send_identity=?", (identity,)).fetchone()
 

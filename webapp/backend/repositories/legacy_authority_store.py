@@ -228,6 +228,14 @@ class LegacyAuthorityStore(
             raise LegacyAuthorityStoreError("detached observation attestation is invalid")
         return expected
 
+    def _attest_observation(self, evidence: ObservationEvidence) -> str:
+        """Create an attestation using this authority store's trusted signer."""
+        if self._observation_identity is None or self._observation_key_provider is None:
+            raise LegacyAuthorityStoreError("trusted observation signer is not configured")
+        return observation_attestation(
+            evidence, self._observation_identity, self._observation_key_provider
+        )
+
 
 class LegacyAuthorityStoreFactory:
     def __init__(self, observation_identity: str, observation_key_provider: HmacKeyProvider) -> None:
